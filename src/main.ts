@@ -1,18 +1,18 @@
 import * as THREE from "three";
-import { createMapBlockout, createZoneOverlay, MAP_GROUND_Y } from "./station-to-sea/map/scene.ts";
-import { createTown } from "./station-to-sea/town.ts";
-import { createScenicShopfronts } from "./station-to-sea/shops.ts";
-import { createScenicResidences } from "./station-to-sea/residences.ts";
-import { createBlueprintStreetfronts } from "./station-to-sea/streetscape.ts";
-import { createNeighborhoodDetail } from "./station-to-sea/map/streetscapeDetails.ts";
-import { createOnariCentralFocus } from "./station-to-sea/map/onariCentral.ts";
+import { createMapBlockout, createZoneOverlay, MAP_GROUND_Y } from "./town/map/scene.ts";
+import { createTown } from "./town/town.ts";
+import { createScenicShopfronts } from "./town/shops.ts";
+import { createScenicResidences } from "./town/residences.ts";
+import { createBlueprintStreetfronts } from "./town/streetscape.ts";
+import { createNeighborhoodDetail } from "./town/map/streetscapeDetails.ts";
+import { createOnariCentralFocus } from "./town/map/onariCentral.ts";
 import {
   createWakamiyaAvenueFinish,
   decorateWakamiyaShopfronts,
-} from "./station-to-sea/map/wakamiya.ts";
-import { createCoast, createRoutePreview } from "./station-to-sea/coast.ts";
-import { tileSurfaceAt } from "./station-to-sea/sceneryAnchors.ts";
-import { loadGraph } from "./station-to-sea/game/graph.ts";
+} from "./town/map/wakamiya.ts";
+import { createCoast, createRoutePreview } from "./town/coast.ts";
+import { tileSurfaceAt } from "./town/sceneryAnchors.ts";
+import { loadGraph } from "./town/graph/graph.ts";
 import { Director } from "./director.ts";
 import { createResidents } from "./characters.ts";
 import { LogPanel, RosterPanel } from "./panels.ts";

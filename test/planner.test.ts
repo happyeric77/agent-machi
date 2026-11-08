@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadGraph } from "../src/station-to-sea/game/graph.ts";
+import { loadGraph } from "../src/town/graph/graph.ts";
 import { planRoute, routeLength } from "../src/planner.ts";
 
 test("Dijkstra finds a traversable route from the station to both beaches", () => {

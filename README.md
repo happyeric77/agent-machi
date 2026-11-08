@@ -4,15 +4,19 @@ Herdr agent statuses drive up to six travellers (Amber, Teal, Moss, Plum,
 Slate, Sand) around the station-to-sea Kamakura scene. The game flow and HUD
 are not loaded.
 
-> **Scene provenance:** the scene source under `src/station-to-sea/` is forked
-> from [happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea)
+> **Scene provenance:** the town source under `src/town/` is derived from
+> [happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea)
 > at commit `a7f589e7` (2026-11-08). It develops independently inside
 > agent-machi from that point; the two repositories are no longer synchronized.
+> Its graph data is slimmed to the fields the loader reads and its centerlines
+> are simplified at 0.02 WU; see `src/town/graph/data/PROVENANCE.md`.
 
 ## Layout
 
-- `src/station-to-sea/` — vendored copy of the station-to-sea `src/` tree at `a7f589e7`.
+- `src/town/` — town scene and graph, derived from station-to-sea `a7f589e7`.
 - `tools/herdr-bridge/index.mjs` — Node stdlib bridge, no dependencies.
+- `tools/slim-town-graph.mjs` — repeatable graph JSON slimming script.
+- `tools/make-graph-baseline.mjs` — rebuilds the pre-refactor comparison fixture.
 - `src/` — Vite + Three town app.
 
 ## Run
