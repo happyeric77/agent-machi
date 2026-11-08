@@ -1,6 +1,6 @@
-# Herdr 0.9.5 schema notes (step 0)
+# Herdr 0.9.5 socket API notes
 
-Captured on the Mac mini on 2026-11-08 with:
+Captured on 2026-11-08 with:
 
 ```sh
 herdr status --json

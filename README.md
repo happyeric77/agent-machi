@@ -1,206 +1,132 @@
-# agent-machi
+# Agent Machi
 
-Herdr agent statuses drive up to six travellers (Amber, Teal, Moss, Plum,
-Slate, Sand) around the station-to-sea Kamakura scene. The game flow and HUD
-are not loaded. The UI is English; the camera supports orbit, zoom, pan and a
-Reset view button.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Go](https://img.shields.io/badge/Go-00ADD8)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![Herdr](https://img.shields.io/badge/Herdr-0.9.5-orange)
 
-> **Scene provenance:** the town source under `src/town/` is derived from
-> [happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea)
-> at commit `a7f589e7` (2026-11-08). It develops independently inside
-> agent-machi from that point; the two repositories are no longer synchronized.
-> Its graph data is slimmed to the fields the loader reads and its centerlines
-> are simplified at 0.02 WU; see `src/town/graph/data/PROVENANCE.md`.
+**In the office when working. At the station when blocked. On the beach when idle.**
 
-## Layout
+Agent Machi is a single-binary visual companion for [Herdr](https://herdr.dev):
+it renders your coding agents as residents of a small 3D Kamakura town, where
+each agent's location tells you its state at a glance. No dashboards to read,
+no panes to flip through. If someone is standing on the station platform, an
+agent needs you.
 
-- `src/town/` — town scene and graph, derived from station-to-sea `a7f589e7`.
-- `tools/herdr-bridge/index.mjs` — Node stdlib bridge, no dependencies.
-- `tools/slim-town-graph.mjs` — repeatable graph JSON slimming script.
-- `tools/make-graph-baseline.mjs` — rebuilds the pre-refactor comparison fixture.
-- `src/` — Vite + Three town app.
+## Overview
 
-## Run
+<img width="900" alt="Agent Machi town: one agent works inside an office with a lit sign, one waits on the station platform because it is blocked, and one rests on the beach" src="assets/poster.png" />
+
+Herdr agents work in panes, and panes hide each other. An agent can sit blocked
+on a question for an hour while you look at another tab. The state exists, but
+nothing in the room shows it.
+
+Agent Machi turns that state into a place. Each agent gets a character and an
+office in the town. Working agents are inside, with their office sign lit. The
+moment one gets blocked, it walks out and waits for you on the station platform.
+When it finishes, its sign grows a pulsing badge until you look at it. Idle
+agents go down to the beach.
+
+| Herdr state | Where the agent is |
+| --- | --- |
+| `working` | Inside its office, sign lit |
+| `blocked` | On the station platform, waiting for you |
+| `done` | Inside its office, sign lit, with a pulsing **!** badge |
+| `idle` | On the beach |
+| `unknown` | Stays where it was |
+
+## Features
+
+- **State you can read from across the room**: location, sign lamps, and badges
+  carry the information. The town is the status page.
+- **Single binary, zero arguments**: the Go binary embeds the town and talks to
+  Herdr itself. Run it and your browser opens on the town. No Node, no build
+  step, no config file.
+- **Nothing leaves your machine**: the binary reads Herdr's local Unix socket
+  and serves the page locally. No accounts, no cloud, no telemetry.
+- **Roster and Log**: every agent with its state, how long it has been in it,
+  and its office; plus an event Log that survives page reloads.
+- **Names you can map**: signs read `Amber Office`; the roster shows
+  `Amber (agent-machi)`, character first, project in parentheses.
+- **Six residents**: Amber, Teal, Moss, Plum, Slate, and Sand. Agents beyond
+  the sixth still appear in the roster and the Log.
+- **Full camera control**: orbit, zoom, and pan, with a Reset view button.
+
+## Quick Start
+
+### Requirements
+
+- Herdr, tested with 0.9.5
+- macOS or Linux (arm64 or amd64)
+
+### Run the binary
+
+Download the binary for your platform from the
+[Releases](https://github.com/happyeric77/agent-machi/releases) page, then:
+
+```sh
+./agent-machi
+```
+
+That is the whole setup. The binary finds Herdr's socket, starts serving on
+port 8731, and opens http://localhost:8731 in your browser. From another
+machine on your network or tailnet, open `http://<host>:8731` instead.
+
+### Build from source
+
+Requires Go and Node.js (Node is only used to build the web frontend):
+
+```sh
+./scripts/build-binary.sh
+./agent-machi
+```
+
+## Configuration
+
+Everything has a default; configuration is only for non-standard setups.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8731` | Port the town and API are served on |
+| `HOST` | `0.0.0.0` | Bind address; use `127.0.0.1` to serve only this machine |
+| `HERDR_SOCKET_PATH` | auto | Explicit path to Herdr's Unix socket |
+| `HERDR_SESSION` | auto | Named Herdr session to connect to |
+| `AGENT_MACHI_EVENTS_LOG` | `~/.local/share/agent-machi/events.jsonl` | Where the event log is kept |
+| `AGENT_MACHI_NO_OPEN` | unset | Set to `1` (or pass `--no-open`) to skip opening the browser |
+
+## How it works
+
+The binary connects to Herdr's Unix socket API and keeps a live table of
+agents and their states. State changes are pushed to the page as server-sent
+events; the page plans each character's walk through the town (station, offices,
+beach) on a route graph and animates it. Every event is also appended to a
+JSONL log on disk, which is what the Log panel reads back after a reload.
+Protocol notes from reverse-engineering the Herdr 0.9.5 socket API live in
+`docs/herdr-schema-notes.md`.
+
+## Development
+
+The web frontend is Vite + Three.js under `src/`; the original Node bridge is
+kept in `tools/herdr-bridge/` as the reference implementation and for scripted
+FAKE scenarios used in tests and demos:
 
 ```sh
 npm install
-npm run bridge         # real Herdr socket
-npm run dev            # http://<this-host>:5173
-
-npm run bridge:fake    # scripted working -> blocked -> working -> done -> idle
-
-FAKE_SCENARIO=flip npm run bridge       # working -> done 2s apart (debounce check)
-FAKE_SCENARIO=blocked2 npm run bridge   # two agents claim S and S-2
-FAKE_SCENARIO=roster npm run bridge     # three interleaved agents (third log only)
-FAKE_SCENARIO=cast npm run bridge       # four agents use Amber/Teal/Moss/Plum
-FAKE_SCENARIO=castreuse npm run bridge  # Moss pane leaves, a new agent inherits Moss
-FAKE_SCENARIO=home npm run bridge       # one agent loops working/blocked/done/idle
-FAKE_SCENARIO=homeblock npm run bridge  # working, then blocked while entering home
-FAKE_SCENARIO=home4 npm run bridge      # four agents go home; doorstep/sign check
-FAKE_SCENARIO=signnames npm run bridge  # pane_id fallback + a long resident name
-FAKE_SCENARIO=dupe npm run bridge       # two agents resolve to the same display name
-FAKE_SCENARIO=beach3 npm run bridge     # three idle agents share six beach spots
-FAKE_SCENARIO=panelnames npm run bridge # roster/Log name format: role + display_name
-FAKE_SCENARIO=demo npm run bridge       # recording timeline: office signs, station, beach
+npm run bridge:fake   # scripted agents, no Herdr needed
+npm run dev           # http://localhost:5173
 ```
 
-Override the bridge in the app with `?bridge=http://host:port`.
-When the bridge is unreachable the page shows `bridge: disconnected` instead
-of a blank screen.
+The Go bridge is verified against the Node bridge scenario by scenario; the
+frontend is identical for both.
 
-## Run the binary
+## Scene provenance
 
-The Go binary serves the built Vite page and the bridge API on the same port.
-It uses only the Go standard library, has no cgo dependency, and embeds the
-page from `internal/web/dist`.
+The town under `src/town/` is derived from
+[happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea) at
+commit `a7f589e7` (2026-11-08) and develops independently inside agent-machi
+from that point. Its graph data is slimmed to the fields the loader reads; see
+`src/town/graph/data/PROVENANCE.md`.
 
-```sh
-./scripts/build-binary.sh   # npm run build, copy dist, go build -o agent-machi
-./agent-machi               # opens http://localhost:8731 unless headless
-```
+## License
 
-`scripts/build-binary.sh` stops with a clear error if `dist/index.html` is
-missing. `AGENT_MACHI_NO_OPEN=1` or `--no-open` disables the browser launch;
-FAKE mode never opens a browser. A failed launch only prints a warning.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `HOST` | `0.0.0.0` | listen address |
-| `PORT` | `8731` | page and API port |
-| `HERDR_SOCKET_PATH` | — | explicit Herdr Unix socket |
-| `HERDR_SESSION` | `default` | named Herdr session (`~/.config/herdr/sessions/<name>/herdr.sock`) |
-| `FAKE` | — | `1` uses scripted agents instead of Herdr |
-| `FAKE_SCENARIO` | `default` | fake script name |
-| `AGENT_MACHI_EVENTS_LOG` | `~/.local/share/agent-machi/events.jsonl` | event log path |
-| `AGENT_MACHI_NO_OPEN` | — | `1` disables auto-open |
-
-The Node bridge remains the development and reference implementation; the Go
-binary is the single-file deployment path. Both speak the same HTTP and
-`events.jsonl` formats.
-
-Bridge endpoints (default `HOST=0.0.0.0:8731`; set `HOST=127.0.0.1` to
-restrict to this machine):
-
-- `GET /snapshot` — array of `{pane_id,name,display_name,terminal_title_stripped,agent,agent_status,status_since,last_change_seq}`
-- `GET /events` — SSE; each `data:` is `{source,pane_id,name,display_name,terminal_title_stripped,agent,status,at}`
-- `GET /log?limit=200` — last N events from `events.jsonl` in arrival order (default 200, max 2000); bad lines are skipped
-- `GET /health`
-
-Every event is appended to `tools/herdr-bridge/events.jsonl` by the Node
-bridge. The Go binary defaults to
-`~/.local/share/agent-machi/events.jsonl`; set `AGENT_MACHI_EVENTS_LOG` to
-share a file between both implementations.
-
-The page also shows a collapsible roster (all bridge agents, with role, status,
-duration, home) and a collapsible Log panel fed by `/log` plus the live SSE
-stream. Roster rows for the first six agents highlight their role (Amber,
-Teal, Moss, Plum, Slate or Sand) in the scene; agents after the sixth are
-marked `log only`. Rows are removed when the bridge's snapshot no longer
-contains that pane. The Log panel loads recent history from `/log` first, so
-it survives a page reload, then appends live SSE events.
-
-## Display names
-
-The bridge computes `display_name` for every agent: `name`, else the basename
-of `foreground_cwd`/`cwd`, else the agent kind, else `pane_id`. Basenames that
-are the home directory, empty, `/`, temporary directories or otherwise
-non-identifying are skipped. Live agents with the same base name get ` (2)`,
-` (3)` suffixes in first-seen order; the first one keeps the plain name.
-Roster and Log show `Role (display_name)` for agents with a character, e.g.
-`Amber (agent-machi)`. Log-only agents show just `display_name`. Home signs
-and the head name tag use the character name alone. Old `/log` entries without
-`display_name` fall back to `name`, `terminal_title_stripped`, then `pane_id`.
-
-## State mapping
-
-| Herdr status | Town target |
-| --- | --- |
-| `working` | assigned home |
-| `done` | assigned home |
-| `blocked` | first free station slot: `S`, `S-2`, `S-3` |
-| `idle` | nearer beach entrance by route length, then a free beach spot |
-| `unknown` | no move |
-
-Home pool order is `P4, P2, P1, P3, P5, R1, R2`. Assignments are keyed by
-`pane_id` and persisted in localStorage, so a reconnect does not change home.
-Amber/Teal/Moss/Plum/Slate/Sand assignment is also persisted by `pane_id`;
-agents after the sixth are only logged to the console and
-`window.__agentMachi.log()`.
-
-A new agent is placed on `S`. A status must stay unchanged for 3 seconds before
-it moves. If the target changes during a walk, the traveller finishes the
-current edge and replans from the next node (mid-route turn, not a snap).
-
-## Homes and signs
-
-When the stable target is `working` or `done`, the traveller walks to the home
-graph node, then a short straight doorstep segment (0.9s), fading out; arrival
-sets `visible = false` and `inside = true`. Leaving home reverses it: appear at
-the doorstep, fade in, walk back to the node, then continue the route. If the
-stable target changes to a non-home while the traveller is entering, the entry
-is aborted and the traveller is made visible at the home node before routing;
-finishing an exit always completes before the next route. Invariant: a stable
-non-home status can never leave a traveller invisible.
-
-Each assigned home gets a sign with the **character name** (Amber, Teal, Moss,
-Plum, Slate, Sand), a status lamp using the same `STATUS_COLORS` as the roster,
-and a pulsing `!` badge while `done`. The name tag above the character uses the
-same character name. The roster and Log instead use the bridge
-`display_name`. The sign panel is bright while the resident is inside and dim
-while they are away. It is redrawn only when the name or status changes.
-Signs are removed when the pane disappears and the home assignment is released.
-
-Doorsteps are kept in `src/homes.ts` (no graph changes). Each one is derived
-from the nearest authored building: move toward the home graph node to the
-rotated footprint boundary plus 0.16 WU, then put the sign on the road/camera
-side. All sign yaw values are `0.46` so the panels face the camera.
-
-| node | doorstep (x,z) | sign (x,z) | nearest building |
-| --- | --- | --- | --- |
-| P4 | -0.814, -3.452 | -0.05, -2.95 | B04 north courtyard house |
-| P2 | -4.87, -1.496 | -4.75, -0.75 | B03 south rear household |
-| P1 | -3.158, -3.948 | -2.72, -3.55 | B01 Onari craft frontage |
-| P3 | 4.538, -4.924 | 3.95, -4.35 | B02 east-gate tea frontage |
-| P5 | 4.557, 2.791 | 4.686, 3.101 | B08 south Wakamiya craft frontage |
-| R1 | -3.037, -2.621 | -2.637, -2.221 | B03 Onari tea frontage |
-| R2 | 4.538, -3.331 | 4.25, -2.9 | B02/B05 Wakamiya coffee frontage |
-
-## Beaches
-
-Idle agents walk to the nearer beach entrance (`F-W` or `F-E`), then leave the
-graph on a short straight segment to a free beach spot. Six spots are defined
-in `src/beaches.ts`, three per entrance. A traveller keeps its spot while
-idle, so two visible travellers never share one; the spot is released when the
-status changes and the traveller starts walking back to the entrance.
-
-| spot | entrance | x | z |
-| --- | --- | --- | --- |
-| W1 | F-W | -4.35 | 6.66 |
-| W2 | F-W | -3.25 | 6.78 |
-| W3 | F-W | -2.15 | 6.64 |
-| E1 | F-E | 2.15 | 6.64 |
-| E2 | F-E | 3.25 | 6.78 |
-| E3 | F-E | 4.35 | 6.66 |
-
-The spots sit on dry sand roughly 0.4-0.6 WU inland of the surf, using the same
-`MAP_GROUND_Y` as the route animator.
-
-## Camera and background
-
-OrbitControls is attached to the render canvas: left-drag orbits, wheel zooms,
-right-drag pans, and touch pinch/drag work. Because the camera is
-orthographic, the effective limits are `minZoom = 0.55` and `maxZoom = 5`
-(about 72.0 to 7.9 WU equivalent distance for the initial offset), with
-`maxPolarAngle = Math.PI / 2 - 0.08` so the view stays above the tabletop.
-Damping is on and updated every frame. **Reset view** restores the initial
-position, target and zoom. The background is the named constant
-`BACKGROUND_COLOR = "#16191d"` in `src/main.ts`, also used by `body` and the
-tabletop so there is no white flash.
-
-## Notes
-
-- Pathfinding is a new Dijkstra in `src/planner.ts` over the vendored town
-  graph's `getTraversableEdges()` using `worldLength`.
-- Animation is a thin new `src/animator.ts` on `samplePathAlongEdge`
-  (3.0 WU/s, yaw, `MAP_GROUND_Y`).
-- `src/town/` is vendored into this repo; there is no submodule.
+MIT
