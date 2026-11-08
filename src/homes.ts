@@ -65,44 +65,59 @@ function drawPanel(
   const { width, height } = context.canvas;
   context.clearRect(0, 0, width, height);
 
-  context.fillStyle = "#f4ecd8";
+  context.fillStyle = "#f8f0da";
   context.beginPath();
-  context.roundRect(5, 5, width - 10, height - 10, 18);
+  context.roundRect(10, 10, width - 20, height - 20, 36);
   context.fill();
-  context.strokeStyle = "#46584d";
-  context.lineWidth = 7;
+  context.strokeStyle = "#3c4f43";
+  context.lineWidth = 14;
   context.stroke();
-  context.strokeStyle = "#b8a888";
-  context.lineWidth = 2;
+  context.strokeStyle = "#b7a583";
+  context.lineWidth = 4;
   context.beginPath();
-  context.roundRect(17, 17, width - 34, height - 34, 12);
+  context.roundRect(34, 34, width - 68, height - 68, 24);
   context.stroke();
 
-  context.fillStyle = "#46584d";
-  context.font = "600 20px ui-monospace, SFMono-Regular, Menlo, monospace";
+  context.fillStyle = "#3c4f43";
+  context.font = "800 52px ui-sans-serif, -apple-system, 'Helvetica Neue', Arial, sans-serif";
   context.textAlign = "left";
   context.textBaseline = "middle";
-  context.fillText("HOME", 92, 50);
+  context.fillText("HOME", 80, 88);
+
+  context.strokeStyle = "#c9b795";
+  context.lineWidth = 4;
+  context.beginPath();
+  context.moveTo(80, 148);
+  context.lineTo(width - 80, 148);
+  context.stroke();
+
+  const lampDiameter = 168;
+  const gap = 36;
+  const maxTextWidth = width - 160 - lampDiameter - gap;
+  let size = 170;
+  context.font = `800 ${size}px ui-sans-serif, -apple-system, 'Helvetica Neue', Arial, sans-serif`;
+  while (size > 68 && context.measureText(name).width > maxTextWidth) {
+    size -= 4;
+    context.font = `800 ${size}px ui-sans-serif, -apple-system, 'Helvetica Neue', Arial, sans-serif`;
+  }
+  const textWidth = Math.min(context.measureText(name).width, maxTextWidth);
+  const rowWidth = lampDiameter + gap + textWidth;
+  const rowX = (width - rowWidth) / 2;
+  const rowY = 300;
 
   const color = statusColor(status);
   context.beginPath();
-  context.arc(58, 132, 27, 0, Math.PI * 2);
+  context.arc(rowX + lampDiameter / 2, rowY, lampDiameter / 2, 0, Math.PI * 2);
   context.fillStyle = color;
   context.fill();
-  context.lineWidth = 5;
-  context.strokeStyle = "#2b3730";
+  context.lineWidth = 12;
+  context.strokeStyle = "#26332b";
   context.stroke();
 
-  let size = 64;
-  context.font = `700 ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-  while (size > 28 && context.measureText(name).width > 390) {
-    size -= 2;
-    context.font = `700 ${size}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-  }
-  context.fillStyle = "#18211b";
+  context.fillStyle = "#0e140f";
   context.textAlign = "left";
   context.textBaseline = "middle";
-  context.fillText(name, 105, 138, 390);
+  context.fillText(name, rowX + lampDiameter + gap, rowY, maxTextWidth);
   texture.needsUpdate = true;
 }
 
@@ -146,23 +161,24 @@ export class HomeSign {
     this.group.rotation.y = spot.signYaw;
 
     this.canvas = document.createElement("canvas");
-    this.canvas.width = 512;
-    this.canvas.height = 256;
+    this.canvas.width = 1024;
+    this.canvas.height = 512;
     const context = this.canvas.getContext("2d");
     if (!context) throw new Error("Missing 2D canvas context for home sign");
     this.context = context;
     this.texture = new THREE.CanvasTexture(this.canvas);
     this.texture.colorSpace = THREE.SRGBColorSpace;
+    this.texture.anisotropy = 8;
 
     this.panel = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.92, 0.46),
+      new THREE.PlaneGeometry(1.15, 0.58),
       new THREE.MeshBasicMaterial({
         map: this.texture,
         transparent: true,
         side: THREE.DoubleSide,
       }),
     );
-    this.panel.position.set(0, 0.76, 0.03);
+    this.panel.position.set(0, 0.84, 0.03);
     this.panel.name = `home sign panel ${spot.node}`;
 
     const poleMaterial = new THREE.MeshStandardMaterial({
@@ -170,8 +186,8 @@ export class HomeSign {
       roughness: 1,
       flatShading: true,
     });
-    this.pole = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.70, 0.055), poleMaterial);
-    this.pole.position.set(0, 0.35, 0);
+    this.pole = new THREE.Mesh(new THREE.BoxGeometry(0.065, 0.82, 0.065), poleMaterial);
+    this.pole.position.set(0, 0.44, 0);
     this.pole.castShadow = true;
     const base = new THREE.Mesh(
       new THREE.BoxGeometry(0.24, 0.06, 0.24),
@@ -195,7 +211,7 @@ export class HomeSign {
     });
     this.badge = new THREE.Sprite(this.badgeMaterial);
     this.badge.scale.set(0.28, 0.28, 1);
-    this.badge.position.set(0, 1.16, 0.04);
+    this.badge.position.set(0, 1.36, 0.04);
     this.badge.visible = false;
     this.badge.renderOrder = 3;
 
