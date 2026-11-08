@@ -536,7 +536,7 @@ export class Director {
     const sign = new HomeSign(
       spot,
       this.groundY,
-      this.signName(actor),
+      this.officeName(actor),
       actor.reportedStatus ?? "unknown",
     );
     this.homeSigns.set(actor.paneId, sign);
@@ -548,13 +548,17 @@ export class Director {
     return this.getRole(actor.paneId) ?? actor.displayName;
   }
 
+  private officeName(actor: Actor): string {
+    return `${this.signName(actor)} Office`;
+  }
+
   private syncSign(actor: Actor): void {
     const node = this.getHome(actor.paneId);
     if (!node) return;
     this.ensureHomeSign(actor, node);
     const sign = this.homeSigns.get(actor.paneId);
     if (!sign) return;
-    sign.setContent(this.signName(actor), actor.reportedStatus ?? "unknown");
+    sign.setContent(this.officeName(actor), actor.reportedStatus ?? "unknown");
     sign.setLit(actor.inside);
     sign.setDone(actor.reportedStatus === "done");
   }
