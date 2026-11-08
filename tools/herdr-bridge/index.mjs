@@ -479,6 +479,18 @@ function startFake() {
     return;
   }
 
+  if (FAKE_SCENARIO === "home4") {
+    // Four agents, all settle into their homes; for doorstep/sign spot checks.
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    const p3 = makeAgent("fake:p3", "Fake Agent C");
+    const p4 = makeAgent("fake:p4", "Fake Agent D");
+    at(1500, p1, "working");
+    at(2500, p2, "working");
+    at(3500, p3, "working");
+    at(4500, p4, "working");
+    return;
+  }
+
   if (FAKE_SCENARIO === "castreuse") {
     const p2 = makeAgent("fake:p2", "Fake Agent B");
     const p3 = makeAgent("fake:p3", "Fake Agent C");
@@ -497,6 +509,28 @@ function startFake() {
     return;
   }
 
+
+  if (FAKE_SCENARIO === "home") {
+    // One agent: home -> blocked -> home(done) -> beach(idle), then repeat.
+    // The loop lets a manually opened page join at any phase.
+    const cycle = () => {
+      at(0, p1, "working");
+      at(16000, p1, "blocked");
+      at(32000, p1, "done");
+      at(48000, p1, "idle");
+      setTimeout(cycle, 64000);
+    };
+    setTimeout(cycle, 8000);
+    return;
+  }
+
+  if (FAKE_SCENARIO === "homeblock") {
+    // Enter the home, then flip to blocked: the traveller must come back out
+    // visibly and finish at the station, never stuck invisible.
+    at(10000, p1, "working");
+    at(15000, p1, "blocked");
+    return;
+  }
 
   const script = ["working", "blocked", "working", "done", "idle"];
   let step = 0;

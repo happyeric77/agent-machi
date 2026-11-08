@@ -166,7 +166,7 @@ window.addEventListener("resize", resize);
 resize();
 
 const graph = loadGraph();
-const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement);
+const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement, scene);
 const bridgeUrl =
   new URLSearchParams(window.location.search).get("bridge") ||
   `http://${location.hostname}:8731`;

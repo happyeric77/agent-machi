@@ -24,6 +24,9 @@ FAKE_SCENARIO=blocked2 npm run bridge   # two agents claim S and S-2
 FAKE_SCENARIO=roster npm run bridge     # three interleaved agents (third log only)
 FAKE_SCENARIO=cast npm run bridge       # four agents use Amber/Teal/Moss/Plum
 FAKE_SCENARIO=castreuse npm run bridge  # Moss pane leaves, a new agent inherits Moss
+FAKE_SCENARIO=home npm run bridge       # one agent loops working/blocked/done/idle
+FAKE_SCENARIO=homeblock npm run bridge  # working, then blocked while entering home
+FAKE_SCENARIO=home4 npm run bridge      # four agents go home; doorstep/sign check
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
@@ -67,6 +70,38 @@ agents after the sixth are only logged to the console and
 A new agent is placed on `S`. A status must stay unchanged for 3 seconds before
 it moves. If the target changes during a walk, the traveller finishes the
 current edge and replans from the next node (mid-route turn, not a snap).
+
+## Homes and signs
+
+When the stable target is `working` or `done`, the traveller walks to the home
+graph node, then a short straight doorstep segment (0.9s), fading out; arrival
+sets `visible = false` and `inside = true`. Leaving home reverses it: appear at
+the doorstep, fade in, walk back to the node, then continue the route. If the
+stable target changes to a non-home while the traveller is entering, the entry
+is aborted and the traveller is made visible at the home node before routing;
+finishing an exit always completes before the next route. Invariant: a stable
+non-home status can never leave a traveller invisible.
+
+Each assigned home gets a sign with the resident name (`name`, else `pane_id`),
+a status lamp using the same `STATUS_COLORS` as the roster, and a pulsing `!`
+badge while `done`. The sign panel is bright while the resident is inside and
+dim while they are away. It is redrawn only when the name or status changes.
+Signs are removed when the pane disappears and the home assignment is released.
+
+Doorsteps are kept in `src/homes.ts` (no graph changes). Each one is derived
+from the nearest authored building: move toward the home graph node to the
+rotated footprint boundary plus 0.16 WU, then put the sign on the road/camera
+side. All sign yaw values are `0.46` so the panels face the camera.
+
+| node | doorstep (x,z) | sign (x,z) | nearest building |
+| --- | --- | --- | --- |
+| P4 | -0.814, -3.452 | -0.05, -2.95 | B04 north courtyard house |
+| P2 | -4.87, -1.496 | -4.75, -0.75 | B03 south rear household |
+| P1 | -3.158, -3.948 | -2.72, -3.55 | B01 Onari craft frontage |
+| P3 | 4.538, -4.924 | 3.95, -4.35 | B02 east-gate tea frontage |
+| P5 | 4.557, 2.791 | 4.686, 3.101 | B08 south Wakamiya craft frontage |
+| R1 | -3.037, -2.621 | -2.637, -2.221 | B03 Onari tea frontage |
+| R2 | 4.538, -3.331 | 4.25, -2.9 | B02/B05 Wakamiya coffee frontage |
 
 ## Notes
 
