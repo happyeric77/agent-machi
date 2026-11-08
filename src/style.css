@@ -195,24 +195,6 @@ body {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #8d9891;
-}
-
-.roster-row[data-status="working"] .status-dot {
-  background: #f2b705;
-}
-
-.roster-row[data-status="blocked"] .status-dot {
-  background: #e2604a;
-  box-shadow: 0 0 0 3px rgba(226, 96, 74, 0.16);
-}
-
-.roster-row[data-status="done"] .status-dot {
-  background: #6ec08a;
-}
-
-.roster-row[data-status="idle"] .status-dot {
-  background: #7ea8c4;
 }
 
 .status-duration {
@@ -259,16 +241,4 @@ body {
 
 .log-change {
   color: #bdc8c0;
-}
-
-.log-entry[data-status="blocked"] .log-change {
-  color: #f08b79;
-}
-
-.log-entry[data-status="done"] .log-change {
-  color: #8bd3a4;
-}
-
-.log-entry[data-status="working"] .log-change {
-  color: #f6cf5b;
 }

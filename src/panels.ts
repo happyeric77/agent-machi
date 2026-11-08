@@ -1,4 +1,5 @@
 import type { AgentRow, BridgeEvent, Director } from "./director.ts";
+import { statusColor } from "./status.ts";
 
 const STATUS_LABELS: Record<string, string> = {
   idle: "idle",
@@ -86,6 +87,9 @@ export class RosterPanel {
 
       const meta = el("span", "roster-meta");
       const dot = el("span", "status-dot");
+      dot.style.background = statusColor(row.agent_status);
+      dot.style.boxShadow =
+        row.agent_status === "blocked" ? `0 0 0 3px ${statusColor("blocked")}2e` : "none";
       const status = el("span", "status-text");
       status.textContent = STATUS_LABELS[row.agent_status] ?? row.agent_status;
       const duration = el("span", "status-duration");
@@ -240,6 +244,7 @@ export class LogPanel {
     });
 
     const change = el("span", "log-change");
+    change.style.color = statusColor(event.status);
     const previous = this.lastStatus.get(event.pane_id);
     change.textContent =
       previous && previous !== event.status

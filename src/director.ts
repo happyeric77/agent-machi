@@ -3,6 +3,8 @@ import type { Object3D } from "three";
 import type { Graph } from "../station-to-sea/src/game/graph.ts";
 import { RouteAnimator } from "./animator.ts";
 import { ACCENTS, TRAVELLERS, createNameTag, type NameTag } from "./characters.ts";
+import { createFadeController, type FadeController } from "./fade.ts";
+import { HomeSign, homeSpot } from "./homes.ts";
 import { logLine } from "./log.ts";
 import { planRoute, routeLength, type RouteStep } from "./planner.ts";
 
@@ -32,9 +34,20 @@ const HOME_POOL = ["P4", "P2", "P1", "P3", "P5", "R1", "R2"] as const;
 const STATION_SLOTS = ["S", "S-2", "S-3"] as const;
 const BEACH_NODES = ["F-W", "F-E"] as const;
 const DEBOUNCE_MS = 3000;
+const DOORSTEP_SECONDS = 0.9;
 
 const HOMES_KEY = "agent-machi.homes";
 const TRAVELLERS_KEY = "agent-machi.travellers";
+
+interface DoorState {
+  phase: "entering" | "exiting";
+  elapsed: number;
+  duration: number;
+  fromX: number;
+  fromZ: number;
+  toX: number;
+  toZ: number;
+}
 
 interface Actor {
   paneId: string;
@@ -46,8 +59,11 @@ interface Actor {
   node: string;
   targetNode: string | null;
   moving: boolean;
+  inside: boolean;
+  door: DoorState | null;
   blockedSlot: string | null;
   animator: RouteAnimator;
+  fade: FadeController;
   ring: THREE.Mesh;
   tag: NameTag;
   highlightTimer: ReturnType<typeof setTimeout> | null;
@@ -84,11 +100,13 @@ export class Director {
   private readonly travelers: Object3D[];
   private readonly groundY: number;
   private readonly statusElement: HTMLElement;
+  private readonly signParent: Object3D;
 
   private readonly actors = new Map<string, Actor>();
   private readonly extraStatuses = new Map<string, AgentStatus>();
   private readonly blockedOccupancy = new Map<string, string>();
   private readonly roster = new Map<string, AgentRow>();
+  private readonly homeSigns = new Map<string, HomeSign>();
   private readonly rosterListeners = new Set<() => void>();
   private readonly eventListeners = new Set<(event: BridgeEvent) => void>();
   private snapshotTimer: ReturnType<typeof setInterval> | null = null;
@@ -99,11 +117,18 @@ export class Director {
   private bridgeUrl = `http://${location.hostname}:8731`;
   private eventSource: EventSource | null = null;
 
-  constructor(graph: Graph, travelers: Object3D[], groundY: number, statusElement: HTMLElement) {
+  constructor(
+    graph: Graph,
+    travelers: Object3D[],
+    groundY: number,
+    statusElement: HTMLElement,
+    signParent: Object3D,
+  ) {
     this.graph = graph;
     this.travelers = travelers;
     this.groundY = groundY;
     this.statusElement = statusElement;
+    this.signParent = signParent;
   }
 
   getRoster(): AgentRow[] {
@@ -175,8 +200,10 @@ export class Director {
 
   update(dtSeconds: number): void {
     for (const actor of this.actors.values()) {
-      if (actor.moving) actor.animator.update(dtSeconds);
+      if (actor.door) this.updateDoor(actor, dtSeconds);
+      else if (actor.moving) actor.animator.update(dtSeconds);
     }
+    for (const sign of this.homeSigns.values()) sign.update(dtSeconds);
   }
 
   private setBridgeState(state: "connecting" | "online" | "offline", text: string): void {
@@ -233,6 +260,7 @@ export class Director {
       actor.agent = row.agent;
       actor.tag.setText(row.name || row.pane_id);
       this.setStatus(actor, normalizeStatus(row.agent_status));
+      this.syncSign(actor);
     }
     this.emitRoster();
   }
@@ -263,6 +291,7 @@ export class Director {
     actor.agent = event.agent;
     actor.tag.setText(event.name || event.pane_id);
     this.setStatus(actor, status);
+    this.syncSign(actor);
     this.emitRoster();
   }
 
@@ -273,13 +302,20 @@ export class Director {
       if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
       this.releaseBlockedSlot(actor);
       actor.moving = false;
+      actor.door = null;
       actor.traveler.visible = false;
+      actor.fade.dispose();
       actor.ring.removeFromParent();
       actor.ring.geometry.dispose();
       (actor.ring.material as THREE.Material).dispose();
       actor.tag.sprite.removeFromParent();
       actor.tag.dispose();
       this.actors.delete(paneId);
+    }
+    const sign = this.homeSigns.get(paneId);
+    if (sign) {
+      sign.dispose();
+      this.homeSigns.delete(paneId);
     }
     if (paneId in this.travellerSlots) {
       delete this.travellerSlots[paneId];
@@ -324,8 +360,11 @@ export class Director {
       node: "S",
       targetNode: null,
       moving: false,
+      inside: false,
+      door: null,
       blockedSlot: null,
       animator: null as unknown as RouteAnimator,
+      fade: null as unknown as FadeController,
       ring,
       tag,
       highlightTimer: null,
@@ -335,6 +374,8 @@ export class Director {
       this.onNodeReached(actor, nodeId);
     });
     actor.traveler.add(ring, tag.sprite);
+    actor.fade = createFadeController(actor.traveler);
+    actor.fade.set(1);
     this.actors.set(paneId, actor);
     this.placeAtNode(actor, "S");
     logLine(`${paneId} (${row.name ?? row.agent ?? "agent"}) 第一次偵測到，放在 S，角色 ${role}`);
@@ -374,6 +415,7 @@ export class Director {
   private setStatus(actor: Actor, status: AgentStatus): void {
     if (actor.reportedStatus === status) return;
     actor.reportedStatus = status;
+    this.syncSign(actor);
     if (actor.debounceTimer) {
       clearTimeout(actor.debounceTimer);
       actor.debounceTimer = null;
@@ -397,8 +439,9 @@ export class Director {
     const status = actor.stableStatus;
     if (!status || status === "unknown") return;
 
+    const wantsHome = status === "working" || status === "done";
     let target: string | null = null;
-    if (status === "working" || status === "done") {
+    if (wantsHome) {
       target = this.homeFor(actor.paneId);
     } else if (status === "blocked") {
       target = this.acquireBlockedSlot(actor);
@@ -412,6 +455,24 @@ export class Director {
     }
 
     actor.targetNode = target;
+    if (wantsHome) this.ensureHomeSign(actor, target);
+    else if (actor.door?.phase === "entering") this.abortEnter(actor);
+
+    if (actor.door) {
+      logLine(`${actor.paneId} ${status}: 新目標 ${target}，門口動作完成後再走`);
+      return;
+    }
+
+    if (actor.inside) {
+      if (wantsHome && target === this.getHome(actor.paneId)) return;
+      this.beginExit(actor);
+      return;
+    }
+
+    if (wantsHome && actor.node === target && !actor.moving) {
+      this.beginEnter(actor);
+      return;
+    }
 
     if (actor.moving) {
       logLine(`${actor.paneId} ${status}: 新目標 ${target}，在目前路段終點改線`);
@@ -420,6 +481,137 @@ export class Director {
 
     logLine(`${actor.paneId} ${status}: 前往 ${target}`);
     this.startRoute(actor);
+  }
+
+  private ensureHomeSign(actor: Actor, node: string): void {
+    if (this.homeSigns.has(actor.paneId)) return;
+    const spot = homeSpot(node);
+    if (!spot) {
+      logLine(`${actor.paneId}: 家 ${node} 沒有門口資料`);
+      return;
+    }
+    const sign = new HomeSign(
+      spot,
+      this.groundY,
+      actor.name || actor.paneId,
+      actor.reportedStatus ?? "unknown",
+    );
+    this.homeSigns.set(actor.paneId, sign);
+    this.signParent.add(sign.group);
+    this.syncSign(actor);
+  }
+
+  private syncSign(actor: Actor): void {
+    const node = this.getHome(actor.paneId);
+    if (!node) return;
+    this.ensureHomeSign(actor, node);
+    const sign = this.homeSigns.get(actor.paneId);
+    if (!sign) return;
+    sign.setContent(actor.name || actor.paneId, actor.reportedStatus ?? "unknown");
+    sign.setLit(actor.inside);
+    sign.setDone(actor.reportedStatus === "done");
+  }
+
+  private beginEnter(actor: Actor): void {
+    if (actor.inside || actor.door) return;
+    const homeNode = this.getHome(actor.paneId);
+    const spot = homeNode ? homeSpot(homeNode) : null;
+    const node = homeNode ? this.graph.nodes.get(homeNode) : null;
+    if (!homeNode || !spot || !node) return;
+    actor.moving = false;
+    actor.door = {
+      phase: "entering",
+      elapsed: 0,
+      duration: DOORSTEP_SECONDS,
+      fromX: node.worldX,
+      fromZ: node.worldZ,
+      toX: spot.x,
+      toZ: spot.z,
+    };
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    logLine(`${actor.paneId} 進門 ${homeNode} → 門口`);
+  }
+
+  private beginExit(actor: Actor): void {
+    if (!actor.inside || actor.door) return;
+    const homeNode = this.getHome(actor.paneId);
+    const spot = homeNode ? homeSpot(homeNode) : null;
+    const node = homeNode ? this.graph.nodes.get(homeNode) : null;
+    if (!homeNode || !spot || !node) return;
+    actor.inside = false;
+    actor.moving = false;
+    actor.door = {
+      phase: "exiting",
+      elapsed: 0,
+      duration: DOORSTEP_SECONDS,
+      fromX: spot.x,
+      fromZ: spot.z,
+      toX: node.worldX,
+      toZ: node.worldZ,
+    };
+    actor.traveler.position.set(spot.x, this.groundY, spot.z);
+    actor.traveler.visible = true;
+    actor.fade.set(0);
+    this.syncSign(actor);
+    logLine(`${actor.paneId} 出門 ${homeNode} → 門口`);
+  }
+
+  private abortEnter(actor: Actor): void {
+    if (actor.door?.phase !== "entering") return;
+    actor.door = null;
+    actor.inside = false;
+    actor.moving = false;
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    this.placeAtNode(actor, actor.node);
+    this.syncSign(actor);
+    logLine(`${actor.paneId} 進門中斷，恢復可見`);
+  }
+
+  private updateDoor(actor: Actor, dtSeconds: number): void {
+    const door = actor.door;
+    if (!door) return;
+    door.elapsed += dtSeconds;
+    const t = Math.min(1, door.elapsed / door.duration);
+    actor.traveler.position.set(
+      door.fromX + (door.toX - door.fromX) * t,
+      this.groundY,
+      door.fromZ + (door.toZ - door.fromZ) * t,
+    );
+
+    if (door.phase === "entering") {
+      actor.fade.set(t < 0.35 ? 1 : 1 - (t - 0.35) / 0.65);
+    } else {
+      actor.fade.set(t < 0.65 ? t / 0.65 : 1);
+    }
+
+    if (t < 1) return;
+
+    actor.door = null;
+    if (door.phase === "entering") {
+      actor.inside = true;
+      actor.traveler.visible = false;
+      actor.fade.set(0);
+      this.syncSign(actor);
+      logLine(`${actor.paneId} 已進門`);
+      return;
+    }
+
+    actor.inside = false;
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    this.placeAtNode(actor, actor.node);
+    this.syncSign(actor);
+    logLine(`${actor.paneId} 已出門`);
+    if (this.isHomeTarget(actor)) this.beginEnter(actor);
+    else if (actor.targetNode) this.startRoute(actor);
+  }
+
+  private isHomeTarget(actor: Actor): boolean {
+    const status = actor.stableStatus;
+    return (status === "working" || status === "done") &&
+      actor.targetNode === this.getHome(actor.paneId);
   }
 
   private homeFor(paneId: string): string {
@@ -481,6 +673,7 @@ export class Director {
     if (steps.length === 0) {
       actor.node = actor.targetNode;
       actor.moving = false;
+      if (this.isHomeTarget(actor)) this.beginEnter(actor);
       return;
     }
     actor.moving = true;
@@ -495,6 +688,7 @@ export class Director {
     }
     actor.moving = false;
     logLine(`${actor.paneId} 抵達 ${nodeId}`);
+    if (this.isHomeTarget(actor)) this.beginEnter(actor);
   }
 
   private placeAtNode(actor: Actor, nodeId: string): void {
