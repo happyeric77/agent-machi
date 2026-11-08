@@ -2,7 +2,7 @@ package bridge
 
 import "time"
 
-const fakeDefaultCwd = "/Users/macbookpro4eric/Projects/agent-machi"
+const fakeDefaultCwd = "/Users/example/Projects/agent-machi"
 
 func strPtr(value string) *string { return &value }
 
