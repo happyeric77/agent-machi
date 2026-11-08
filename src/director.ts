@@ -210,6 +210,13 @@ export class Director {
     for (const paneId of [...this.roster.keys()]) {
       if (!seen.has(paneId)) this.roster.delete(paneId);
     }
+    for (const paneId of new Set([
+      ...this.actors.keys(),
+      ...Object.keys(this.travellerSlots),
+      ...Object.keys(this.homes),
+    ])) {
+      if (!seen.has(paneId)) this.removeAgent(paneId);
+    }
     this.emitRoster();
 
     for (const row of rows) {
@@ -252,9 +259,31 @@ export class Director {
     this.setStatus(actor, status);
   }
 
+  private removeAgent(paneId: string): void {
+    const actor = this.actors.get(paneId);
+    if (actor) {
+      if (actor.debounceTimer) clearTimeout(actor.debounceTimer);
+      if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
+      this.releaseBlockedSlot(actor);
+      actor.moving = false;
+      actor.traveler.visible = false;
+      this.actors.delete(paneId);
+    }
+    if (paneId in this.travellerSlots) {
+      delete this.travellerSlots[paneId];
+      saveMap(TRAVELLERS_KEY, this.travellerSlots);
+    }
+    if (paneId in this.homes) {
+      delete this.homes[paneId];
+      saveMap(HOMES_KEY, this.homes);
+    }
+    this.extraStatuses.delete(paneId);
+  }
+
   private createActor(paneId: string, row: { name: string | null; agent: string | null }): Actor | null {
     const slot = this.travellerSlot(paneId);
     if (slot === null) return null;
+    this.travelers[slot].visible = true;
 
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(0.26, 0.36, 32),
