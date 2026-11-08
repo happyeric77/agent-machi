@@ -1,4 +1,4 @@
-import type { Graph, GraphEdge, OutgoingEdgeOption } from "./station-to-sea/game/graph.ts";
+import type { Graph, GraphEdge, OutgoingEdgeOption } from "./town/graph/graph.ts";
 
 export type Direction = "FORWARD" | "REVERSE";
 

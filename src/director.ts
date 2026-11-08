@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { Object3D } from "three";
-import type { Graph } from "./station-to-sea/game/graph.ts";
+import type { Graph } from "./town/graph/graph.ts";
 import { RouteAnimator } from "./animator.ts";
 import { ACCENTS, TRAVELLERS, createNameTag, type NameTag } from "./characters.ts";
 import { createFadeController, type FadeController } from "./fade.ts";
