@@ -1,8 +1,9 @@
-# agent-machi — Milestone 2
+# agent-machi
 
 Herdr agent statuses drive up to six travellers (Amber, Teal, Moss, Plum,
 Slate, Sand) around the station-to-sea Kamakura scene. The game flow and HUD
-are not loaded.
+are not loaded. The UI is English; the camera supports orbit, zoom, pan and a
+Reset view button.
 
 > **Scene provenance:** the town source under `src/town/` is derived from
 > [happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea)
@@ -37,17 +38,20 @@ FAKE_SCENARIO=home npm run bridge       # one agent loops working/blocked/done/i
 FAKE_SCENARIO=homeblock npm run bridge  # working, then blocked while entering home
 FAKE_SCENARIO=home4 npm run bridge      # four agents go home; doorstep/sign check
 FAKE_SCENARIO=signnames npm run bridge  # pane_id fallback + a long resident name
+FAKE_SCENARIO=dupe npm run bridge       # two agents resolve to the same display name
+FAKE_SCENARIO=beach3 npm run bridge     # three idle agents share six beach spots
+FAKE_SCENARIO=panelnames npm run bridge # roster/Log name format: role + display_name
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
-When the bridge is unreachable the page shows `bridge: 未連線` instead of a
-blank screen.
+When the bridge is unreachable the page shows `bridge: disconnected` instead
+of a blank screen.
 
 Bridge endpoints (default `HOST=0.0.0.0:8731`; set `HOST=127.0.0.1` to
 restrict to this machine):
 
-- `GET /snapshot` — array of `{pane_id,name,terminal_title_stripped,agent,agent_status,status_since,last_change_seq}`
-- `GET /events` — SSE; each `data:` is `{source,pane_id,name,terminal_title_stripped,agent,status,at}`
+- `GET /snapshot` — array of `{pane_id,name,display_name,terminal_title_stripped,agent,agent_status,status_since,last_change_seq}`
+- `GET /events` — SSE; each `data:` is `{source,pane_id,name,display_name,terminal_title_stripped,agent,status,at}`
 - `GET /log?limit=200` — last N events from `events.jsonl` in arrival order (default 200, max 2000); bad lines are skipped
 - `GET /health`
 
@@ -61,6 +65,18 @@ marked `log only`. Rows are removed when the bridge's snapshot no longer
 contains that pane. The Log panel loads recent history from `/log` first, so
 it survives a page reload, then appends live SSE events.
 
+## Display names
+
+The bridge computes `display_name` for every agent: `name`, else the basename
+of `foreground_cwd`/`cwd`, else the agent kind, else `pane_id`. Basenames that
+are the home directory, empty, `/`, temporary directories or otherwise
+non-identifying are skipped. Live agents with the same base name get ` (2)`,
+` (3)` suffixes in first-seen order; the first one keeps the plain name.
+Roster and Log show `Role (display_name)` for agents with a character, e.g.
+`Amber (agent-machi)`. Log-only agents show just `display_name`. Home signs
+and the head name tag use the character name alone. Old `/log` entries without
+`display_name` fall back to `name`, `terminal_title_stripped`, then `pane_id`.
+
 ## State mapping
 
 | Herdr status | Town target |
@@ -68,7 +84,7 @@ it survives a page reload, then appends live SSE events.
 | `working` | assigned home |
 | `done` | assigned home |
 | `blocked` | first free station slot: `S`, `S-2`, `S-3` |
-| `idle` | nearer beach by route length: `F-W` or `F-E` |
+| `idle` | nearer beach entrance by route length, then a free beach spot |
 | `unknown` | no move |
 
 Home pool order is `P4, P2, P1, P3, P5, R1, R2`. Assignments are keyed by
@@ -92,10 +108,12 @@ is aborted and the traveller is made visible at the home node before routing;
 finishing an exit always completes before the next route. Invariant: a stable
 non-home status can never leave a traveller invisible.
 
-Each assigned home gets a sign with the resident name (`name`, else `pane_id`),
-a status lamp using the same `STATUS_COLORS` as the roster, and a pulsing `!`
-badge while `done`. The sign panel is bright while the resident is inside and
-dim while they are away. It is redrawn only when the name or status changes.
+Each assigned home gets a sign with the **character name** (Amber, Teal, Moss,
+Plum, Slate, Sand), a status lamp using the same `STATUS_COLORS` as the roster,
+and a pulsing `!` badge while `done`. The name tag above the character uses the
+same character name. The roster and Log instead use the bridge
+`display_name`. The sign panel is bright while the resident is inside and dim
+while they are away. It is redrawn only when the name or status changes.
 Signs are removed when the pane disappears and the home assignment is released.
 
 Doorsteps are kept in `src/homes.ts` (no graph changes). Each one is derived
@@ -113,10 +131,42 @@ side. All sign yaw values are `0.46` so the panels face the camera.
 | R1 | -3.037, -2.621 | -2.637, -2.221 | B03 Onari tea frontage |
 | R2 | 4.538, -3.331 | 4.25, -2.9 | B02/B05 Wakamiya coffee frontage |
 
+## Beaches
+
+Idle agents walk to the nearer beach entrance (`F-W` or `F-E`), then leave the
+graph on a short straight segment to a free beach spot. Six spots are defined
+in `src/beaches.ts`, three per entrance. A traveller keeps its spot while
+idle, so two visible travellers never share one; the spot is released when the
+status changes and the traveller starts walking back to the entrance.
+
+| spot | entrance | x | z |
+| --- | --- | --- | --- |
+| W1 | F-W | -4.35 | 6.66 |
+| W2 | F-W | -3.25 | 6.78 |
+| W3 | F-W | -2.15 | 6.64 |
+| E1 | F-E | 2.15 | 6.64 |
+| E2 | F-E | 3.25 | 6.78 |
+| E3 | F-E | 4.35 | 6.66 |
+
+The spots sit on dry sand roughly 0.4-0.6 WU inland of the surf, using the same
+`MAP_GROUND_Y` as the route animator.
+
+## Camera and background
+
+OrbitControls is attached to the render canvas: left-drag orbits, wheel zooms,
+right-drag pans, and touch pinch/drag work. Because the camera is
+orthographic, the effective limits are `minZoom = 0.55` and `maxZoom = 5`
+(about 72.0 to 7.9 WU equivalent distance for the initial offset), with
+`maxPolarAngle = Math.PI / 2 - 0.08` so the view stays above the tabletop.
+Damping is on and updated every frame. **Reset view** restores the initial
+position, target and zoom. The background is the named constant
+`BACKGROUND_COLOR = "#16191d"` in `src/main.ts`, also used by `body` and the
+tabletop so there is no white flash.
+
 ## Notes
 
-- Pathfinding is a new Dijkstra in `src/planner.ts` over the submodule's
-  `getTraversableEdges()` using `worldLength`.
+- Pathfinding is a new Dijkstra in `src/planner.ts` over the vendored town
+  graph's `getTraversableEdges()` using `worldLength`.
 - Animation is a thin new `src/animator.ts` on `samplePathAlongEdge`
   (3.0 WU/s, yaw, `MAP_GROUND_Y`).
-- The submodule is not modified.
+- `src/town/` is vendored into this repo; there is no submodule.

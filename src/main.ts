@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { createMapBlockout, createZoneOverlay, MAP_GROUND_Y } from "./town/map/scene.ts";
 import { createTown } from "./town/town.ts";
 import { createScenicShopfronts } from "./town/shops.ts";
@@ -30,8 +31,9 @@ if (!app) throw new Error("Missing #app");
 const statusElement = document.querySelector<HTMLDivElement>("#bridge-status");
 if (!statusElement) throw new Error("Missing #bridge-status");
 
+const BACKGROUND_COLOR = "#16191d";
 const scene = new THREE.Scene();
-scene.background = new THREE.Color("#e5ebe6");
+scene.background = new THREE.Color(BACKGROUND_COLOR);
 scene.add(createMapBlockout());
 scene.add(createNeighborhoodDetail(MAP_GROUND_Y));
 scene.add(createZoneOverlay());
@@ -115,7 +117,7 @@ scene.add(coast);
 
 const tabletop = new THREE.Mesh(
   new THREE.PlaneGeometry(200, 200),
-  new THREE.MeshStandardMaterial({ color: "#e5ebe6", roughness: 1, metalness: 0 }),
+  new THREE.MeshBasicMaterial({ color: BACKGROUND_COLOR, toneMapped: false }),
 );
 tabletop.rotation.x = -Math.PI / 2;
 tabletop.position.y = -0.025;
@@ -152,6 +154,31 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
 app.appendChild(renderer.domElement);
 
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(focus);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minPolarAngle = 0.12;
+controls.maxPolarAngle = Math.PI / 2 - 0.08;
+// OrthographicCamera zooms through camera.zoom, not camera distance, so the
+// effective OrbitControls limits are minZoom/maxZoom (equivalent distance
+// range is about 72.0 to 7.9 world units for the initial offset).
+controls.minZoom = 0.55;
+controls.maxZoom = 5;
+controls.update();
+
+const initialCameraPosition = camera.position.clone();
+const initialTarget = controls.target.clone();
+const resetButton = document.querySelector<HTMLButtonElement>("#reset-view");
+if (!resetButton) throw new Error("Missing #reset-view");
+resetButton.addEventListener("click", () => {
+  camera.position.copy(initialCameraPosition);
+  controls.target.copy(initialTarget);
+  camera.zoom = 1;
+  camera.updateProjectionMatrix();
+  controls.update();
+});
+
 function resize(): void {
   const width = Math.max(1, app!.clientWidth);
   const height = Math.max(1, app!.clientHeight);
@@ -183,6 +210,7 @@ const clock = new THREE.Clock();
 function frame(): void {
   const dt = Math.min(clock.getDelta(), 0.1);
   director.update(dt);
+  controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }

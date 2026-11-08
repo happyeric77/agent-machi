@@ -1,4 +1,5 @@
 import type { AgentRow, BridgeEvent, Director } from "./director.ts";
+import { resolveDisplayName } from "./display.ts";
 import { statusColor } from "./status.ts";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -9,14 +10,14 @@ const STATUS_LABELS: Record<string, string> = {
   unknown: "unknown",
 };
 
-function displayName(row: { name: string | null; terminal_title_stripped?: string | null; pane_id: string }): string {
-  return row.name || row.terminal_title_stripped || row.pane_id;
-}
-
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
   element.className = className;
   return element;
+}
+
+function formatName(role: string | null, displayName: string): string {
+  return role ? `${role} (${displayName})` : displayName;
 }
 
 function durationSince(iso: string): string {
@@ -59,7 +60,7 @@ export class RosterPanel {
 
   private updateHeader(): void {
     this.toggle.replaceChildren(
-      document.createTextNode("Agent 名冊 "),
+      document.createTextNode("Agents "),
       this.count,
       document.createTextNode(this.collapsed ? " ▸" : " ▾"),
     );
@@ -82,7 +83,7 @@ export class RosterPanel {
       const badge = el("span", `role-badge ${role ? `role-${role.toLowerCase()}` : "role-log"}`);
       badge.textContent = role ?? "log only";
       const name = el("span", "roster-name");
-      name.textContent = displayName(row);
+      name.textContent = formatName(role, resolveDisplayName(row));
       top.append(badge, name);
 
       const meta = el("span", "roster-meta");
@@ -102,7 +103,7 @@ export class RosterPanel {
       agent.textContent = row.agent ?? "agent ?";
       const home = el("span", "");
       const assigned = this.director.getHome(row.pane_id);
-      home.textContent = assigned ? `家 ${assigned}` : "家 未指派";
+      home.textContent = assigned ? `Home ${assigned}` : "Home unassigned";
       sub.append(agent, home);
 
       item.append(top, meta, sub);
@@ -110,8 +111,8 @@ export class RosterPanel {
         const highlighted = this.director.highlight(row.pane_id);
         this.showNote(
           highlighted
-            ? `已定位 ${role ?? displayName(row)}`
-            : `${displayName(row)} 沒有對應角色`,
+            ? `Located ${role ?? resolveDisplayName(row)}`
+            : `${resolveDisplayName(row)} has no character`,
         );
       });
       this.list.append(item);
@@ -158,6 +159,9 @@ export class LogPanel {
         this.list.scrollHeight - this.list.scrollTop - this.list.clientHeight < 24;
     });
     this.director.onEvent((event) => this.accept(event));
+    this.director.onRosterChange(() => {
+      if (this.historyLoaded) this.refreshNames();
+    });
     void this.loadHistory(bridgeUrl);
     document.body.append(this.root);
   }
@@ -226,6 +230,19 @@ export class LogPanel {
     if (this.stickToBottom) this.list.scrollTop = this.list.scrollHeight;
   }
 
+  private refreshNames(): void {
+    const nodes = this.list.children;
+    for (let index = 0; index < this.entries.length && index < nodes.length; index += 1) {
+      const name = nodes[index].querySelector(".log-name");
+      if (name) {
+        name.textContent = formatName(
+          this.director.getRole(this.entries[index].pane_id),
+          resolveDisplayName(this.entries[index]),
+        );
+      }
+    }
+  }
+
   private renderEntry(event: BridgeEvent): HTMLLIElement {
     const item = el("li", "log-entry");
     item.dataset.status = event.status;
@@ -237,11 +254,10 @@ export class LogPanel {
       : parsed.toLocaleTimeString("en-GB", { hour12: false });
 
     const name = el("span", "log-name");
-    name.textContent = displayName({
-      name: event.name,
-      terminal_title_stripped: event.terminal_title_stripped ?? null,
-      pane_id: event.pane_id,
-    });
+    name.textContent = formatName(
+      this.director.getRole(event.pane_id),
+      resolveDisplayName(event),
+    );
 
     const change = el("span", "log-change");
     change.style.color = statusColor(event.status);
@@ -249,7 +265,7 @@ export class LogPanel {
     change.textContent =
       previous && previous !== event.status
         ? `${previous} → ${event.status}`
-        : `偵測到 · ${event.status}`;
+        : `detected · ${event.status}`;
     this.lastStatus.set(event.pane_id, event.status);
 
     item.append(time, name, change);

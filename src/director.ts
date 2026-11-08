@@ -5,6 +5,8 @@ import { RouteAnimator } from "./animator.ts";
 import { ACCENTS, TRAVELLERS, createNameTag, type NameTag } from "./characters.ts";
 import { createFadeController, type FadeController } from "./fade.ts";
 import { HomeSign, homeSpot } from "./homes.ts";
+import { BEACH_SPOTS, beachSpot } from "./beaches.ts";
+import { resolveDisplayName } from "./display.ts";
 import { logLine } from "./log.ts";
 import { planRoute, routeLength, type RouteStep } from "./planner.ts";
 
@@ -13,6 +15,7 @@ export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 export interface AgentRow {
   pane_id: string;
   name: string | null;
+  display_name?: string | null;
   terminal_title_stripped?: string | null;
   agent: string | null;
   agent_status: AgentStatus;
@@ -24,6 +27,7 @@ export interface BridgeEvent {
   source: string;
   pane_id: string;
   name: string | null;
+  display_name?: string | null;
   terminal_title_stripped?: string | null;
   agent: string | null;
   status: AgentStatus;
@@ -40,6 +44,7 @@ const HOMES_KEY = "agent-machi.homes";
 const TRAVELLERS_KEY = "agent-machi.travellers";
 
 interface DoorState {
+  kind: "door" | "beach";
   phase: "entering" | "exiting";
   elapsed: number;
   duration: number;
@@ -47,11 +52,13 @@ interface DoorState {
   fromZ: number;
   toX: number;
   toZ: number;
+  label?: string;
 }
 
 interface Actor {
   paneId: string;
   name: string | null;
+  displayName: string;
   agent: string | null;
   traveler: Object3D;
   reportedStatus: AgentStatus | null;
@@ -62,6 +69,8 @@ interface Actor {
   inside: boolean;
   door: DoorState | null;
   blockedSlot: string | null;
+  beachSpot: string | null;
+  atBeachSpot: boolean;
   animator: RouteAnimator;
   fade: FadeController;
   ring: THREE.Mesh;
@@ -105,6 +114,7 @@ export class Director {
   private readonly actors = new Map<string, Actor>();
   private readonly extraStatuses = new Map<string, AgentStatus>();
   private readonly blockedOccupancy = new Map<string, string>();
+  private readonly beachOccupancy = new Map<string, string>();
   private readonly roster = new Map<string, AgentRow>();
   private readonly homeSigns = new Map<string, HomeSign>();
   private readonly rosterListeners = new Set<() => void>();
@@ -183,11 +193,11 @@ export class Director {
     }
     this.eventSource = new EventSource(`${this.bridgeUrl}/events`);
     this.eventSource.onopen = () => {
-      this.setBridgeState("online", "bridge: 已連線");
+      this.setBridgeState("online", "bridge: connected");
       this.refreshSnapshot();
     };
     this.eventSource.onerror = () => {
-      this.setBridgeState("offline", "bridge: 未連線");
+      this.setBridgeState("offline", "bridge: disconnected");
     };
     this.eventSource.onmessage = (message) => {
       try {
@@ -219,9 +229,9 @@ export class Director {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const rows = (await response.json()) as AgentRow[];
       this.applySnapshot(rows);
-      this.setBridgeState("online", "bridge: 已連線");
+      this.setBridgeState("online", "bridge: connected");
     } catch {
-      this.setBridgeState("offline", "bridge: 未連線");
+      this.setBridgeState("offline", "bridge: disconnected");
     } finally {
       clearTimeout(timer);
     }
@@ -257,8 +267,9 @@ export class Director {
         continue;
       }
       actor.name = row.name;
+      actor.displayName = resolveDisplayName(row);
       actor.agent = row.agent;
-      actor.tag.setText(row.name || row.pane_id);
+      actor.tag.setText(this.signName(actor));
       this.setStatus(actor, normalizeStatus(row.agent_status));
       this.syncSign(actor);
     }
@@ -272,6 +283,7 @@ export class Director {
     this.roster.set(event.pane_id, {
       pane_id: event.pane_id,
       name: event.name ?? previous?.name ?? null,
+      display_name: event.display_name ?? previous?.display_name ?? null,
       terminal_title_stripped:
         event.terminal_title_stripped ?? previous?.terminal_title_stripped ?? null,
       agent: event.agent ?? previous?.agent ?? null,
@@ -288,8 +300,9 @@ export class Director {
       return;
     }
     actor.name = event.name;
+    actor.displayName = resolveDisplayName(event);
     actor.agent = event.agent;
-    actor.tag.setText(event.name || event.pane_id);
+    actor.tag.setText(this.signName(actor));
     this.setStatus(actor, status);
     this.syncSign(actor);
     this.emitRoster();
@@ -301,6 +314,8 @@ export class Director {
       if (actor.debounceTimer) clearTimeout(actor.debounceTimer);
       if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
       this.releaseBlockedSlot(actor);
+      this.releaseBeachSpot(actor);
+      actor.atBeachSpot = false;
       actor.moving = false;
       actor.door = null;
       actor.traveler.visible = false;
@@ -328,10 +343,14 @@ export class Director {
     this.extraStatuses.delete(paneId);
   }
 
-  private createActor(paneId: string, row: { name: string | null; agent: string | null }): Actor | null {
+  private createActor(
+    paneId: string,
+    row: { name: string | null; display_name?: string | null; terminal_title_stripped?: string | null; agent: string | null },
+  ): Actor | null {
     const slot = this.travellerSlot(paneId);
     if (slot === null) return null;
     const role = TRAVELLERS[slot];
+    const displayName = resolveDisplayName({ ...row, pane_id: paneId });
     this.travelers[slot].visible = true;
 
     const ring = new THREE.Mesh(
@@ -348,11 +367,12 @@ export class Director {
     ring.position.y = 0.02;
     ring.visible = false;
 
-    const tag = createNameTag(row.name || paneId);
+    const tag = createNameTag(role);
 
     const actor: Actor = {
       paneId,
       name: row.name,
+      displayName,
       agent: row.agent,
       traveler: this.travelers[slot],
       reportedStatus: null,
@@ -363,6 +383,8 @@ export class Director {
       inside: false,
       door: null,
       blockedSlot: null,
+      beachSpot: null,
+      atBeachSpot: false,
       animator: null as unknown as RouteAnimator,
       fade: null as unknown as FadeController,
       ring,
@@ -378,7 +400,7 @@ export class Director {
     actor.fade.set(1);
     this.actors.set(paneId, actor);
     this.placeAtNode(actor, "S");
-    logLine(`${paneId} (${row.name ?? row.agent ?? "agent"}) 第一次偵測到，放在 S，角色 ${role}`);
+    logLine(`${paneId} (${displayName}) first seen, placed at S as ${role}`);
     return actor;
   }
 
@@ -409,7 +431,7 @@ export class Director {
   private logExtra(paneId: string, name: string | null, status: AgentStatus): void {
     if (this.extraStatuses.get(paneId) === status) return;
     this.extraStatuses.set(paneId, status);
-    logLine(`${paneId} (${name ?? "agent"}) -> ${status}（第三位起不畫）`);
+    logLine(`${paneId} (${name ?? "agent"}) -> ${status} (not drawn beyond six)`);
   }
 
   private setStatus(actor: Actor, status: AgentStatus): void {
@@ -423,7 +445,7 @@ export class Director {
 
     if (status !== "blocked") this.releaseBlockedSlot(actor);
     if (status === "unknown") {
-      logLine(`${actor.paneId} unknown：不移動`);
+      logLine(`${actor.paneId} unknown: hold position`);
       return;
     }
 
@@ -440,26 +462,34 @@ export class Director {
     if (!status || status === "unknown") return;
 
     const wantsHome = status === "working" || status === "done";
+    const wantsBeach = status === "idle";
     let target: string | null = null;
     if (wantsHome) {
       target = this.homeFor(actor.paneId);
     } else if (status === "blocked") {
       target = this.acquireBlockedSlot(actor);
-    } else if (status === "idle") {
+    } else if (wantsBeach) {
       target = this.nearestBeach(actor.node);
+      if (target) this.acquireBeachSpot(actor, target);
     }
 
     if (!target) {
-      logLine(`${actor.paneId} ${status}: 找不到可走目標`);
+      logLine(`${actor.paneId} ${status}: no reachable target`);
       return;
     }
 
     actor.targetNode = target;
-    if (wantsHome) this.ensureHomeSign(actor, target);
-    else if (actor.door?.phase === "entering") this.abortEnter(actor);
+    if (wantsHome) {
+      this.ensureHomeSign(actor, target);
+    } else if (actor.door?.kind === "door" && actor.door.phase === "entering") {
+      this.abortEnter(actor);
+    }
+    if (!wantsBeach && actor.door?.kind === "beach" && actor.door.phase === "entering") {
+      this.abortBeachApproach(actor);
+    }
 
     if (actor.door) {
-      logLine(`${actor.paneId} ${status}: 新目標 ${target}，門口動作完成後再走`);
+      logLine(`${actor.paneId} ${status}: new target ${target}; finishing current transition first`);
       return;
     }
 
@@ -469,17 +499,30 @@ export class Director {
       return;
     }
 
+    if (actor.atBeachSpot) {
+      if (wantsBeach && target === this.nearestBeach(actor.node)) return;
+      this.beginBeachReturn(actor);
+      this.releaseBeachSpot(actor);
+      return;
+    }
+    if (!wantsBeach) this.releaseBeachSpot(actor);
+
     if (wantsHome && actor.node === target && !actor.moving) {
       this.beginEnter(actor);
       return;
     }
 
-    if (actor.moving) {
-      logLine(`${actor.paneId} ${status}: 新目標 ${target}，在目前路段終點改線`);
+    if (wantsBeach && actor.node === target && !actor.moving) {
+      this.beginBeachApproach(actor);
       return;
     }
 
-    logLine(`${actor.paneId} ${status}: 前往 ${target}`);
+    if (actor.moving) {
+      logLine(`${actor.paneId} ${status}: new target ${target}; rerouting at current edge end`);
+      return;
+    }
+
+    logLine(`${actor.paneId} ${status}: heading to ${target}`);
     this.startRoute(actor);
   }
 
@@ -487,18 +530,22 @@ export class Director {
     if (this.homeSigns.has(actor.paneId)) return;
     const spot = homeSpot(node);
     if (!spot) {
-      logLine(`${actor.paneId}: 家 ${node} 沒有門口資料`);
+      logLine(`${actor.paneId}: home ${node} has no doorstep data`);
       return;
     }
     const sign = new HomeSign(
       spot,
       this.groundY,
-      actor.name || actor.paneId,
+      this.signName(actor),
       actor.reportedStatus ?? "unknown",
     );
     this.homeSigns.set(actor.paneId, sign);
     this.signParent.add(sign.group);
     this.syncSign(actor);
+  }
+
+  private signName(actor: Actor): string {
+    return this.getRole(actor.paneId) ?? actor.displayName;
   }
 
   private syncSign(actor: Actor): void {
@@ -507,7 +554,7 @@ export class Director {
     this.ensureHomeSign(actor, node);
     const sign = this.homeSigns.get(actor.paneId);
     if (!sign) return;
-    sign.setContent(actor.name || actor.paneId, actor.reportedStatus ?? "unknown");
+    sign.setContent(this.signName(actor), actor.reportedStatus ?? "unknown");
     sign.setLit(actor.inside);
     sign.setDone(actor.reportedStatus === "done");
   }
@@ -520,6 +567,7 @@ export class Director {
     if (!homeNode || !spot || !node) return;
     actor.moving = false;
     actor.door = {
+      kind: "door",
       phase: "entering",
       elapsed: 0,
       duration: DOORSTEP_SECONDS,
@@ -530,7 +578,7 @@ export class Director {
     };
     actor.traveler.visible = true;
     actor.fade.set(1);
-    logLine(`${actor.paneId} 進門 ${homeNode} → 門口`);
+    logLine(`${actor.paneId} entering ${homeNode} -> doorstep`);
   }
 
   private beginExit(actor: Actor): void {
@@ -542,6 +590,7 @@ export class Director {
     actor.inside = false;
     actor.moving = false;
     actor.door = {
+      kind: "door",
       phase: "exiting",
       elapsed: 0,
       duration: DOORSTEP_SECONDS,
@@ -554,7 +603,7 @@ export class Director {
     actor.traveler.visible = true;
     actor.fade.set(0);
     this.syncSign(actor);
-    logLine(`${actor.paneId} 出門 ${homeNode} → 門口`);
+    logLine(`${actor.paneId} leaving ${homeNode} -> street`);
   }
 
   private abortEnter(actor: Actor): void {
@@ -566,7 +615,7 @@ export class Director {
     actor.fade.set(1);
     this.placeAtNode(actor, actor.node);
     this.syncSign(actor);
-    logLine(`${actor.paneId} 進門中斷，恢復可見`);
+    logLine(`${actor.paneId} entry aborted; visible again`);
   }
 
   private updateDoor(actor: Actor, dtSeconds: number): void {
@@ -580,7 +629,10 @@ export class Director {
       door.fromZ + (door.toZ - door.fromZ) * t,
     );
 
-    if (door.phase === "entering") {
+    if (door.kind === "beach") {
+      actor.traveler.visible = true;
+      actor.fade.set(1);
+    } else if (door.phase === "entering") {
       actor.fade.set(t < 0.35 ? 1 : 1 - (t - 0.35) / 0.65);
     } else {
       actor.fade.set(t < 0.65 ? t / 0.65 : 1);
@@ -589,12 +641,27 @@ export class Director {
     if (t < 1) return;
 
     actor.door = null;
+    if (door.kind === "beach") {
+      if (door.phase === "entering") {
+        actor.atBeachSpot = true;
+        actor.moving = false;
+        logLine(`${actor.paneId} at beach spot ${door.label ?? "?"}`);
+      } else {
+        actor.atBeachSpot = false;
+        this.placeAtNode(actor, actor.node);
+        logLine(`${actor.paneId} left beach spot ${door.label ?? "?"}`);
+        if (this.isBeachTarget(actor)) this.beginBeachApproach(actor);
+        else if (actor.targetNode) this.startRoute(actor);
+      }
+      return;
+    }
+
     if (door.phase === "entering") {
       actor.inside = true;
       actor.traveler.visible = false;
       actor.fade.set(0);
       this.syncSign(actor);
-      logLine(`${actor.paneId} 已進門`);
+      logLine(`${actor.paneId} inside home`);
       return;
     }
 
@@ -603,7 +670,7 @@ export class Director {
     actor.fade.set(1);
     this.placeAtNode(actor, actor.node);
     this.syncSign(actor);
-    logLine(`${actor.paneId} 已出門`);
+    logLine(`${actor.paneId} back on street`);
     if (this.isHomeTarget(actor)) this.beginEnter(actor);
     else if (actor.targetNode) this.startRoute(actor);
   }
@@ -612,6 +679,104 @@ export class Director {
     const status = actor.stableStatus;
     return (status === "working" || status === "done") &&
       actor.targetNode === this.getHome(actor.paneId);
+  }
+
+  private isBeachTarget(actor: Actor): boolean {
+    return actor.stableStatus === "idle" &&
+      !!actor.targetNode &&
+      (BEACH_NODES as readonly string[]).includes(actor.targetNode);
+  }
+
+  private acquireBeachSpot(actor: Actor, entrance: string): string | null {
+    if (actor.beachSpot) {
+      const existing = beachSpot(actor.beachSpot);
+      if (existing && this.beachOccupancy.get(existing.id) === actor.paneId) return existing.id;
+      actor.beachSpot = null;
+    }
+    const node = this.graph.nodes.get(entrance);
+    if (!node) return null;
+    const free = BEACH_SPOTS.filter((spot) => !this.beachOccupancy.has(spot.id)).sort((a, b) => {
+      const da = Math.hypot(a.x - node.worldX, a.z - node.worldZ);
+      const db = Math.hypot(b.x - node.worldX, b.z - node.worldZ);
+      return da - db;
+    });
+    const chosen = free[0];
+    if (!chosen) {
+      logLine(`${actor.paneId}: no free beach spot`);
+      return null;
+    }
+    this.beachOccupancy.set(chosen.id, actor.paneId);
+    actor.beachSpot = chosen.id;
+    logLine(`${actor.paneId}: beach spot ${chosen.id} assigned`);
+    return chosen.id;
+  }
+
+  private releaseBeachSpot(actor: Actor): void {
+    if (!actor.beachSpot) return;
+    if (this.beachOccupancy.get(actor.beachSpot) === actor.paneId) {
+      this.beachOccupancy.delete(actor.beachSpot);
+    }
+    actor.beachSpot = null;
+  }
+
+  private beginBeachApproach(actor: Actor): void {
+    if (actor.atBeachSpot || actor.door) return;
+    const spot = actor.beachSpot ? beachSpot(actor.beachSpot) : null;
+    if (!spot) return;
+    const node = this.graph.nodes.get(spot.entrance);
+    if (!node) return;
+    const distance = Math.hypot(spot.x - node.worldX, spot.z - node.worldZ);
+    actor.moving = false;
+    actor.door = {
+      kind: "beach",
+      phase: "entering",
+      elapsed: 0,
+      duration: Math.max(0.35, distance / 3),
+      fromX: node.worldX,
+      fromZ: node.worldZ,
+      toX: spot.x,
+      toZ: spot.z,
+      label: spot.id,
+    };
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    logLine(`${actor.paneId} walking to beach spot ${spot.id}`);
+  }
+
+  private beginBeachReturn(actor: Actor): void {
+    if (!actor.atBeachSpot || actor.door) return;
+    const spot = actor.beachSpot ? beachSpot(actor.beachSpot) : null;
+    if (!spot) return;
+    const node = this.graph.nodes.get(spot.entrance);
+    if (!node) return;
+    const distance = Math.hypot(spot.x - node.worldX, spot.z - node.worldZ);
+    actor.atBeachSpot = false;
+    actor.moving = false;
+    actor.door = {
+      kind: "beach",
+      phase: "exiting",
+      elapsed: 0,
+      duration: Math.max(0.35, distance / 3),
+      fromX: spot.x,
+      fromZ: spot.z,
+      toX: node.worldX,
+      toZ: node.worldZ,
+      label: spot.id,
+    };
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    logLine(`${actor.paneId} leaving beach spot ${spot.id}`);
+  }
+
+  private abortBeachApproach(actor: Actor): void {
+    if (actor.door?.kind !== "beach" || actor.door.phase !== "entering") return;
+    actor.door = null;
+    actor.atBeachSpot = false;
+    actor.moving = false;
+    actor.traveler.visible = true;
+    actor.fade.set(1);
+    this.placeAtNode(actor, actor.node);
+    logLine(`${actor.paneId} beach approach aborted; back at entrance`);
   }
 
   private homeFor(paneId: string): string {
@@ -625,7 +790,7 @@ export class Director {
     if (index >= HOME_POOL.length) index = Object.keys(this.homes).length % HOME_POOL.length;
     this.homes[paneId] = index;
     saveMap(HOMES_KEY, this.homes);
-    logLine(`${paneId} 指派家 ${HOME_POOL[index]}`);
+    logLine(`${paneId} assigned home ${HOME_POOL[index]}`);
     return HOME_POOL[index];
   }
 
@@ -666,7 +831,7 @@ export class Director {
     if (!actor.targetNode) return;
     const steps: RouteStep[] | null = planRoute(this.graph, actor.node, actor.targetNode);
     if (steps === null) {
-      logLine(`${actor.paneId}: ${actor.node} -> ${actor.targetNode} 沒有可通行路線`);
+      logLine(`${actor.paneId}: ${actor.node} -> ${actor.targetNode} has no traversable route`);
       actor.moving = false;
       return;
     }
@@ -674,6 +839,7 @@ export class Director {
       actor.node = actor.targetNode;
       actor.moving = false;
       if (this.isHomeTarget(actor)) this.beginEnter(actor);
+      else if (this.isBeachTarget(actor)) this.beginBeachApproach(actor);
       return;
     }
     actor.moving = true;
@@ -687,8 +853,9 @@ export class Director {
       return;
     }
     actor.moving = false;
-    logLine(`${actor.paneId} 抵達 ${nodeId}`);
+    logLine(`${actor.paneId} arrived at ${nodeId}`);
     if (this.isHomeTarget(actor)) this.beginEnter(actor);
+    else if (this.isBeachTarget(actor)) this.beginBeachApproach(actor);
   }
 
   private placeAtNode(actor: Actor, nodeId: string): void {

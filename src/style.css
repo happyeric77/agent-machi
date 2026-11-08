@@ -3,7 +3,7 @@ body {
   margin: 0;
   height: 100%;
   overflow: hidden;
-  background: #e5ebe6;
+  background: #16191d;
 }
 
 #app {
@@ -25,6 +25,37 @@ body {
 
 #bridge-status[data-state="offline"] {
   background: rgba(120, 32, 24, 0.85);
+}
+
+#camera-ui {
+  position: fixed;
+  left: 12px;
+  bottom: 292px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(20, 24, 29, 0.72);
+  color: #c7d0c9;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#reset-view {
+  padding: 4px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #eef2ed;
+  font: inherit;
+  cursor: pointer;
+}
+
+#reset-view:hover,
+#reset-view:focus-visible {
+  background: rgba(255, 255, 255, 0.16);
+  outline: none;
 }
 
 .panel {
@@ -52,7 +83,7 @@ body {
 .log-panel {
   bottom: 12px;
   left: 12px;
-  width: min(480px, calc(100vw - 24px));
+  width: min(560px, calc(100vw - 24px));
   max-height: 270px;
 }
 
@@ -220,7 +251,7 @@ body {
 
 .log-entry {
   display: grid;
-  grid-template-columns: 62px 112px 1fr;
+  grid-template-columns: 62px 170px 1fr;
   gap: 7px;
   padding: 4px 2px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
