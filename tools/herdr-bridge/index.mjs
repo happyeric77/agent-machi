@@ -21,7 +21,7 @@ const HOME = os.homedir();
 const FAKE = process.env.FAKE === "1";
 const FAKE_SCENARIO = process.env.FAKE_SCENARIO || "default";
 const PORT = Number(process.env.PORT || 8731);
-const HOST = "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 const EVENT_LOG = path.join(HERE, "events.jsonl");
 
 const STATUSES = new Set(["idle", "working", "blocked", "done", "unknown"]);

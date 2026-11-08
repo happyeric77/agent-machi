@@ -85,7 +85,7 @@ export class Director {
   private homes: Record<string, number> = loadMap(HOMES_KEY);
   private travellerSlots: Record<string, number> = loadMap(TRAVELLERS_KEY);
 
-  private bridgeUrl = "http://127.0.0.1:8731";
+  private bridgeUrl = `http://${location.hostname}:8731`;
   private eventSource: EventSource | null = null;
 
   constructor(graph: Graph, travelers: Object3D[], groundY: number, statusElement: HTMLElement) {

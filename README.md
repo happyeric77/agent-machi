@@ -14,7 +14,7 @@ station-to-sea Kamakura scene. The game flow and HUD are not loaded.
 ```sh
 npm install
 npm run bridge         # real Herdr socket
-npm run dev            # http://localhost:5173
+npm run dev            # http://<this-host>:5173
 
 npm run bridge:fake    # scripted working -> blocked -> working -> done -> idle
 
@@ -26,7 +26,8 @@ Override the bridge in the app with `?bridge=http://host:port`.
 When the bridge is unreachable the page shows `bridge: 未連線` instead of a
 blank screen.
 
-Bridge endpoints (127.0.0.1 only):
+Bridge endpoints (default `HOST=0.0.0.0:8731`; set `HOST=127.0.0.1` to
+restrict to this machine):
 
 - `GET /snapshot` — array of `{pane_id,name,agent,agent_status,status_since,last_change_seq}`
 - `GET /events` — SSE; each `data:` is `{source,pane_id,name,agent,status,at}`

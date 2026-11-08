@@ -159,7 +159,8 @@ resize();
 const graph = loadGraph();
 const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement);
 const bridgeUrl =
-  new URLSearchParams(window.location.search).get("bridge") || "http://127.0.0.1:8731";
+  new URLSearchParams(window.location.search).get("bridge") ||
+  `http://${location.hostname}:8731`;
 director.start(bridgeUrl);
 
 window.__agentMachi = { log: getLog };
