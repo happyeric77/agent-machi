@@ -160,7 +160,7 @@ export class LogPanel {
     });
     this.director.onEvent((event) => this.accept(event));
     this.director.onRosterChange(() => {
-      if (this.historyLoaded) this.renderAll();
+      if (this.historyLoaded) this.refreshNames();
     });
     void this.loadHistory(bridgeUrl);
     document.body.append(this.root);
@@ -228,6 +228,19 @@ export class LogPanel {
     for (const event of this.entries) this.list.append(this.renderEntry(event));
     this.updateHeader();
     if (this.stickToBottom) this.list.scrollTop = this.list.scrollHeight;
+  }
+
+  private refreshNames(): void {
+    const nodes = this.list.children;
+    for (let index = 0; index < this.entries.length && index < nodes.length; index += 1) {
+      const name = nodes[index].querySelector(".log-name");
+      if (name) {
+        name.textContent = formatName(
+          this.director.getRole(this.entries[index].pane_id),
+          resolveDisplayName(this.entries[index]),
+        );
+      }
+    }
   }
 
   private renderEntry(event: BridgeEvent): HTMLLIElement {
