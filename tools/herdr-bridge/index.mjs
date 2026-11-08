@@ -27,10 +27,15 @@ const EVENT_LOG = path.join(HERE, "events.jsonl");
 const STATUSES = new Set(["idle", "working", "blocked", "done", "unknown"]);
 
 /** @typedef {"idle"|"working"|"blocked"|"done"|"unknown"} AgentStatus */
-/** @typedef {{pane_id:string,name:string|null,terminal_title_stripped:string|null,agent:string|null,agent_status:AgentStatus,status_since:string,last_change_seq:number}} AgentRow */
+/** @typedef {{pane_id:string,name:string|null,display_name:string,terminal_title_stripped:string|null,agent:string|null,agent_status:AgentStatus,status_since:string,last_change_seq:number}} AgentRow */
 
 /** @type {Map<string, AgentRow>} */
 const agents = new Map();
+/** @type {Map<string, {cwd: string|null, foreground_cwd: string|null}>} */
+const locations = new Map();
+/** @type {Map<string, number>} */
+const firstSeen = new Map();
+let seenSeq = 0;
 /** @type {Set<import("node:http").ServerResponse>} */
 const sseClients = new Set();
 
@@ -58,12 +63,63 @@ function appendEventLog(event) {
   }
 }
 
+function clean(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function markSeen(paneId) {
+  if (!firstSeen.has(paneId)) firstSeen.set(paneId, ++seenSeq);
+}
+
+function cwdBase(raw) {
+  const value = clean(raw).replace(/\/+$/, "");
+  if (!value || value === "/") return null;
+  if (value === HOME) return null;
+  if (["/tmp", "/private/tmp", "/var/tmp", "/Users", "/private", "/home"].includes(value)) return null;
+  const base = value.split("/").pop();
+  if (!base || base === "tmp") return null;
+  return base;
+}
+
+function baseDisplayName(row) {
+  const named = clean(row.name);
+  if (named) return named;
+  const place = locations.get(row.pane_id);
+  for (const cwd of [place?.foreground_cwd, place?.cwd]) {
+    const base = cwdBase(cwd);
+    if (base) return base;
+  }
+  return clean(row.agent) || row.pane_id;
+}
+
+// First-seen pane keeps the plain name; later collisions get " (2)", " (3)".
+function refreshDisplayNames() {
+  const used = new Map();
+  const ordered = [...agents.values()].sort(
+    (a, b) => (firstSeen.get(a.pane_id) ?? 0) - (firstSeen.get(b.pane_id) ?? 0),
+  );
+  for (const row of ordered) {
+    const base = baseDisplayName(row);
+    const count = (used.get(base) ?? 0) + 1;
+    used.set(base, count);
+    row.display_name = count === 1 ? base : `${base} (${count})`;
+  }
+}
+
+function removeAgentRow(paneId) {
+  agents.delete(paneId);
+  locations.delete(paneId);
+  firstSeen.delete(paneId);
+  refreshDisplayNames();
+}
+
 /** @param {AgentRow} row */
 function publish(row) {
   const event = {
     source: "herdr",
     pane_id: row.pane_id,
     name: row.name,
+    display_name: row.display_name,
     terminal_title_stripped: row.terminal_title_stripped,
     agent: row.agent,
     status: row.agent_status,
@@ -245,7 +301,7 @@ function handleSocketLine(line) {
     const paneId = data.pane_id;
     if (!paneId) return;
     if (data.released || data.final_status === "unknown") {
-      agents.delete(paneId);
+      removeAgentRow(paneId);
       closeSubscription(`pane:${paneId}`);
       return;
     }
@@ -271,7 +327,7 @@ function handleSocketLine(line) {
   if (eventName.includes("pane_closed") || eventName.includes("pane_exited")) {
     const paneId = data.pane_id;
     if (!paneId) return;
-    agents.delete(paneId);
+    removeAgentRow(paneId);
     closeSubscription(`pane:${paneId}`);
   }
 }
@@ -283,13 +339,20 @@ function setStatus(paneId, status, data = {}) {
     row = {
       pane_id: paneId,
       name: data.name ?? null,
+      display_name: "",
       terminal_title_stripped: data.terminal_title_stripped ?? data.title ?? null,
       agent: data.agent ?? null,
       agent_status: status,
       status_since: at,
       last_change_seq: Number(data.state_change_seq ?? 0),
     };
+    locations.set(paneId, {
+      cwd: data.cwd ?? null,
+      foreground_cwd: data.foreground_cwd ?? null,
+    });
+    markSeen(paneId);
     agents.set(paneId, row);
+    refreshDisplayNames();
     publish(row);
     return;
   }
@@ -299,6 +362,11 @@ function setStatus(paneId, status, data = {}) {
   else if (data.title !== undefined) row.terminal_title_stripped = data.title;
   if (data.agent !== undefined && data.agent !== null) row.agent = data.agent;
   if (data.state_change_seq !== undefined) row.last_change_seq = Number(data.state_change_seq);
+  const place = locations.get(paneId) ?? { cwd: null, foreground_cwd: null };
+  if (data.cwd !== undefined) place.cwd = data.cwd;
+  if (data.foreground_cwd !== undefined) place.foreground_cwd = data.foreground_cwd;
+  locations.set(paneId, place);
+  refreshDisplayNames();
 
   if (row.agent_status !== status) {
     row.agent_status = status;
@@ -310,25 +378,32 @@ function setStatus(paneId, status, data = {}) {
 function syncAgents(snapshotAgents) {
   const seen = new Set();
   const at = nowIso();
+  const changed = [];
 
   for (const info of snapshotAgents || []) {
     const paneId = info?.pane_id;
     if (!paneId || !info.agent) continue;
     seen.add(paneId);
     const status = normalizeStatus(info.agent_status);
+    locations.set(paneId, {
+      cwd: info.cwd ?? null,
+      foreground_cwd: info.foreground_cwd ?? null,
+    });
     const previous = agents.get(paneId);
     if (!previous) {
       const row = {
         pane_id: paneId,
         name: info.name ?? null,
+        display_name: "",
         terminal_title_stripped: info.terminal_title_stripped ?? info.terminal_title ?? null,
         agent: info.agent,
         agent_status: status,
         status_since: at,
         last_change_seq: Number(info.state_change_seq ?? 0),
       };
+      markSeen(paneId);
       agents.set(paneId, row);
-      publish(row);
+      changed.push(row);
       continue;
     }
     if (info.name !== undefined) previous.name = info.name;
@@ -342,13 +417,15 @@ function syncAgents(snapshotAgents) {
     if (previous.agent_status !== status) {
       previous.agent_status = status;
       previous.status_since = at;
-      publish(previous);
+      changed.push(previous);
     }
   }
 
   for (const paneId of [...agents.keys()]) {
-    if (!seen.has(paneId)) agents.delete(paneId);
+    if (!seen.has(paneId)) removeAgentRow(paneId);
   }
+  refreshDisplayNames();
+  for (const row of changed) publish(row);
 }
 
 async function reconcileAll() {
@@ -402,17 +479,21 @@ function scheduleReconcile(delayMs = 250) {
 // Fake mode: one agent runs the full status script without a Herdr socket.
 
 function startFake() {
-  const makeAgent = (paneId, name) => {
+  const makeAgent = (paneId, name, cwd = "/Users/macbookpro4eric/Projects/agent-machi") => {
     const row = {
       pane_id: paneId,
       name,
+      display_name: "",
       terminal_title_stripped: null,
       agent: "opencode",
       agent_status: /** @type {AgentStatus} */ ("idle"),
       status_since: nowIso(),
       last_change_seq: 0,
     };
+    locations.set(paneId, { cwd, foreground_cwd: cwd });
+    markSeen(paneId);
     agents.set(paneId, row);
+    refreshDisplayNames();
     return row;
   };
 
@@ -434,6 +515,16 @@ function startFake() {
     const longName = makeAgent("fake:p-long", "Wakamiya Coffee Roaster");
     at(1500, paneId, "working");
     at(1500, longName, "working");
+    return;
+  }
+
+  if (FAKE_SCENARIO === "dupe") {
+    // Two unnamed agents in the same project: display_name must dedupe by
+    // first-seen order, not both read "agent-machi".
+    const a = makeAgent("fake:p1", null);
+    const b = makeAgent("fake:p2", null);
+    at(1500, a, "working");
+    at(2500, b, "working");
     return;
   }
 
@@ -498,6 +589,25 @@ function startFake() {
     at(2500, p2, "working");
     at(3500, p3, "working");
     at(4500, p4, "working");
+    return;
+  }
+
+  if (FAKE_SCENARIO === "beach3") {
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    const p3 = makeAgent("fake:p3", "Fake Agent C");
+    at(1500, p1, "working");
+    at(2500, p2, "working");
+    at(3500, p3, "working");
+    at(12000, p1, "idle");
+    at(12000, p2, "idle");
+    at(13000, p3, "idle");
+    // p1 leaves the beach; p4 arrives later and must inherit its spot.
+    at(30000, p1, "working");
+    setTimeout(() => {
+      const p4 = makeAgent("fake:p4", "Fake Agent D");
+      setFakeStatus(p4, "working");
+      setTimeout(() => setFakeStatus(p4, "idle"), 4000);
+    }, 32000);
     return;
   }
 
