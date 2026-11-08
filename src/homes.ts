@@ -178,7 +178,7 @@ export class HomeSign {
         side: THREE.DoubleSide,
       }),
     );
-    this.panel.position.set(0, 0.84, 0.03);
+    this.panel.position.set(0, 0.84, 0.07);
     this.panel.name = `home sign panel ${spot.node}`;
 
     const poleMaterial = new THREE.MeshStandardMaterial({
@@ -211,7 +211,7 @@ export class HomeSign {
     });
     this.badge = new THREE.Sprite(this.badgeMaterial);
     this.badge.scale.set(0.28, 0.28, 1);
-    this.badge.position.set(0, 1.36, 0.04);
+    this.badge.position.set(0, 1.36, 0.08);
     this.badge.visible = false;
     this.badge.renderOrder = 3;
 
