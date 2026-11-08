@@ -119,14 +119,6 @@ npm run dev           # http://localhost:5173
 The Go bridge is verified against the Node bridge scenario by scenario; the
 frontend is identical for both.
 
-## Scene provenance
-
-The town under `src/town/` is derived from
-[happyeric77/station-to-sea](https://github.com/happyeric77/station-to-sea) at
-commit `a7f589e7` (2026-11-08) and develops independently inside agent-machi
-from that point. Its graph data is slimmed to the fields the loader reads; see
-`src/town/graph/data/PROVENANCE.md`.
-
 ## License
 
 MIT
