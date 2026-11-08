@@ -14,6 +14,7 @@ import { createCoast, createRoutePreview } from "../station-to-sea/src/coast.ts"
 import { tileSurfaceAt } from "../station-to-sea/src/sceneryAnchors.ts";
 import { loadGraph } from "../station-to-sea/src/game/graph.ts";
 import { Director } from "./director.ts";
+import { createResidents } from "./characters.ts";
 import { LogPanel, RosterPanel } from "./panels.ts";
 import { getLog } from "./log.ts";
 import "./style.css";
@@ -93,9 +94,16 @@ scene.add(createOnariCentralFocus(MAP_GROUND_Y));
 scene.add(createWakamiyaAvenueFinish(MAP_GROUND_Y));
 
 const sourcePreview = createRoutePreview();
-const travelers = sourcePreview.children.filter((object) => object.name.includes("traveller"));
-if (travelers.length !== 2) throw new Error("Expected both original traveler assets");
-travelers.forEach((traveler) => scene.add(traveler));
+const previewTravelers = sourcePreview.children.filter((object) => object.name.includes("traveller"));
+if (previewTravelers.length !== 2) throw new Error("Expected both original traveler assets");
+previewTravelers.forEach((traveler) => scene.add(traveler));
+
+const residents = createResidents();
+for (const resident of residents) {
+  resident.visible = false;
+  scene.add(resident);
+}
+const travelers = [...previewTravelers, ...residents];
 
 const coast = createCoast();
 coast.scale.x = 1.65;
