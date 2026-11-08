@@ -96,7 +96,10 @@ scene.add(createWakamiyaAvenueFinish(MAP_GROUND_Y));
 const sourcePreview = createRoutePreview();
 const previewTravelers = sourcePreview.children.filter((object) => object.name.includes("traveller"));
 if (previewTravelers.length !== 2) throw new Error("Expected both original traveler assets");
-previewTravelers.forEach((traveler) => scene.add(traveler));
+previewTravelers.forEach((traveler) => {
+  traveler.visible = false;
+  scene.add(traveler);
+});
 
 const residents = createResidents();
 for (const resident of residents) {
