@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadGraph } from "../station-to-sea/src/game/graph.ts";
+import { loadGraph } from "../src/station-to-sea/game/graph.ts";
 import { HOME_SPOTS } from "../src/homes.ts";
 
 test("every home node has an off-road doorstep and a sign anchor", () => {

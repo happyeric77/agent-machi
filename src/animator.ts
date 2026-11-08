@@ -1,5 +1,5 @@
 import type { Object3D } from "three";
-import type { Graph, GraphEdge } from "../station-to-sea/src/game/graph.ts";
+import type { Graph, GraphEdge } from "./station-to-sea/game/graph.ts";
 import type { Direction, RouteStep } from "./planner.ts";
 
 interface PathPoint {
