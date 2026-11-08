@@ -47,6 +47,36 @@ Override the bridge in the app with `?bridge=http://host:port`.
 When the bridge is unreachable the page shows `bridge: disconnected` instead
 of a blank screen.
 
+## Run the binary
+
+The Go binary serves the built Vite page and the bridge API on the same port.
+It uses only the Go standard library, has no cgo dependency, and embeds the
+page from `internal/web/dist`.
+
+```sh
+./scripts/build-binary.sh   # npm run build, copy dist, go build -o agent-machi
+./agent-machi               # opens http://localhost:8731 unless headless
+```
+
+`scripts/build-binary.sh` stops with a clear error if `dist/index.html` is
+missing. `AGENT_MACHI_NO_OPEN=1` or `--no-open` disables the browser launch;
+FAKE mode never opens a browser. A failed launch only prints a warning.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | listen address |
+| `PORT` | `8731` | page and API port |
+| `HERDR_SOCKET_PATH` | — | explicit Herdr Unix socket |
+| `HERDR_SESSION` | `default` | named Herdr session (`~/.config/herdr/sessions/<name>/herdr.sock`) |
+| `FAKE` | — | `1` uses scripted agents instead of Herdr |
+| `FAKE_SCENARIO` | `default` | fake script name |
+| `AGENT_MACHI_EVENTS_LOG` | `~/.local/share/agent-machi/events.jsonl` | event log path |
+| `AGENT_MACHI_NO_OPEN` | — | `1` disables auto-open |
+
+The Node bridge remains the development and reference implementation; the Go
+binary is the single-file deployment path. Both speak the same HTTP and
+`events.jsonl` formats.
+
 Bridge endpoints (default `HOST=0.0.0.0:8731`; set `HOST=127.0.0.1` to
 restrict to this machine):
 
@@ -55,7 +85,10 @@ restrict to this machine):
 - `GET /log?limit=200` — last N events from `events.jsonl` in arrival order (default 200, max 2000); bad lines are skipped
 - `GET /health`
 
-Every event is appended to `tools/herdr-bridge/events.jsonl`.
+Every event is appended to `tools/herdr-bridge/events.jsonl` by the Node
+bridge. The Go binary defaults to
+`~/.local/share/agent-machi/events.jsonl`; set `AGENT_MACHI_EVENTS_LOG` to
+share a file between both implementations.
 
 The page also shows a collapsible roster (all bridge agents, with role, status,
 duration, home) and a collapsible Log panel fed by `/log` plus the live SSE
