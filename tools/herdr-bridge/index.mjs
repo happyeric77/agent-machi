@@ -479,7 +479,7 @@ function scheduleReconcile(delayMs = 250) {
 // Fake mode: one agent runs the full status script without a Herdr socket.
 
 function startFake() {
-  const makeAgent = (paneId, name, cwd = "/Users/macbookpro4eric/Projects/agent-machi") => {
+  const makeAgent = (paneId, name, cwd = "/Users/example/Projects/agent-machi") => {
     const row = {
       pane_id: paneId,
       name,
