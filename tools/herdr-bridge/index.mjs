@@ -27,7 +27,7 @@ const EVENT_LOG = path.join(HERE, "events.jsonl");
 const STATUSES = new Set(["idle", "working", "blocked", "done", "unknown"]);
 
 /** @typedef {"idle"|"working"|"blocked"|"done"|"unknown"} AgentStatus */
-/** @typedef {{pane_id:string,name:string|null,agent:string|null,agent_status:AgentStatus,status_since:string,last_change_seq:number}} AgentRow */
+/** @typedef {{pane_id:string,name:string|null,terminal_title_stripped:string|null,agent:string|null,agent_status:AgentStatus,status_since:string,last_change_seq:number}} AgentRow */
 
 /** @type {Map<string, AgentRow>} */
 const agents = new Map();
@@ -64,6 +64,7 @@ function publish(row) {
     source: "herdr",
     pane_id: row.pane_id,
     name: row.name,
+    terminal_title_stripped: row.terminal_title_stripped,
     agent: row.agent,
     status: row.agent_status,
     at: nowIso(),
@@ -221,7 +222,9 @@ function handleSocketLine(line) {
     return;
   }
 
-  const eventName = String(message.event || message.data?.type || "");
+  // Herdr mixes dotted and underscored event names (pane.agent_status_changed
+  // but pane_created/pane_closed), so normalize before matching.
+  const eventName = String(message.event || message.data?.type || "").replaceAll(".", "_");
   if (process.env.DEBUG && eventName) console.log("[bridge] socket event", eventName, message.data?.pane_id ?? "");
   if (!eventName) return;
 
@@ -255,7 +258,7 @@ function handleSocketLine(line) {
     return;
   }
 
-  if (eventName.includes("pane.created")) {
+  if (eventName.includes("pane_created")) {
     if (data.pane_id) {
       openSubscription(`pane:${data.pane_id}`, [
         { type: "pane.agent_status_changed", pane_id: data.pane_id },
@@ -265,7 +268,7 @@ function handleSocketLine(line) {
     return;
   }
 
-  if (eventName.includes("pane.closed") || eventName.includes("pane.exited")) {
+  if (eventName.includes("pane_closed") || eventName.includes("pane_exited")) {
     const paneId = data.pane_id;
     if (!paneId) return;
     agents.delete(paneId);
@@ -280,6 +283,7 @@ function setStatus(paneId, status, data = {}) {
     row = {
       pane_id: paneId,
       name: data.name ?? null,
+      terminal_title_stripped: data.terminal_title_stripped ?? data.title ?? null,
       agent: data.agent ?? null,
       agent_status: status,
       status_since: at,
@@ -291,6 +295,8 @@ function setStatus(paneId, status, data = {}) {
   }
 
   if (data.name !== undefined) row.name = data.name;
+  if (data.terminal_title_stripped !== undefined) row.terminal_title_stripped = data.terminal_title_stripped;
+  else if (data.title !== undefined) row.terminal_title_stripped = data.title;
   if (data.agent !== undefined && data.agent !== null) row.agent = data.agent;
   if (data.state_change_seq !== undefined) row.last_change_seq = Number(data.state_change_seq);
 
@@ -315,6 +321,7 @@ function syncAgents(snapshotAgents) {
       const row = {
         pane_id: paneId,
         name: info.name ?? null,
+        terminal_title_stripped: info.terminal_title_stripped ?? info.terminal_title ?? null,
         agent: info.agent,
         agent_status: status,
         status_since: at,
@@ -325,6 +332,11 @@ function syncAgents(snapshotAgents) {
       continue;
     }
     if (info.name !== undefined) previous.name = info.name;
+    if (info.terminal_title_stripped !== undefined) {
+      previous.terminal_title_stripped = info.terminal_title_stripped;
+    } else if (info.terminal_title !== undefined) {
+      previous.terminal_title_stripped = info.terminal_title;
+    }
     previous.agent = info.agent;
     previous.last_change_seq = Number(info.state_change_seq ?? previous.last_change_seq);
     if (previous.agent_status !== status) {
@@ -394,6 +406,7 @@ function startFake() {
     const row = {
       pane_id: paneId,
       name,
+      terminal_title_stripped: null,
       agent: "opencode",
       agent_status: /** @type {AgentStatus} */ ("idle"),
       status_since: nowIso(),
@@ -434,6 +447,22 @@ function startFake() {
     return;
   }
 
+  if (FAKE_SCENARIO === "roster") {
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    const p3 = makeAgent("fake:p3", "Fake Agent C");
+    // Three agents, interleaved. p1/p2 get characters; p3 is log only.
+    at(1500, p1, "working");
+    at(4500, p2, "working");
+    at(7500, p3, "working");
+    at(14000, p1, "blocked");
+    at(17000, p3, "done");
+    at(20000, p2, "blocked");
+    at(26000, p1, "working");
+    at(32000, p2, "done");
+    at(35000, p3, "idle");
+    return;
+  }
+
   // Default: one agent runs the full status script.
   const script = ["working", "blocked", "working", "done", "idle"];
   let step = 0;
@@ -463,6 +492,31 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/snapshot") {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify([...agents.values()]));
+    return;
+  }
+
+  if (url.pathname === "/log") {
+    const rawLimit = Number(url.searchParams.get("limit") ?? 200);
+    const limit = Number.isFinite(rawLimit) ? Math.min(2000, Math.max(1, Math.floor(rawLimit))) : 200;
+    let events = [];
+    try {
+      const text = fs.readFileSync(EVENT_LOG, "utf8");
+      events = text
+        .split("\n")
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            const parsed = JSON.parse(line);
+            return parsed && typeof parsed === "object" ? [parsed] : [];
+          } catch {
+            return [];
+          }
+        });
+    } catch (error) {
+      if (error.code !== "ENOENT") console.error("[bridge] cannot read events.jsonl:", error.message);
+    }
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(JSON.stringify(events.slice(-limit)));
     return;
   }
 

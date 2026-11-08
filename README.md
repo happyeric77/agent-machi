@@ -20,6 +20,7 @@ npm run bridge:fake    # scripted working -> blocked -> working -> done -> idle
 
 FAKE_SCENARIO=flip npm run bridge       # working -> done 2s apart (debounce check)
 FAKE_SCENARIO=blocked2 npm run bridge   # two agents claim S and S-2
+FAKE_SCENARIO=roster npm run bridge     # three interleaved agents (third log only)
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
@@ -29,11 +30,19 @@ blank screen.
 Bridge endpoints (default `HOST=0.0.0.0:8731`; set `HOST=127.0.0.1` to
 restrict to this machine):
 
-- `GET /snapshot` — array of `{pane_id,name,agent,agent_status,status_since,last_change_seq}`
-- `GET /events` — SSE; each `data:` is `{source,pane_id,name,agent,status,at}`
+- `GET /snapshot` — array of `{pane_id,name,terminal_title_stripped,agent,agent_status,status_since,last_change_seq}`
+- `GET /events` — SSE; each `data:` is `{source,pane_id,name,terminal_title_stripped,agent,status,at}`
+- `GET /log?limit=200` — last N events from `events.jsonl` in arrival order (default 200, max 2000); bad lines are skipped
 - `GET /health`
 
 Every event is appended to `tools/herdr-bridge/events.jsonl`.
+
+The page also shows a collapsible roster (all bridge agents, with role, status,
+duration, home) and a collapsible Log panel fed by `/log` plus the live SSE
+stream. Roster rows for the first two agents highlight Amber or Teal in the
+scene; later agents are marked `log only`. Rows are removed when the bridge's
+snapshot no longer contains that pane. The Log panel loads recent history from
+`/log` first, so it survives a page reload, then appends live SSE events.
 
 ## State mapping
 

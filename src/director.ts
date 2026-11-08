@@ -1,3 +1,4 @@
+import * as THREE from "three";
 import type { Object3D } from "three";
 import type { Graph } from "../station-to-sea/src/game/graph.ts";
 import { RouteAnimator } from "./animator.ts";
@@ -9,6 +10,7 @@ export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 export interface AgentRow {
   pane_id: string;
   name: string | null;
+  terminal_title_stripped?: string | null;
   agent: string | null;
   agent_status: AgentStatus;
   status_since: string;
@@ -19,6 +21,7 @@ export interface BridgeEvent {
   source: string;
   pane_id: string;
   name: string | null;
+  terminal_title_stripped?: string | null;
   agent: string | null;
   status: AgentStatus;
   at: string;
@@ -44,6 +47,8 @@ interface Actor {
   moving: boolean;
   blockedSlot: string | null;
   animator: RouteAnimator;
+  ring: THREE.Mesh;
+  highlightTimer: ReturnType<typeof setTimeout> | null;
   debounceTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -81,6 +86,10 @@ export class Director {
   private readonly actors = new Map<string, Actor>();
   private readonly extraStatuses = new Map<string, AgentStatus>();
   private readonly blockedOccupancy = new Map<string, string>();
+  private readonly roster = new Map<string, AgentRow>();
+  private readonly rosterListeners = new Set<() => void>();
+  private readonly eventListeners = new Set<(event: BridgeEvent) => void>();
+  private snapshotTimer: ReturnType<typeof setInterval> | null = null;
 
   private homes: Record<string, number> = loadMap(HOMES_KEY);
   private travellerSlots: Record<string, number> = loadMap(TRAVELLERS_KEY);
@@ -95,9 +104,54 @@ export class Director {
     this.statusElement = statusElement;
   }
 
+  getRoster(): AgentRow[] {
+    return [...this.roster.values()];
+  }
+
+  getRole(paneId: string): "Amber" | "Teal" | null {
+    const slot = this.travellerSlots[paneId];
+    return slot === 0 ? "Amber" : slot === 1 ? "Teal" : null;
+  }
+
+  getHome(paneId: string): string | null {
+    const index = this.homes[paneId];
+    return Number.isInteger(index) && index >= 0 && index < HOME_POOL.length
+      ? HOME_POOL[index]
+      : null;
+  }
+
+  onRosterChange(listener: () => void): () => void {
+    this.rosterListeners.add(listener);
+    return () => this.rosterListeners.delete(listener);
+  }
+
+  onEvent(listener: (event: BridgeEvent) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
+  highlight(paneId: string): boolean {
+    const actor = this.actors.get(paneId);
+    if (!actor) return false;
+    actor.ring.visible = true;
+    if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
+    actor.highlightTimer = setTimeout(() => {
+      actor.ring.visible = false;
+      actor.highlightTimer = null;
+    }, 2500);
+    return true;
+  }
+
+  private emitRoster(): void {
+    for (const listener of this.rosterListeners) listener();
+  }
+
   start(bridgeUrl: string): void {
     this.bridgeUrl = bridgeUrl.replace(/\/+$/, "");
     this.refreshSnapshot();
+    if (!this.snapshotTimer) {
+      this.snapshotTimer = setInterval(() => void this.refreshSnapshot(), 5000);
+    }
     this.eventSource = new EventSource(`${this.bridgeUrl}/events`);
     this.eventSource.onopen = () => {
       this.setBridgeState("online", "bridge: 已連線");
@@ -143,6 +197,28 @@ export class Director {
   }
 
   private applySnapshot(rows: AgentRow[]): void {
+    const seen = new Set<string>();
+    for (const row of rows) {
+      if (!row?.pane_id) continue;
+      seen.add(row.pane_id);
+      this.roster.set(row.pane_id, {
+        ...row,
+        terminal_title_stripped: row.terminal_title_stripped ?? null,
+        agent_status: normalizeStatus(row.agent_status),
+      });
+    }
+    for (const paneId of [...this.roster.keys()]) {
+      if (!seen.has(paneId)) this.roster.delete(paneId);
+    }
+    for (const paneId of new Set([
+      ...this.actors.keys(),
+      ...Object.keys(this.travellerSlots),
+      ...Object.keys(this.homes),
+    ])) {
+      if (!seen.has(paneId)) this.removeAgent(paneId);
+    }
+    this.emitRoster();
+
     for (const row of rows) {
       if (!row?.pane_id) continue;
       const actor = this.actors.get(row.pane_id) ?? this.createActor(row.pane_id, row);
@@ -159,6 +235,20 @@ export class Director {
   private handleEvent(event: BridgeEvent): void {
     if (!event?.pane_id) return;
     const status = normalizeStatus(event.status);
+    const previous = this.roster.get(event.pane_id);
+    this.roster.set(event.pane_id, {
+      pane_id: event.pane_id,
+      name: event.name ?? previous?.name ?? null,
+      terminal_title_stripped:
+        event.terminal_title_stripped ?? previous?.terminal_title_stripped ?? null,
+      agent: event.agent ?? previous?.agent ?? null,
+      agent_status: status,
+      status_since: event.at,
+      last_change_seq: previous?.last_change_seq ?? 0,
+    });
+    this.emitRoster();
+    for (const listener of this.eventListeners) listener(event);
+
     const actor = this.actors.get(event.pane_id) ?? this.createActor(event.pane_id, event);
     if (!actor) {
       this.logExtra(event.pane_id, event.name, status);
@@ -169,9 +259,45 @@ export class Director {
     this.setStatus(actor, status);
   }
 
+  private removeAgent(paneId: string): void {
+    const actor = this.actors.get(paneId);
+    if (actor) {
+      if (actor.debounceTimer) clearTimeout(actor.debounceTimer);
+      if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
+      this.releaseBlockedSlot(actor);
+      actor.moving = false;
+      actor.traveler.visible = false;
+      this.actors.delete(paneId);
+    }
+    if (paneId in this.travellerSlots) {
+      delete this.travellerSlots[paneId];
+      saveMap(TRAVELLERS_KEY, this.travellerSlots);
+    }
+    if (paneId in this.homes) {
+      delete this.homes[paneId];
+      saveMap(HOMES_KEY, this.homes);
+    }
+    this.extraStatuses.delete(paneId);
+  }
+
   private createActor(paneId: string, row: { name: string | null; agent: string | null }): Actor | null {
     const slot = this.travellerSlot(paneId);
     if (slot === null) return null;
+    this.travelers[slot].visible = true;
+
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.26, 0.36, 32),
+      new THREE.MeshBasicMaterial({
+        color: slot === 0 ? "#f2b705" : "#3d9bb5",
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+    ring.visible = false;
 
     const actor: Actor = {
       paneId,
@@ -185,11 +311,14 @@ export class Director {
       moving: false,
       blockedSlot: null,
       animator: null as unknown as RouteAnimator,
+      ring,
+      highlightTimer: null,
       debounceTimer: null,
     };
     actor.animator = new RouteAnimator(actor.traveler, this.graph, this.groundY, (nodeId) => {
       this.onNodeReached(actor, nodeId);
     });
+    actor.traveler.add(ring);
     this.actors.set(paneId, actor);
     this.placeAtNode(actor, "S");
     logLine(`${paneId} (${row.name ?? row.agent ?? "agent"}) 第一次偵測到，放在 S，角色 ${slot === 0 ? "Amber" : "Teal"}`);

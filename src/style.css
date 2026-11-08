@@ -26,3 +26,229 @@ body {
 #bridge-status[data-state="offline"] {
   background: rgba(120, 32, 24, 0.85);
 }
+
+.panel {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(20, 28, 24, 0.82);
+  color: #eef2ed;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  box-shadow: 0 8px 24px rgba(20, 28, 24, 0.18);
+  backdrop-filter: blur(4px);
+}
+
+.roster {
+  top: 12px;
+  right: 12px;
+  width: min(320px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+}
+
+.log-panel {
+  bottom: 12px;
+  left: 12px;
+  width: min(480px, calc(100vw - 24px));
+  max-height: 270px;
+}
+
+.panel-toggle {
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.panel-toggle:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.panel-count {
+  opacity: 0.7;
+  font-weight: 400;
+}
+
+.panel.is-collapsed .roster-list,
+.panel.is-collapsed .roster-note,
+.panel.is-collapsed .log-list {
+  display: none;
+}
+
+.panel.is-collapsed .panel-toggle {
+  border-bottom: 0;
+}
+
+.roster-list {
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.roster-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.roster-row:hover,
+.roster-row:focus-visible {
+  background: rgba(255, 255, 255, 0.08);
+  outline: none;
+}
+
+.roster-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.role-badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.role-amber {
+  background: rgba(242, 183, 5, 0.22);
+  color: #f6cf5b;
+}
+
+.role-teal {
+  background: rgba(61, 155, 181, 0.24);
+  color: #79c6d8;
+}
+
+.role-log {
+  color: #b9c4bd;
+}
+
+.roster-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.roster-meta,
+.roster-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 2px;
+  color: #c3cdc6;
+}
+
+.roster-sub {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.roster-sub > span:last-child {
+  margin-left: auto;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8d9891;
+}
+
+.roster-row[data-status="working"] .status-dot {
+  background: #f2b705;
+}
+
+.roster-row[data-status="blocked"] .status-dot {
+  background: #e2604a;
+  box-shadow: 0 0 0 3px rgba(226, 96, 74, 0.16);
+}
+
+.roster-row[data-status="done"] .status-dot {
+  background: #6ec08a;
+}
+
+.roster-row[data-status="idle"] .status-dot {
+  background: #7ea8c4;
+}
+
+.status-duration {
+  margin-left: auto;
+  color: #aeb9b1;
+  font-variant-numeric: tabular-nums;
+}
+
+.roster-note {
+  min-height: 16px;
+  margin: 0;
+  padding: 0 10px 8px;
+  color: #f6cf5b;
+  font-size: 11px;
+}
+
+.log-list {
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px 8px 8px;
+  list-style: none;
+}
+
+.log-entry {
+  display: grid;
+  grid-template-columns: 62px 112px 1fr;
+  gap: 7px;
+  padding: 4px 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  align-items: baseline;
+}
+
+.log-time {
+  color: #9faaa2;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e8ede8;
+}
+
+.log-change {
+  color: #bdc8c0;
+}
+
+.log-entry[data-status="blocked"] .log-change {
+  color: #f08b79;
+}
+
+.log-entry[data-status="done"] .log-change {
+  color: #8bd3a4;
+}
+
+.log-entry[data-status="working"] .log-change {
+  color: #f6cf5b;
+}
