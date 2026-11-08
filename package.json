@@ -1,0 +1,22 @@
+{
+  "name": "agent-machi",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/**/*.test.ts",
+    "bridge": "node tools/herdr-bridge/index.mjs",
+    "bridge:fake": "FAKE=1 node tools/herdr-bridge/index.mjs"
+  },
+  "devDependencies": {
+    "@types/three": "^0.186.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  }
+}

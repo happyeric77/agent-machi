@@ -1,0 +1,28 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #e5ebe6;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+#bridge-status {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(20, 28, 24, 0.72);
+  color: #fff;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#bridge-status[data-state="offline"] {
+  background: rgba(120, 32, 24, 0.85);
+}
