@@ -87,6 +87,7 @@ let reconcileTimer = null;
 let reconciling = false;
 let reconcileAgain = false;
 let stopping = false;
+let retryDelayMs = 500;
 
 /** @type {Map<string, net.Socket>} */
 const subscriptions = new Map();
@@ -362,9 +363,11 @@ async function reconcileAll() {
         { type: "pane.agent_status_changed", pane_id: paneId },
       ]);
     }
+    retryDelayMs = 500;
   } catch (error) {
     console.error("[bridge] reconcile failed:", error.message);
-    scheduleReconcile(1000);
+    scheduleReconcile(retryDelayMs);
+    retryDelayMs = Math.min(retryDelayMs * 2, 30000);
   } finally {
     reconciling = false;
     if (reconcileAgain) {
