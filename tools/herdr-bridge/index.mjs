@@ -508,6 +508,22 @@ function startFake() {
     setTimeout(() => setFakeStatus(row, status), delayMs);
   };
 
+  if (FAKE_SCENARIO === "demo") {
+    // Recording prop: three named agents (Amber, Teal, Moss) follow the
+    // timeline in the delivery notes. Not ported to the Go binary.
+    const amber = makeAgent("fake:p1", null);
+    const teal = makeAgent("fake:p2", null, "/tmp/runwarden");
+    const moss = makeAgent("fake:p3", null, "/tmp");
+    at(1500, amber, "working"); // Amber -> P4 office
+    at(12000, teal, "working"); // Teal -> P2 office
+    at(21000, amber, "blocked"); // Amber -> station S
+    at(33000, amber, "working"); // Amber -> P4 office
+    at(39000, teal, "done"); // Teal stays in P2, done badge
+    at(47000, teal, "idle"); // Teal -> east beach
+    at(54000, moss, "working"); // Moss -> P1 office
+    return;
+  }
+
   if (FAKE_SCENARIO === "signnames") {
     // Two working residents: one has no name (sign falls back to pane_id),
     // one has a long name (font must shrink without overflowing the panel).

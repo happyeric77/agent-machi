@@ -41,6 +41,7 @@ FAKE_SCENARIO=signnames npm run bridge  # pane_id fallback + a long resident nam
 FAKE_SCENARIO=dupe npm run bridge       # two agents resolve to the same display name
 FAKE_SCENARIO=beach3 npm run bridge     # three idle agents share six beach spots
 FAKE_SCENARIO=panelnames npm run bridge # roster/Log name format: role + display_name
+FAKE_SCENARIO=demo npm run bridge       # recording timeline: office signs, station, beach
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
