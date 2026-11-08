@@ -2,6 +2,7 @@ import * as THREE from "three";
 import type { Object3D } from "three";
 import type { Graph } from "../station-to-sea/src/game/graph.ts";
 import { RouteAnimator } from "./animator.ts";
+import { ACCENTS, TRAVELLERS, createNameTag, type NameTag } from "./characters.ts";
 import { logLine } from "./log.ts";
 import { planRoute, routeLength, type RouteStep } from "./planner.ts";
 
@@ -48,6 +49,7 @@ interface Actor {
   blockedSlot: string | null;
   animator: RouteAnimator;
   ring: THREE.Mesh;
+  tag: NameTag;
   highlightTimer: ReturnType<typeof setTimeout> | null;
   debounceTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -108,9 +110,11 @@ export class Director {
     return [...this.roster.values()];
   }
 
-  getRole(paneId: string): "Amber" | "Teal" | null {
+  getRole(paneId: string): string | null {
     const slot = this.travellerSlots[paneId];
-    return slot === 0 ? "Amber" : slot === 1 ? "Teal" : null;
+    return Number.isInteger(slot) && slot >= 0 && slot < TRAVELLERS.length
+      ? TRAVELLERS[slot]
+      : null;
   }
 
   getHome(paneId: string): string | null {
@@ -217,7 +221,6 @@ export class Director {
     ])) {
       if (!seen.has(paneId)) this.removeAgent(paneId);
     }
-    this.emitRoster();
 
     for (const row of rows) {
       if (!row?.pane_id) continue;
@@ -228,8 +231,10 @@ export class Director {
       }
       actor.name = row.name;
       actor.agent = row.agent;
+      actor.tag.setText(row.name || row.pane_id);
       this.setStatus(actor, normalizeStatus(row.agent_status));
     }
+    this.emitRoster();
   }
 
   private handleEvent(event: BridgeEvent): void {
@@ -246,17 +251,19 @@ export class Director {
       status_since: event.at,
       last_change_seq: previous?.last_change_seq ?? 0,
     });
-    this.emitRoster();
     for (const listener of this.eventListeners) listener(event);
 
     const actor = this.actors.get(event.pane_id) ?? this.createActor(event.pane_id, event);
     if (!actor) {
       this.logExtra(event.pane_id, event.name, status);
+      this.emitRoster();
       return;
     }
     actor.name = event.name;
     actor.agent = event.agent;
+    actor.tag.setText(event.name || event.pane_id);
     this.setStatus(actor, status);
+    this.emitRoster();
   }
 
   private removeAgent(paneId: string): void {
@@ -267,6 +274,11 @@ export class Director {
       this.releaseBlockedSlot(actor);
       actor.moving = false;
       actor.traveler.visible = false;
+      actor.ring.removeFromParent();
+      actor.ring.geometry.dispose();
+      (actor.ring.material as THREE.Material).dispose();
+      actor.tag.sprite.removeFromParent();
+      actor.tag.dispose();
       this.actors.delete(paneId);
     }
     if (paneId in this.travellerSlots) {
@@ -283,12 +295,13 @@ export class Director {
   private createActor(paneId: string, row: { name: string | null; agent: string | null }): Actor | null {
     const slot = this.travellerSlot(paneId);
     if (slot === null) return null;
+    const role = TRAVELLERS[slot];
     this.travelers[slot].visible = true;
 
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(0.26, 0.36, 32),
       new THREE.MeshBasicMaterial({
-        color: slot === 0 ? "#f2b705" : "#3d9bb5",
+        color: ACCENTS[role],
         transparent: true,
         opacity: 0.85,
         side: THREE.DoubleSide,
@@ -298,6 +311,8 @@ export class Director {
     ring.rotation.x = -Math.PI / 2;
     ring.position.y = 0.02;
     ring.visible = false;
+
+    const tag = createNameTag(row.name || paneId);
 
     const actor: Actor = {
       paneId,
@@ -312,22 +327,23 @@ export class Director {
       blockedSlot: null,
       animator: null as unknown as RouteAnimator,
       ring,
+      tag,
       highlightTimer: null,
       debounceTimer: null,
     };
     actor.animator = new RouteAnimator(actor.traveler, this.graph, this.groundY, (nodeId) => {
       this.onNodeReached(actor, nodeId);
     });
-    actor.traveler.add(ring);
+    actor.traveler.add(ring, tag.sprite);
     this.actors.set(paneId, actor);
     this.placeAtNode(actor, "S");
-    logLine(`${paneId} (${row.name ?? row.agent ?? "agent"}) 第一次偵測到，放在 S，角色 ${slot === 0 ? "Amber" : "Teal"}`);
+    logLine(`${paneId} (${row.name ?? row.agent ?? "agent"}) 第一次偵測到，放在 S，角色 ${role}`);
     return actor;
   }
 
   private travellerSlot(paneId: string): number | null {
     const existing = this.travellerSlots[paneId];
-    if (existing === 0 || existing === 1) {
+    if (Number.isInteger(existing) && existing >= 0 && existing < this.travelers.length) {
       const usedByOther = Object.entries(this.travellerSlots).some(
         ([otherPane, slot]) => otherPane !== paneId && slot === existing,
       );

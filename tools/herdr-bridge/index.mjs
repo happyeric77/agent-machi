@@ -463,7 +463,41 @@ function startFake() {
     return;
   }
 
-  // Default: one agent runs the full status script.
+  if (FAKE_SCENARIO === "cast") {
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    const p3 = makeAgent("fake:p3", "Fake Agent C");
+    const p4 = makeAgent("fake:p4", "Fake Agent D");
+    // Four agents: Amber, Teal, Moss, Plum. All reach a home, then diverge.
+    at(1500, p1, "working");
+    at(2500, p2, "working");
+    at(3500, p3, "working");
+    at(4500, p4, "working");
+    at(18000, p2, "blocked");
+    at(22000, p3, "idle");
+    at(26000, p4, "done");
+    at(30000, p2, "working");
+    return;
+  }
+
+  if (FAKE_SCENARIO === "castreuse") {
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    const p3 = makeAgent("fake:p3", "Fake Agent C");
+    const p4 = makeAgent("fake:p4", "Fake Agent D");
+    // p3 holds Moss. Remove it, then a new agent should inherit slot 2.
+    at(1500, p1, "working");
+    at(2500, p2, "working");
+    at(3500, p3, "working");
+    at(4500, p4, "working");
+    setTimeout(() => {
+      agents.delete("fake:p3");
+    }, 10000);
+    setTimeout(() => {
+      at(0, makeAgent("fake:p5", "Fake Agent E"), "working");
+    }, 35000);
+    return;
+  }
+
+
   const script = ["working", "blocked", "working", "done", "idle"];
   let step = 0;
   const advance = () => {

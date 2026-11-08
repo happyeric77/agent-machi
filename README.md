@@ -1,7 +1,8 @@
-# agent-machi — Milestone 1
+# agent-machi — Milestone 2
 
-Herdr agent statuses drive two travellers (Amber, Teal) around the
-station-to-sea Kamakura scene. The game flow and HUD are not loaded.
+Herdr agent statuses drive up to six travellers (Amber, Teal, Moss, Plum,
+Slate, Sand) around the station-to-sea Kamakura scene. The game flow and HUD
+are not loaded.
 
 ## Layout
 
@@ -21,6 +22,8 @@ npm run bridge:fake    # scripted working -> blocked -> working -> done -> idle
 FAKE_SCENARIO=flip npm run bridge       # working -> done 2s apart (debounce check)
 FAKE_SCENARIO=blocked2 npm run bridge   # two agents claim S and S-2
 FAKE_SCENARIO=roster npm run bridge     # three interleaved agents (third log only)
+FAKE_SCENARIO=cast npm run bridge       # four agents use Amber/Teal/Moss/Plum
+FAKE_SCENARIO=castreuse npm run bridge  # Moss pane leaves, a new agent inherits Moss
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
@@ -39,10 +42,11 @@ Every event is appended to `tools/herdr-bridge/events.jsonl`.
 
 The page also shows a collapsible roster (all bridge agents, with role, status,
 duration, home) and a collapsible Log panel fed by `/log` plus the live SSE
-stream. Roster rows for the first two agents highlight Amber or Teal in the
-scene; later agents are marked `log only`. Rows are removed when the bridge's
-snapshot no longer contains that pane. The Log panel loads recent history from
-`/log` first, so it survives a page reload, then appends live SSE events.
+stream. Roster rows for the first six agents highlight their role (Amber,
+Teal, Moss, Plum, Slate or Sand) in the scene; agents after the sixth are
+marked `log only`. Rows are removed when the bridge's snapshot no longer
+contains that pane. The Log panel loads recent history from `/log` first, so
+it survives a page reload, then appends live SSE events.
 
 ## State mapping
 
@@ -56,8 +60,9 @@ snapshot no longer contains that pane. The Log panel loads recent history from
 
 Home pool order is `P4, P2, P1, P3, P5, R1, R2`. Assignments are keyed by
 `pane_id` and persisted in localStorage, so a reconnect does not change home.
-Amber/Teal assignment is also persisted by `pane_id`; agents after the second
-are only logged to the console and `window.__agentMachi.log()`.
+Amber/Teal/Moss/Plum/Slate/Sand assignment is also persisted by `pane_id`;
+agents after the sixth are only logged to the console and
+`window.__agentMachi.log()`.
 
 A new agent is placed on `S`. A status must stay unchanged for 3 seconds before
 it moves. If the target changes during a walk, the traveller finishes the
