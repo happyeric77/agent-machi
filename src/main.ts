@@ -14,6 +14,7 @@ import { createCoast, createRoutePreview } from "../station-to-sea/src/coast.ts"
 import { tileSurfaceAt } from "../station-to-sea/src/sceneryAnchors.ts";
 import { loadGraph } from "../station-to-sea/src/game/graph.ts";
 import { Director } from "./director.ts";
+import { LogPanel, RosterPanel } from "./panels.ts";
 import { getLog } from "./log.ts";
 import "./style.css";
 
@@ -161,6 +162,8 @@ const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement);
 const bridgeUrl =
   new URLSearchParams(window.location.search).get("bridge") ||
   `http://${location.hostname}:8731`;
+new RosterPanel(director);
+new LogPanel(director, bridgeUrl);
 director.start(bridgeUrl);
 
 window.__agentMachi = { log: getLog };

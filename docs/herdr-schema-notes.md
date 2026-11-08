@@ -89,6 +89,9 @@ Live event lines:
 ```
 
 `pane.agent_status_changed` uses dots; `pane_agent_detected` uses underscores.
+Live `pane.created`, `pane.closed`, and `pane.exited` events also use
+underscores (`pane_created`, `pane_closed`, `pane_exited`). The bridge
+normalises `.` to `_` before matching so both forms work.
 `events_lost` was not observed; the bridge treats any such event as a dropped
 connection, reconnects, resubscribes, and reconciles with `session.snapshot`.
 
