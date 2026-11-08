@@ -17,6 +17,9 @@ npm run bridge         # real Herdr socket
 npm run dev            # http://localhost:5173
 
 npm run bridge:fake    # scripted working -> blocked -> working -> done -> idle
+
+FAKE_SCENARIO=flip npm run bridge       # working -> done 2s apart (debounce check)
+FAKE_SCENARIO=blocked2 npm run bridge   # two agents claim S and S-2
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.

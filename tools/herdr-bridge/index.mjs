@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
 const FAKE = process.env.FAKE === "1";
+const FAKE_SCENARIO = process.env.FAKE_SCENARIO || "default";
 const PORT = Number(process.env.PORT || 8731);
 const HOST = "127.0.0.1";
 const EVENT_LOG = path.join(HERE, "events.jsonl");
@@ -389,26 +390,57 @@ function scheduleReconcile(delayMs = 250) {
 // Fake mode: one agent runs the full status script without a Herdr socket.
 
 function startFake() {
-  const paneId = "fake:p1";
-  const row = {
-    pane_id: paneId,
-    name: "Fake Agent",
-    agent: "opencode",
-    agent_status: /** @type {AgentStatus} */ ("idle"),
-    status_since: nowIso(),
-    last_change_seq: 0,
+  const makeAgent = (paneId, name) => {
+    const row = {
+      pane_id: paneId,
+      name,
+      agent: "opencode",
+      agent_status: /** @type {AgentStatus} */ ("idle"),
+      status_since: nowIso(),
+      last_change_seq: 0,
+    };
+    agents.set(paneId, row);
+    return row;
   };
-  agents.set(paneId, row);
 
+  const setFakeStatus = (row, status) => {
+    row.agent_status = /** @type {AgentStatus} */ (status);
+    row.status_since = nowIso();
+    row.last_change_seq += 1;
+    publish(row);
+  };
+
+  const at = (delayMs, row, status) => {
+    setTimeout(() => setFakeStatus(row, status), delayMs);
+  };
+
+  const p1 = makeAgent("fake:p1", "Fake Agent");
+
+  if (FAKE_SCENARIO === "flip") {
+    // working and done only 2s apart: only the final stable status may move.
+    at(1500, p1, "working");
+    at(3500, p1, "done");
+    at(12000, p1, "idle");
+    return;
+  }
+
+  if (FAKE_SCENARIO === "blocked2") {
+    const p2 = makeAgent("fake:p2", "Fake Agent B");
+    // p1 takes S, p2 takes S-2, p1 leaves (releasing S), then p1 returns.
+    at(1500, p1, "blocked");
+    at(8000, p2, "blocked");
+    at(16000, p1, "working");
+    at(30000, p1, "blocked");
+    return;
+  }
+
+  // Default: one agent runs the full status script.
   const script = ["working", "blocked", "working", "done", "idle"];
   let step = 0;
   const advance = () => {
     const status = script[step++];
     if (!status) return;
-    row.agent_status = /** @type {AgentStatus} */ (status);
-    row.status_since = nowIso();
-    row.last_change_seq += 1;
-    publish(row);
+    setFakeStatus(p1, status);
     if (step < script.length) setTimeout(advance, 10000);
   };
   setTimeout(advance, 1500);
