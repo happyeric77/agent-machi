@@ -1,0 +1,8 @@
+node_modules/
+/dist/
+internal/web/dist/*
+!internal/web/dist/.gitkeep
+tools/herdr-bridge/events.jsonl
+events.jsonl
+/agent-machi
+.DS_Store

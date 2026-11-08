@@ -1,0 +1,920 @@
+[
+ {
+  "id": "road-1-1",
+  "from": "road-1-N",
+  "to": "CJ-OW",
+  "centerline": [
+   [
+    -2.42957,
+    -5.82168
+   ],
+   [
+    -2.51466,
+    -4.69199
+   ]
+  ],
+  "worldLength": 1.1328875053171843,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-2-1",
+  "from": "road-2-N",
+  "to": "P3",
+  "centerline": [
+   [
+    3.66,
+    -6.09
+   ],
+   [
+    3.74561,
+    -4.90104
+   ]
+  ],
+  "worldLength": 1.1920538059623536,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-2-2",
+  "from": "J-2-3",
+  "to": "P5",
+  "centerline": [
+   [
+    3.72078,
+    0.03386
+   ],
+   [
+    3.66255,
+    2.17296
+   ],
+   [
+    3.67063,
+    3.53011
+   ]
+  ],
+  "worldLength": 3.4971811656998932,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-3-1",
+  "from": "road-3-N",
+  "to": "CJ-P2",
+  "centerline": [
+   [
+    -5.2,
+    -0.1
+   ],
+   [
+    -4.60979,
+    -0.08308
+   ]
+  ],
+  "worldLength": 0.5904540898631488,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-3-2",
+  "from": "J-3-5",
+  "to": "J-2-3",
+  "centerline": [
+   [
+    0.11844308570220649,
+    0.06061558546810385
+   ],
+   [
+    3.7207774586657063,
+    0.033857463853039
+   ]
+  ],
+  "worldLength": 3.602586874371568,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-3-3",
+  "from": "J-2-3",
+  "to": "road-3-S",
+  "centerline": [
+   [
+    3.7207774586657063,
+    0.033857463853039
+   ],
+   [
+    5.93,
+    0.11
+   ]
+  ],
+  "worldLength": 2.2108297633843024,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-4-1",
+  "from": "road-4-N",
+  "to": "CF-W",
+  "centerline": [
+   [
+    -5.78,
+    5.26
+   ],
+   [
+    -5.42224,
+    5.27317
+   ]
+  ],
+  "worldLength": 0.3580022180786366,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-5-1",
+  "from": "road-5-N",
+  "to": "P4",
+  "centerline": [
+   [
+    -0.12,
+    -4.86
+   ],
+   [
+    0.10618,
+    -4.25492
+   ],
+   [
+    0.17658,
+    -3.96872
+   ],
+   [
+    0.17858,
+    -3.67165
+   ],
+   [
+    0.1,
+    -3.2
+   ]
+  ],
+  "worldLength": 1.7172662945216859,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-5-2",
+  "from": "J-3-5",
+  "to": "J-5-6",
+  "centerline": [
+   [
+    0.11844308570220641,
+    0.06061558546810347
+   ],
+   [
+    0.2797973550663627,
+    1.6212232793037864
+   ],
+   [
+    0.1585944976559808,
+    2.884523912671848
+   ]
+  ],
+  "worldLength": 2.840505538487377,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-5-3",
+  "from": "J-5-6",
+  "to": "road-5-S",
+  "centerline": [
+   [
+    0.1585944976559808,
+    2.884523912671848
+   ],
+   [
+    0.17,
+    4.8999999999999995
+   ]
+  ],
+  "worldLength": 2.0161423120101585,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-6-1",
+  "from": "road-6-N",
+  "to": "J-5-6",
+  "centerline": [
+   [
+    -4.17,
+    2.07
+   ],
+   [
+    -3.4997769517464286,
+    1.8518445074981895
+   ],
+   [
+    -3.2991125487467596,
+    1.8295074610748003
+   ],
+   [
+    -3.098855392969571,
+    1.8486530660228913
+   ],
+   [
+    -2.8105548323055634,
+    1.9295337858166854
+   ],
+   [
+    -2.0462553098710914,
+    2.2399004878551514
+   ],
+   [
+    -1.1049813671603028,
+    2.5553071214428087
+   ],
+   [
+    0.15859449765598055,
+    2.884523912671848
+   ]
+  ],
+  "worldLength": 4.532995315203203,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "BLOCKED",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-6-2",
+  "from": "J-5-6",
+  "to": "road-6-S",
+  "centerline": [
+   [
+    0.15859449765598055,
+    2.884523912671848
+   ],
+   [
+    0.8855495530158829,
+    2.9934900812315237
+   ],
+   [
+    2.3099999999999996,
+    3.1100000000000003
+   ]
+  ],
+  "worldLength": 2.1646075480448563,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "BLOCKED",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-7-1",
+  "from": "road-7-N",
+  "to": "road-7-S",
+  "centerline": [
+   [
+    -2.22679,
+    -4.86612
+   ],
+   [
+    -1.65197,
+    -4.5929
+   ],
+   [
+    -1.40178,
+    -4.52983
+   ],
+   [
+    -1.14326,
+    -4.57299
+   ],
+   [
+    -0.53767,
+    -4.8015
+   ]
+  ],
+  "worldLength": 1.806906,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "v06g-C",
+  "from": "P2-311",
+  "to": "P2",
+  "centerline": [
+   [
+    -4.61,
+    -0.1
+   ],
+   [
+    -4.61,
+    -1.4
+   ]
+  ],
+  "worldLength": 1.2999999999999998,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "v06g-D",
+  "from": "P2",
+  "to": "P2-south",
+  "centerline": [
+   [
+    -4.61,
+    -1.4
+   ],
+   [
+    -4.39,
+    -1.7
+   ],
+   [
+    -4.48,
+    -3.88
+   ],
+   [
+    -4.41,
+    -4.77
+   ],
+   [
+    -4.46,
+    -5.6
+   ]
+  ],
+  "worldLength": 4.278385807970317,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "v06g-E",
+  "from": "P2-south",
+  "to": "Onari-north",
+  "centerline": [
+   [
+    -4.46,
+    -5.6
+   ],
+   [
+    -4.46,
+    -6.4
+   ],
+   [
+    -2.28,
+    -6.4
+   ],
+   [
+    -2.28,
+    -5.65
+   ]
+  ],
+  "worldLength": 3.730000000000001,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-CF-W-F-W",
+  "from": "CF-W",
+  "to": "F-W",
+  "centerline": [
+   [
+    -5.42224,
+    5.27317
+   ],
+   [
+    -5.45,
+    5.95
+   ]
+  ],
+  "worldLength": 0.6774014385665474,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-CF-E-F-E",
+  "from": "CF-E",
+  "to": "F-E",
+  "centerline": [
+   [
+    5.42936,
+    5.31857
+   ],
+   [
+    5.45,
+    5.95
+   ]
+  ],
+  "worldLength": 0.6317668511535538,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-central-coastal",
+  "from": "road-5-S",
+  "to": "CJ-C",
+  "centerline": [
+   [
+    0.17,
+    4.9
+   ],
+   [
+    0.17089,
+    5.31708
+   ]
+  ],
+  "worldLength": 0.4170785918362371,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-station-west",
+  "from": "S",
+  "to": "road-7-S",
+  "centerline": [
+   [
+    -0.05,
+    -5.13
+   ],
+   [
+    -0.53767,
+    -4.8015
+   ]
+  ],
+  "worldLength": 0.5879917337003999,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-west-central",
+  "from": "road-7-S",
+  "to": "road-5-N",
+  "centerline": [
+   [
+    -0.53767,
+    -4.8015
+   ],
+   [
+    -0.12,
+    -4.86
+   ]
+  ],
+  "worldLength": 0.4217469370368977,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-station-west-onari",
+  "from": "road-7-N",
+  "to": "CJ-OW",
+  "centerline": [
+   [
+    -2.22679,
+    -4.86612
+   ],
+   [
+    -2.51466,
+    -4.69199
+   ]
+  ],
+  "worldLength": 0.3364414397587125,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-onari-311",
+  "from": "road-1-S",
+  "to": "CJ-OS",
+  "centerline": [
+   [
+    -2.46957,
+    -0.1483
+   ],
+   [
+    -2.3109,
+    0.03239
+   ]
+  ],
+  "worldLength": 0.2404733557018359,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-P2-311",
+  "from": "P2-311",
+  "to": "CJ-P2",
+  "centerline": [
+   [
+    -4.61,
+    -0.1
+   ],
+   [
+    -4.60979,
+    -0.08308
+   ]
+  ],
+  "worldLength": 0.016923850026849905,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "gap-east-coastal",
+  "from": "road-2-S",
+  "to": "CJ-E",
+  "centerline": [
+   [
+    3.71,
+    5.29
+   ],
+   [
+    3.71228,
+    5.35119
+   ]
+  ],
+  "worldLength": 0.06123539107119018,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-Onari-north-road-1-N",
+  "from": "Onari-north",
+  "to": "road-1-N",
+  "centerline": [
+   [
+    -2.28,
+    -5.65
+   ],
+   [
+    -2.42957,
+    -5.82168
+   ]
+  ],
+  "worldLength": 0.22769542661194947,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-4-1b",
+  "from": "CF-W",
+  "to": "CJ-C",
+  "centerline": [
+   [
+    -5.42224,
+    5.27317
+   ],
+   [
+    -3.57263,
+    5.33132
+   ],
+   [
+    0.17089,
+    5.31708
+   ]
+  ],
+  "worldLength": 5.594292686899043,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-4-1c",
+  "from": "CJ-C",
+  "to": "CJ-E",
+  "centerline": [
+   [
+    0.17089,
+    5.31708
+   ],
+   [
+    3.71228,
+    5.35119
+   ]
+  ],
+  "worldLength": 3.541567748388964,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-4-1d",
+  "from": "CJ-E",
+  "to": "CF-E",
+  "centerline": [
+   [
+    3.71228,
+    5.35119
+   ],
+   [
+    5.42936,
+    5.31857
+   ]
+  ],
+  "worldLength": 1.7174881619762057,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-4-1e",
+  "from": "CF-E",
+  "to": "road-4-S",
+  "centerline": [
+   [
+    5.42936,
+    5.31857
+   ],
+   [
+    5.74,
+    5.31
+   ]
+  ],
+  "worldLength": 0.3107611015148493,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-1-1b",
+  "from": "CJ-OW",
+  "to": "P1",
+  "centerline": [
+   [
+    -2.51466,
+    -4.69199
+   ],
+   [
+    -2.56847,
+    -3.91078
+   ]
+  ],
+  "worldLength": 0.783061,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-1-1c",
+  "from": "P1",
+  "to": "R1",
+  "centerline": [
+   [
+    -2.56847,
+    -3.91078
+   ],
+   [
+    -2.64024,
+    -2.62196
+   ]
+  ],
+  "worldLength": 1.291122,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-1-1d",
+  "from": "R1",
+  "to": "road-1-S",
+  "centerline": [
+   [
+    -2.64024,
+    -2.62196
+   ],
+   [
+    -2.61052,
+    -1.80043
+   ],
+   [
+    -2.46957,
+    -0.1483
+   ]
+  ],
+  "worldLength": 2.480429,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-2-1b",
+  "from": "P3",
+  "to": "R2",
+  "centerline": [
+   [
+    3.74561,
+    -4.90104
+   ],
+   [
+    3.77189,
+    -4.18486
+   ],
+   [
+    3.75803,
+    -3.33191
+   ]
+  ],
+  "worldLength": 1.5698673159303431,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-2-1c",
+  "from": "R2",
+  "to": "J-2-3",
+  "centerline": [
+   [
+    3.75803,
+    -3.33191
+   ],
+   [
+    3.72,
+    -2.04037
+   ],
+   [
+    3.72078,
+    0.03386
+   ]
+  ],
+  "worldLength": 3.3663817873858095,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-2-2b",
+  "from": "P5",
+  "to": "road-2-S",
+  "centerline": [
+   [
+    3.67063,
+    3.53011
+   ],
+   [
+    3.71,
+    5.29
+   ]
+  ],
+  "worldLength": 1.760336559178047,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-5-1b",
+  "from": "P4",
+  "to": "J-3-5",
+  "centerline": [
+   [
+    0.1,
+    -3.2
+   ],
+   [
+    -0.05255,
+    -2.63942
+   ],
+   [
+    -0.0809,
+    -2.41334
+   ],
+   [
+    -0.04251,
+    -2.19412
+   ],
+   [
+    0.15703,
+    -1.70912
+   ],
+   [
+    0.19929,
+    -1.47508
+   ],
+   [
+    0.20066,
+    -1.10189
+   ],
+   [
+    0.11844,
+    0.06062
+   ]
+  ],
+  "worldLength": 3.335619489136153,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-3-1b",
+  "from": "CJ-P2",
+  "to": "CJ-OS",
+  "centerline": [
+   [
+    -4.60979,
+    -0.08308
+   ],
+   [
+    -2.3109,
+    0.03239
+   ]
+  ],
+  "worldLength": 2.3020605239458694,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "road-3-1c",
+  "from": "CJ-OS",
+  "to": "J-3-5",
+  "centerline": [
+   [
+    -2.3109,
+    0.03239
+   ],
+   [
+    0.11844,
+    0.06062
+   ]
+  ],
+  "worldLength": 2.4298802713490937,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-S-central",
+  "from": "S",
+  "to": "road-5-N",
+  "centerline": [
+   [
+    -0.05,
+    -5.13
+   ],
+   [
+    -0.12,
+    -4.86
+   ]
+  ],
+  "worldLength": 0.27892651361962617,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-S-2-central",
+  "from": "S-2",
+  "to": "road-5-N",
+  "centerline": [
+   [
+    -0.4,
+    -4.95
+   ],
+   [
+    -0.12,
+    -4.86
+   ]
+  ],
+  "worldLength": 0.2941088233970541,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ },
+ {
+  "id": "link-S-3-central",
+  "from": "S-3",
+  "to": "road-5-N",
+  "centerline": [
+   [
+    0.45,
+    -4.95
+   ],
+   [
+    -0.12,
+    -4.86
+   ]
+  ],
+  "worldLength": 0.5770615218501415,
+  "bidirectional": true,
+  "runtimeCollisionStatus": "FINITE_SAMPLE_PASS",
+  "ownerApprovalStatus": "NEEDS_OWNER_APPROVAL"
+ }
+]
