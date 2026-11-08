@@ -40,6 +40,7 @@ FAKE_SCENARIO=home4 npm run bridge      # four agents go home; doorstep/sign che
 FAKE_SCENARIO=signnames npm run bridge  # pane_id fallback + a long resident name
 FAKE_SCENARIO=dupe npm run bridge       # two agents resolve to the same display name
 FAKE_SCENARIO=beach3 npm run bridge     # three idle agents share six beach spots
+FAKE_SCENARIO=panelnames npm run bridge # roster/Log name format: role + display_name
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
@@ -71,9 +72,10 @@ of `foreground_cwd`/`cwd`, else the agent kind, else `pane_id`. Basenames that
 are the home directory, empty, `/`, temporary directories or otherwise
 non-identifying are skipped. Live agents with the same base name get ` (2)`,
 ` (3)` suffixes in first-seen order; the first one keeps the plain name.
-Roster and Log use `display_name`. Home signs and the head name tag use the
-character name instead. Old `/log` entries without `display_name` fall back to
-`name`, `terminal_title_stripped`, then `pane_id`.
+Roster and Log show `Role (display_name)` for agents with a character, e.g.
+`Amber (agent-machi)`. Log-only agents show just `display_name`. Home signs
+and the head name tag use the character name alone. Old `/log` entries without
+`display_name` fall back to `name`, `terminal_title_stripped`, then `pane_id`.
 
 ## State mapping
 

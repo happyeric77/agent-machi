@@ -83,7 +83,7 @@ body {
 .log-panel {
   bottom: 12px;
   left: 12px;
-  width: min(480px, calc(100vw - 24px));
+  width: min(560px, calc(100vw - 24px));
   max-height: 270px;
 }
 
@@ -251,7 +251,7 @@ body {
 
 .log-entry {
   display: grid;
-  grid-template-columns: 62px 112px 1fr;
+  grid-template-columns: 62px 170px 1fr;
   gap: 7px;
   padding: 4px 2px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);

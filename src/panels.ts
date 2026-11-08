@@ -16,6 +16,10 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): H
   return element;
 }
 
+function formatName(role: string | null, displayName: string): string {
+  return role ? `${role} (${displayName})` : displayName;
+}
+
 function durationSince(iso: string): string {
   const started = Date.parse(iso);
   if (!Number.isFinite(started)) return "—";
@@ -79,7 +83,7 @@ export class RosterPanel {
       const badge = el("span", `role-badge ${role ? `role-${role.toLowerCase()}` : "role-log"}`);
       badge.textContent = role ?? "log only";
       const name = el("span", "roster-name");
-      name.textContent = resolveDisplayName(row);
+      name.textContent = formatName(role, resolveDisplayName(row));
       top.append(badge, name);
 
       const meta = el("span", "roster-meta");
@@ -155,6 +159,9 @@ export class LogPanel {
         this.list.scrollHeight - this.list.scrollTop - this.list.clientHeight < 24;
     });
     this.director.onEvent((event) => this.accept(event));
+    this.director.onRosterChange(() => {
+      if (this.historyLoaded) this.renderAll();
+    });
     void this.loadHistory(bridgeUrl);
     document.body.append(this.root);
   }
@@ -234,7 +241,10 @@ export class LogPanel {
       : parsed.toLocaleTimeString("en-GB", { hour12: false });
 
     const name = el("span", "log-name");
-    name.textContent = resolveDisplayName(event);
+    name.textContent = formatName(
+      this.director.getRole(event.pane_id),
+      resolveDisplayName(event),
+    );
 
     const change = el("span", "log-change");
     change.style.color = statusColor(event.status);

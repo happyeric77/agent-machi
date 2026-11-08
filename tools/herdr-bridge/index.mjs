@@ -528,6 +528,25 @@ function startFake() {
     return;
   }
 
+  if (FAKE_SCENARIO === "panelnames") {
+    // Six role agents plus one log-only agent.
+    const a = makeAgent("fake:p1", null);
+    const b = makeAgent("fake:p2", null);
+    const c = makeAgent("fake:p3", null, "/tmp");
+    const d = makeAgent("fake:p4", null, "/tmp/agent-a");
+    const e = makeAgent("fake:p5", null, "/tmp/agent-b");
+    const f = makeAgent("fake:p6", null, "/tmp/agent-c");
+    const g = makeAgent("fake:p7", null, "/tmp/runwarden");
+    at(1500, a, "working");
+    at(2500, b, "working");
+    at(3500, c, "working");
+    at(4500, d, "working");
+    at(5500, e, "working");
+    at(6500, f, "working");
+    at(7500, g, "working");
+    return;
+  }
+
   const p1 = makeAgent("fake:p1", "Fake Agent");
 
   if (FAKE_SCENARIO === "flip") {
