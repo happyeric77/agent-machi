@@ -427,6 +427,16 @@ function startFake() {
     setTimeout(() => setFakeStatus(row, status), delayMs);
   };
 
+  if (FAKE_SCENARIO === "signnames") {
+    // Two working residents: one has no name (sign falls back to pane_id),
+    // one has a long name (font must shrink without overflowing the panel).
+    const paneId = makeAgent("w7:p2", null);
+    const longName = makeAgent("fake:p-long", "Wakamiya Coffee Roaster");
+    at(1500, paneId, "working");
+    at(1500, longName, "working");
+    return;
+  }
+
   const p1 = makeAgent("fake:p1", "Fake Agent");
 
   if (FAKE_SCENARIO === "flip") {

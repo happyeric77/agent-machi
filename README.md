@@ -27,6 +27,7 @@ FAKE_SCENARIO=castreuse npm run bridge  # Moss pane leaves, a new agent inherits
 FAKE_SCENARIO=home npm run bridge       # one agent loops working/blocked/done/idle
 FAKE_SCENARIO=homeblock npm run bridge  # working, then blocked while entering home
 FAKE_SCENARIO=home4 npm run bridge      # four agents go home; doorstep/sign check
+FAKE_SCENARIO=signnames npm run bridge  # pane_id fallback + a long resident name
 ```
 
 Override the bridge in the app with `?bridge=http://host:port`.
