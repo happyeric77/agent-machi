@@ -20,6 +20,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
 const FAKE = process.env.FAKE === "1";
 const FAKE_SCENARIO = process.env.FAKE_SCENARIO || "default";
+let trailerOnSnapshot = null;
+let trailerStarted = false;
 const PORT = Number(process.env.PORT || 8731);
 const HOST = process.env.HOST || "0.0.0.0";
 const EVENT_LOG = path.join(HERE, "events.jsonl");
@@ -508,6 +510,24 @@ function startFake() {
     setTimeout(() => setFakeStatus(row, status), delayMs);
   };
 
+  if (FAKE_SCENARIO === "trailer") {
+    // Cinematic prop: initial states match the opening positions. No new
+    // events until the 14s camera orbit has finished.
+    const amber = makeAgent("fake:p1", null);
+    const teal = makeAgent("fake:p2", null, "/tmp/runwarden");
+    const moss = makeAgent("fake:p3", null, "/tmp");
+    setFakeStatus(amber, "blocked"); // station S
+    setFakeStatus(teal, "working"); // P2 office
+    setFakeStatus(moss, "idle"); // beach
+    trailerOnSnapshot = () => {
+      at(25000, amber, "working"); // blocked released -> office
+      at(30000, teal, "done"); // completion badge at office
+      at(32000, teal, "idle"); // viewed -> nearest beach
+      at(39000, moss, "working"); // called back -> office
+    };
+    return;
+  }
+
   if (FAKE_SCENARIO === "demo") {
     // Recording prop: three named agents (Amber, Teal, Moss) follow the
     // timeline in the delivery notes. Not ported to the Go binary.
@@ -713,6 +733,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === "/snapshot") {
+    if (FAKE_SCENARIO === "trailer" && trailerOnSnapshot && !trailerStarted) {
+      trailerStarted = true;
+      trailerOnSnapshot();
+    }
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify([...agents.values()]));
     return;

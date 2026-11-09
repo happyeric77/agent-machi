@@ -51,6 +51,8 @@ agents go down to the beach.
 - **Six residents**: Amber, Teal, Moss, Plum, Slate, and Sand. Agents beyond
   the sixth still appear in the roster and the Log.
 - **Full camera control**: orbit, zoom, and pan, with a Reset view button.
+- **Trailer mode**: add `?trailer=1` to hide the panels and play a fixed
+  wide-to-close camera orbit around the town.
 
 ## Quick Start
 
@@ -113,6 +115,7 @@ FAKE scenarios used in tests and demos:
 ```sh
 npm install
 npm run bridge:fake   # scripted agents, no Herdr needed
+FAKE_SCENARIO=trailer npm run bridge:fake   # opening scene for ?trailer=1
 npm run dev           # http://localhost:5173
 ```
 
