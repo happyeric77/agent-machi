@@ -273,3 +273,9 @@ body {
 .log-change {
   color: #bdc8c0;
 }
+
+body.trailer #bridge-status,
+body.trailer #camera-ui,
+body.trailer .panel {
+  display: none;
+}
