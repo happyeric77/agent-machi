@@ -4,6 +4,7 @@ import type { Graph } from "./town/graph/graph.ts";
 import { RouteAnimator } from "./animator.ts";
 import { ACCENTS, TRAVELLERS, createNameTag, type NameTag } from "./characters.ts";
 import { createFadeController, type FadeController } from "./fade.ts";
+import { StatusBadgeSprite } from "./badge.ts";
 import { HomeSign, homeSpot } from "./homes.ts";
 import { BEACH_SPOTS, beachSpot } from "./beaches.ts";
 import { resolveDisplayName } from "./display.ts";
@@ -75,6 +76,7 @@ interface Actor {
   fade: FadeController;
   ring: THREE.Mesh;
   tag: NameTag;
+  badge: StatusBadgeSprite;
   highlightTimer: ReturnType<typeof setTimeout> | null;
   debounceTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -212,6 +214,8 @@ export class Director {
     for (const actor of this.actors.values()) {
       if (actor.door) this.updateDoor(actor, dtSeconds);
       else if (actor.moving) actor.animator.update(dtSeconds);
+      this.syncHeadBadge(actor);
+      actor.badge.update(dtSeconds);
     }
     for (const sign of this.homeSigns.values()) sign.update(dtSeconds);
   }
@@ -325,6 +329,7 @@ export class Director {
       (actor.ring.material as THREE.Material).dispose();
       actor.tag.sprite.removeFromParent();
       actor.tag.dispose();
+      actor.badge.dispose();
       this.actors.delete(paneId);
     }
     const sign = this.homeSigns.get(paneId);
@@ -368,6 +373,9 @@ export class Director {
     ring.visible = false;
 
     const tag = createNameTag(role);
+    const badge = new StatusBadgeSprite("!", 0.36);
+    badge.sprite.position.set(0, 1.52, 0.02);
+    badge.sprite.renderOrder = 4;
 
     const actor: Actor = {
       paneId,
@@ -389,6 +397,7 @@ export class Director {
       fade: null as unknown as FadeController,
       ring,
       tag,
+      badge,
       highlightTimer: null,
       debounceTimer: null,
     };
@@ -397,6 +406,7 @@ export class Director {
     });
     actor.traveler.add(ring, tag.sprite);
     actor.fade = createFadeController(actor.traveler);
+    actor.traveler.add(badge.sprite);
     actor.fade.set(1);
     this.actors.set(paneId, actor);
     this.placeAtNode(actor, "S");
@@ -560,7 +570,13 @@ export class Director {
     if (!sign) return;
     sign.setContent(this.officeName(actor), actor.reportedStatus ?? "unknown");
     sign.setLit(actor.inside);
-    sign.setDone(actor.reportedStatus === "done");
+    sign.setBadge(actor.reportedStatus ?? "");
+  }
+
+  private syncHeadBadge(actor: Actor): void {
+    const enteringHome = actor.inside || actor.door?.kind === "door";
+    const outdoors = actor.traveler.visible && !enteringHome;
+    actor.badge.setStatus(outdoors ? (actor.reportedStatus ?? "") : "");
   }
 
   private beginEnter(actor: Actor): void {

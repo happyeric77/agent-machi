@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { StatusBadgeSprite } from "./badge.ts";
 import { statusColor } from "./status.ts";
 
 // Doorstep coordinates are agent-machi data, not graph data. Each point was
@@ -121,24 +122,6 @@ function drawPanel(
   texture.needsUpdate = true;
 }
 
-function drawBadge(context: CanvasRenderingContext2D, texture: THREE.CanvasTexture): void {
-  const { width, height } = context.canvas;
-  context.clearRect(0, 0, width, height);
-  context.beginPath();
-  context.arc(width / 2, height / 2, 52, 0, Math.PI * 2);
-  context.fillStyle = "#f2b705";
-  context.fill();
-  context.lineWidth = 8;
-  context.strokeStyle = "#5e4a12";
-  context.stroke();
-  context.fillStyle = "#2b2410";
-  context.font = "800 74px ui-monospace, SFMono-Regular, Menlo, monospace";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText("!", width / 2, height / 2 + 4);
-  texture.needsUpdate = true;
-}
-
 export class HomeSign {
   readonly group: THREE.Group;
   private readonly panel: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
@@ -146,13 +129,10 @@ export class HomeSign {
   private readonly canvas: HTMLCanvasElement;
   private readonly context: CanvasRenderingContext2D;
   private readonly texture: THREE.CanvasTexture;
-  private readonly badge: THREE.Sprite;
-  private readonly badgeMaterial: THREE.SpriteMaterial;
+  private readonly badge = new StatusBadgeSprite("check", 0.28);
   private name = "";
   private status = "";
   private lit: boolean | null = null;
-  private done: boolean | null = null;
-  private pulse = 0;
 
   constructor(spot: HomeSpot, groundY: number, initialName: string, initialStatus: string) {
     this.group = new THREE.Group();
@@ -196,26 +176,10 @@ export class HomeSign {
     base.position.set(0, 0.03, 0);
     base.castShadow = true;
 
-    const badgeCanvas = document.createElement("canvas");
-    badgeCanvas.width = 128;
-    badgeCanvas.height = 128;
-    const badgeContext = badgeCanvas.getContext("2d");
-    if (!badgeContext) throw new Error("Missing 2D canvas context for done badge");
-    const badgeTexture = new THREE.CanvasTexture(badgeCanvas);
-    badgeTexture.colorSpace = THREE.SRGBColorSpace;
-    drawBadge(badgeContext, badgeTexture);
-    this.badgeMaterial = new THREE.SpriteMaterial({
-      map: badgeTexture,
-      transparent: true,
-      depthWrite: false,
-    });
-    this.badge = new THREE.Sprite(this.badgeMaterial);
-    this.badge.scale.set(0.28, 0.28, 1);
-    this.badge.position.set(0, 1.36, 0.08);
-    this.badge.visible = false;
-    this.badge.renderOrder = 3;
+    this.badge.sprite.position.set(0, 1.36, 0.08);
+    this.badge.sprite.renderOrder = 3;
 
-    this.group.add(base, this.pole, this.panel, this.badge);
+    this.group.add(base, this.pole, this.panel, this.badge.sprite);
     this.setContent(initialName, initialStatus);
     this.setLit(false);
   }
@@ -235,19 +199,12 @@ export class HomeSign {
     this.pole.material.color.set("#6d5c4b").multiplyScalar(brightness);
   }
 
-  setDone(done: boolean): void {
-    if (done === this.done) return;
-    this.done = done;
-    this.badge.visible = done;
-    if (done) this.pulse = 0;
+  setBadge(status: string): void {
+    this.badge.setStatus(status);
   }
 
   update(dtSeconds: number): void {
-    if (!this.badge.visible) return;
-    this.pulse += dtSeconds;
-    const scale = 0.28 * (1 + Math.sin(this.pulse * 4.2) * 0.14);
-    this.badge.scale.set(scale, scale, 1);
-    this.badgeMaterial.opacity = 0.82 + Math.sin(this.pulse * 4.2) * 0.18;
+    this.badge.update(dtSeconds);
   }
 
   dispose(): void {
@@ -257,12 +214,11 @@ export class HomeSign {
     this.panel.geometry.dispose();
     this.pole.geometry.dispose();
     this.pole.material.dispose();
-    const base = this.group.children.find((child) => child !== this.panel && child !== this.pole && child !== this.badge);
+    const base = this.group.children.find((child) => child !== this.panel && child !== this.pole && child !== this.badge.sprite);
     if (base instanceof THREE.Mesh) {
       base.geometry.dispose();
       (base.material as THREE.Material).dispose();
     }
-    this.badgeMaterial.map?.dispose();
-    this.badgeMaterial.dispose();
+    this.badge.dispose();
   }
 }

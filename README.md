@@ -24,14 +24,14 @@ nothing in the room shows it.
 Agent Machi turns that state into a place. Each agent gets a character and an
 office in the town. Working agents are inside, with their office sign lit. The
 moment one gets blocked, it walks out and waits for you on the station platform.
-When it finishes, its sign grows a pulsing badge until you look at it. Idle
+When it finishes, its sign grows a pulsing green check until you look at it. Idle
 agents go down to the beach.
 
 | Herdr state | Where the agent is |
 | --- | --- |
 | `working` | Inside its office, sign lit |
-| `blocked` | On the station platform, waiting for you |
-| `done` | Inside its office, sign lit, with a pulsing **!** badge |
+| `blocked` | On the station platform, waiting for you, pulsing yellow **!** above its name |
+| `done` | Inside its office, sign lit, with a pulsing green check |
 | `idle` | On the beach |
 | `unknown` | Stays where it was |
 
