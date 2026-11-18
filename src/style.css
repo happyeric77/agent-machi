@@ -274,8 +274,28 @@ body {
   color: #bdc8c0;
 }
 
+.demo-ribbon {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  z-index: 10;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(28, 70, 48, 0.9);
+  color: #eef5ee;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-decoration: none;
+  transform: translateX(-50%);
+}
+
+.demo-ribbon:hover,
+.demo-ribbon:focus-visible {
+  background: rgba(40, 96, 66, 0.95);
+}
+
 body.trailer #bridge-status,
 body.trailer #camera-ui,
+body.trailer .demo-ribbon,
 body.trailer .panel {
   display: none;
 }

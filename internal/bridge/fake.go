@@ -74,6 +74,28 @@ func (b *Bridge) StartFake() {
 		at(6500*time.Millisecond, g, StatusWorking)
 		at(7500*time.Millisecond, h, StatusWorking)
 		return
+
+	case "demo":
+		// Public demo: the Node bridge's three-agent story, replayed forever.
+		amber := makeAgent("fake:p1", nil)
+		teal := makeAgent("fake:p2", nil, "/tmp/runwarden")
+		moss := makeAgent("fake:p3", nil, "/tmp")
+		var cycle func()
+		cycle = func() {
+			setFakeStatus(amber, StatusIdle)
+			setFakeStatus(teal, StatusIdle)
+			setFakeStatus(moss, StatusIdle)
+			at(1500*time.Millisecond, amber, StatusWorking)
+			at(12000*time.Millisecond, teal, StatusWorking)
+			at(21000*time.Millisecond, amber, StatusBlocked)
+			at(33000*time.Millisecond, amber, StatusWorking)
+			at(39000*time.Millisecond, teal, StatusDone)
+			at(47000*time.Millisecond, teal, StatusIdle)
+			at(54000*time.Millisecond, moss, StatusWorking)
+			time.AfterFunc(62000*time.Millisecond, cycle)
+		}
+		time.AfterFunc(1500*time.Millisecond, cycle)
+		return
 	}
 
 	p1 := makeAgent("fake:p1", strPtr("Fake Agent"))

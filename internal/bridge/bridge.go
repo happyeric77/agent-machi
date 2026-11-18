@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,6 +77,7 @@ func (b *Bridge) appendEventLog(event Event) {
 	if err != nil {
 		return
 	}
+	b.trimEventLog()
 	file, err := os.OpenFile(b.cfg.EventsLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		fmt.Printf("[bridge] cannot append events.jsonl: %v\n", err)
@@ -84,6 +86,36 @@ func (b *Bridge) appendEventLog(event Event) {
 	defer file.Close()
 	if _, err := file.Write(append(data, '\n')); err != nil {
 		fmt.Printf("[bridge] cannot append events.jsonl: %v\n", err)
+	}
+}
+
+// eventsLogMaxBytes keeps a long-running demo pod from growing its log
+// forever; ReadLog only caps the response, not the file.
+const eventsLogMaxBytes = 1 << 20
+
+// trimEventLog keeps the newer half of an oversized log. Every caller already
+// holds b.mu, so the rewrite cannot race another append.
+func (b *Bridge) trimEventLog() {
+	info, err := os.Stat(b.cfg.EventsLog)
+	if err != nil || info.Size() <= eventsLogMaxBytes {
+		return
+	}
+	data, err := os.ReadFile(b.cfg.EventsLog)
+	if err != nil {
+		return
+	}
+	lines := splitLines(string(data))
+	keep := len(lines) / 2
+	if keep < 1 {
+		keep = 1
+	}
+	payload := strings.Join(lines[len(lines)-keep:], "\n") + "\n"
+	temp := b.cfg.EventsLog + ".tmp"
+	if err := os.WriteFile(temp, []byte(payload), 0o644); err != nil {
+		return
+	}
+	if err := os.Rename(temp, b.cfg.EventsLog); err != nil {
+		_ = os.Remove(temp)
 	}
 }
 
