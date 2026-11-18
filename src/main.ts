@@ -206,13 +206,42 @@ resize();
 
 const graph = loadGraph();
 const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement, scene);
+// The bridge serves this page in production, so same-origin is the default;
+// Vite dev runs on its own port with the bridge still on 8731.
 const bridgeUrl =
-  params.get("bridge") || `http://${location.hostname}:8731`;
+  params.get("bridge") ||
+  (import.meta.env.DEV ? `http://${location.hostname}:8731` : location.origin);
 if (!trailerMode) {
   new RosterPanel(director);
   new LogPanel(director, bridgeUrl);
+  void showDemoRibbon(bridgeUrl);
 }
 director.start(bridgeUrl);
+
+async function showDemoRibbon(bridgeBase: string): Promise<void> {
+  try {
+    const response = await fetch(`${bridgeBase.replace(/\/+$/, "")}/health`);
+    if (!response.ok) return;
+    const health = (await response.json()) as { fake?: boolean };
+    if (health?.fake !== true) return;
+    const repo = "https://github.com/happyeric77/agent-machi";
+    const ribbon = document.createElement("div");
+    ribbon.className = "demo-ribbon";
+    ribbon.append("Live demo · fake agents · ");
+    for (const [label, href] of [["repo", repo], ["releases", `${repo}/releases`]] as const) {
+      const link = document.createElement("a");
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = label;
+      ribbon.append(link);
+      if (label === "repo") ribbon.append(" · ");
+    }
+    document.body.append(ribbon);
+  } catch {
+    /* no bridge, no ribbon */
+  }
+}
 
 window.__agentMachi = { log: getLog };
 

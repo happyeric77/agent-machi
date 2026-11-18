@@ -15,6 +15,7 @@ const GO_PORT = 8802;
 
 const scenarios = {
   default: 45000,
+  demo: 70000,
   flip: 15000,
   blocked2: 33000,
   roster: 38000,

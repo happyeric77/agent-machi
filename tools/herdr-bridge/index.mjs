@@ -529,18 +529,27 @@ function startFake() {
   }
 
   if (FAKE_SCENARIO === "demo") {
-    // Recording prop: three named agents (Amber, Teal, Moss) follow the
-    // timeline in the delivery notes. Not ported to the Go binary.
+    // Public demo: three named agents (Amber, Teal, Moss) replay the same
+    // 66s story forever so a visitor arriving at any moment sees it moving.
     const amber = makeAgent("fake:p1", null);
     const teal = makeAgent("fake:p2", null, "/tmp/runwarden");
     const moss = makeAgent("fake:p3", null, "/tmp");
-    at(1500, amber, "working"); // Amber -> P4 office
-    at(12000, teal, "working"); // Teal -> P2 office
-    at(21000, amber, "blocked"); // Amber -> station S
-    at(33000, amber, "working"); // Amber -> P4 office
-    at(39000, teal, "done"); // Teal stays in P2, done badge
-    at(47000, teal, "idle"); // Teal -> east beach
-    at(54000, moss, "working"); // Moss -> P1 office
+    const cycle = () => {
+      setFakeStatus(amber, "idle");
+      setFakeStatus(teal, "idle");
+      setFakeStatus(moss, "idle");
+      // Amber needs the 3s debounce plus her doorstep walk to leave the
+      // office, so a visitor sees the story restart on screen.
+      at(8000, amber, "working"); // Amber -> P4 office
+      at(12000, teal, "working"); // Teal -> P2 office
+      at(21000, amber, "blocked"); // Amber -> station S
+      at(33000, amber, "working"); // Amber -> P4 office
+      at(39000, teal, "done"); // Teal stays in P2, done badge
+      at(47000, teal, "idle"); // Teal -> east beach
+      at(54000, moss, "working"); // Moss -> P1 office
+      setTimeout(cycle, 66000);
+    };
+    setTimeout(cycle, 1500);
     return;
   }
 
