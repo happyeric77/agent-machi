@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -78,6 +79,10 @@ func (b *Bridge) appendEventLog(event Event) {
 		return
 	}
 	line := append(data, '\n')
+	if int64(len(line)) > eventsLogMaxBytes {
+		fmt.Println("[bridge] events.jsonl: event larger than the cap, dropping it")
+		return
+	}
 	if err := b.makeRoomInEventLog(int64(len(line))); err != nil {
 		fmt.Printf("[bridge] events.jsonl rotation failed, dropping event: %v\n", err)
 		return
@@ -98,32 +103,41 @@ func (b *Bridge) appendEventLog(event Event) {
 const eventsLogMaxBytes = 1 << 20
 
 // makeRoomInEventLog guarantees the pending line still fits the cap: it keeps
-// the newest whole rows within half the cap, so the next appends have slack.
-// Every caller holds b.mu, so the rewrite cannot race another append. A failed
-// rotation is returned to the caller, which then drops the event instead of
-// appending past the cap.
+// the newest whole rows within both half the cap and the room left after the
+// pending line. Every caller holds b.mu, so the rewrite cannot race another
+// append. A failed rotation is returned to the caller, which then drops the
+// event instead of appending past the cap.
 func (b *Bridge) makeRoomInEventLog(pending int64) error {
 	info, err := os.Stat(b.cfg.EventsLog)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	size := int64(0)
+	if err == nil {
+		size = info.Size()
+	}
+	if size+pending <= eventsLogMaxBytes {
+		return nil
+	}
+	data, err := os.ReadFile(b.cfg.EventsLog)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	if info.Size()+pending <= eventsLogMaxBytes {
-		return nil
-	}
-	if pending >= eventsLogMaxBytes {
-		// A single event larger than the cap can only be stored alone.
-		return os.WriteFile(b.cfg.EventsLog, nil, 0o644)
-	}
-	data, err := os.ReadFile(b.cfg.EventsLog)
-	if err != nil {
-		return err
+	// A row is only whole when a newline closes it; a truncated tail is dropped.
+	if end := bytes.LastIndexByte(data, '\n'); end >= 0 {
+		data = data[:end]
+	} else {
+		data = nil
 	}
 	budget := int64(eventsLogMaxBytes / 2)
-	if pending > budget {
-		budget = pending
+	if room := int64(eventsLogMaxBytes) - pending; room < budget {
+		budget = room
+	}
+	if budget < 0 {
+		budget = 0
 	}
 	payload := strings.Join(newestLinesWithin(splitLines(string(data)), budget), "\n")
 	if payload != "" {
@@ -140,14 +154,13 @@ func (b *Bridge) makeRoomInEventLog(pending int64) error {
 	return nil
 }
 
-// newestLinesWithin keeps the newest whole lines that fit budget bytes,
-// always at least the last one.
+// newestLinesWithin keeps the newest whole lines that fit budget bytes.
 func newestLinesWithin(lines []string, budget int64) []string {
 	start := len(lines)
 	total := int64(0)
 	for start > 0 {
 		size := int64(len(lines[start-1]) + 1)
-		if total+size > budget && start < len(lines) {
+		if total+size > budget {
 			break
 		}
 		total += size

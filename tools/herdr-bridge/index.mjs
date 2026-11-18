@@ -530,7 +530,7 @@ function startFake() {
 
   if (FAKE_SCENARIO === "demo") {
     // Public demo: three named agents (Amber, Teal, Moss) replay the same
-    // 62s story forever so a visitor arriving at any moment sees it moving.
+    // 66s story forever so a visitor arriving at any moment sees it moving.
     const amber = makeAgent("fake:p1", null);
     const teal = makeAgent("fake:p2", null, "/tmp/runwarden");
     const moss = makeAgent("fake:p3", null, "/tmp");
