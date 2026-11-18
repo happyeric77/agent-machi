@@ -85,14 +85,16 @@ func (b *Bridge) StartFake() {
 			setFakeStatus(amber, StatusIdle)
 			setFakeStatus(teal, StatusIdle)
 			setFakeStatus(moss, StatusIdle)
-			at(1500*time.Millisecond, amber, StatusWorking)
+			// Amber needs the 3s debounce plus her doorstep walk to leave the
+			// office, so a visitor sees the story restart on screen.
+			at(8000*time.Millisecond, amber, StatusWorking)
 			at(12000*time.Millisecond, teal, StatusWorking)
 			at(21000*time.Millisecond, amber, StatusBlocked)
 			at(33000*time.Millisecond, amber, StatusWorking)
 			at(39000*time.Millisecond, teal, StatusDone)
 			at(47000*time.Millisecond, teal, StatusIdle)
 			at(54000*time.Millisecond, moss, StatusWorking)
-			time.AfterFunc(62000*time.Millisecond, cycle)
+			time.AfterFunc(66000*time.Millisecond, cycle)
 		}
 		time.AfterFunc(1500*time.Millisecond, cycle)
 		return

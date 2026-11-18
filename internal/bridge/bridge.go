@@ -77,14 +77,18 @@ func (b *Bridge) appendEventLog(event Event) {
 	if err != nil {
 		return
 	}
-	b.trimEventLog()
+	line := append(data, '\n')
+	if err := b.makeRoomInEventLog(int64(len(line))); err != nil {
+		fmt.Printf("[bridge] events.jsonl rotation failed, dropping event: %v\n", err)
+		return
+	}
 	file, err := os.OpenFile(b.cfg.EventsLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		fmt.Printf("[bridge] cannot append events.jsonl: %v\n", err)
 		return
 	}
 	defer file.Close()
-	if _, err := file.Write(append(data, '\n')); err != nil {
+	if _, err := file.Write(line); err != nil {
 		fmt.Printf("[bridge] cannot append events.jsonl: %v\n", err)
 	}
 }
@@ -93,30 +97,63 @@ func (b *Bridge) appendEventLog(event Event) {
 // forever; ReadLog only caps the response, not the file.
 const eventsLogMaxBytes = 1 << 20
 
-// trimEventLog keeps the newer half of an oversized log. Every caller already
-// holds b.mu, so the rewrite cannot race another append.
-func (b *Bridge) trimEventLog() {
+// makeRoomInEventLog guarantees the pending line still fits the cap: it keeps
+// the newest whole rows within half the cap, so the next appends have slack.
+// Every caller holds b.mu, so the rewrite cannot race another append. A failed
+// rotation is returned to the caller, which then drops the event instead of
+// appending past the cap.
+func (b *Bridge) makeRoomInEventLog(pending int64) error {
 	info, err := os.Stat(b.cfg.EventsLog)
-	if err != nil || info.Size() <= eventsLogMaxBytes {
-		return
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Size()+pending <= eventsLogMaxBytes {
+		return nil
+	}
+	if pending >= eventsLogMaxBytes {
+		// A single event larger than the cap can only be stored alone.
+		return os.WriteFile(b.cfg.EventsLog, nil, 0o644)
 	}
 	data, err := os.ReadFile(b.cfg.EventsLog)
 	if err != nil {
-		return
+		return err
 	}
-	lines := splitLines(string(data))
-	keep := len(lines) / 2
-	if keep < 1 {
-		keep = 1
+	budget := int64(eventsLogMaxBytes / 2)
+	if pending > budget {
+		budget = pending
 	}
-	payload := strings.Join(lines[len(lines)-keep:], "\n") + "\n"
+	payload := strings.Join(newestLinesWithin(splitLines(string(data)), budget), "\n")
+	if payload != "" {
+		payload += "\n"
+	}
 	temp := b.cfg.EventsLog + ".tmp"
 	if err := os.WriteFile(temp, []byte(payload), 0o644); err != nil {
-		return
+		return err
 	}
 	if err := os.Rename(temp, b.cfg.EventsLog); err != nil {
 		_ = os.Remove(temp)
+		return err
 	}
+	return nil
+}
+
+// newestLinesWithin keeps the newest whole lines that fit budget bytes,
+// always at least the last one.
+func newestLinesWithin(lines []string, budget int64) []string {
+	start := len(lines)
+	total := int64(0)
+	for start > 0 {
+		size := int64(len(lines[start-1]) + 1)
+		if total+size > budget && start < len(lines) {
+			break
+		}
+		total += size
+		start--
+	}
+	return lines[start:]
 }
 
 // publishLocked requires b.mu to be held. It mirrors Node publish().

@@ -538,14 +538,16 @@ function startFake() {
       setFakeStatus(amber, "idle");
       setFakeStatus(teal, "idle");
       setFakeStatus(moss, "idle");
-      at(1500, amber, "working"); // Amber -> P4 office
+      // Amber needs the 3s debounce plus her doorstep walk to leave the
+      // office, so a visitor sees the story restart on screen.
+      at(8000, amber, "working"); // Amber -> P4 office
       at(12000, teal, "working"); // Teal -> P2 office
       at(21000, amber, "blocked"); // Amber -> station S
       at(33000, amber, "working"); // Amber -> P4 office
       at(39000, teal, "done"); // Teal stays in P2, done badge
       at(47000, teal, "idle"); // Teal -> east beach
       at(54000, moss, "working"); // Moss -> P1 office
-      setTimeout(cycle, 62000);
+      setTimeout(cycle, 66000);
     };
     setTimeout(cycle, 1500);
     return;

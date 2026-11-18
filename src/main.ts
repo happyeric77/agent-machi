@@ -223,13 +223,20 @@ async function showDemoRibbon(bridgeBase: string): Promise<void> {
     const response = await fetch(`${bridgeBase.replace(/\/+$/, "")}/health`);
     if (!response.ok) return;
     const health = (await response.json()) as { fake?: boolean };
-    if (!health.fake) return;
-    const ribbon = document.createElement("a");
+    if (health?.fake !== true) return;
+    const repo = "https://github.com/happyeric77/agent-machi";
+    const ribbon = document.createElement("div");
     ribbon.className = "demo-ribbon";
-    ribbon.href = "https://github.com/happyeric77/agent-machi";
-    ribbon.target = "_blank";
-    ribbon.rel = "noreferrer";
-    ribbon.textContent = "Live demo · fake agents · happyeric77/agent-machi";
+    ribbon.append("Live demo · fake agents · ");
+    for (const [label, href] of [["repo", repo], ["releases", `${repo}/releases`]] as const) {
+      const link = document.createElement("a");
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = label;
+      ribbon.append(link);
+      if (label === "repo") ribbon.append(" · ");
+    }
     document.body.append(ribbon);
   } catch {
     /* no bridge, no ribbon */

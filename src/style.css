@@ -288,9 +288,13 @@ body {
   transform: translateX(-50%);
 }
 
-.demo-ribbon:hover,
-.demo-ribbon:focus-visible {
-  background: rgba(40, 96, 66, 0.95);
+.demo-ribbon a {
+  color: inherit;
+}
+
+.demo-ribbon a:hover,
+.demo-ribbon a:focus-visible {
+  text-decoration: underline;
 }
 
 body.trailer #bridge-status,
