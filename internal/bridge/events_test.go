@@ -31,15 +31,20 @@ func assertBounded(t *testing.T, logPath string) {
 	if info.Size() > eventsLogMaxBytes {
 		t.Fatalf("events log is %d bytes, want <= %d", info.Size(), eventsLogMaxBytes)
 	}
-	b := New(Config{EventsLog: logPath})
-	rows := b.ReadLog(10)
-	if len(rows) == 0 || !strings.Contains(string(rows[len(rows)-1]), `"pane_id":"new"`) {
-		t.Fatalf("rows = %s, want the appended event last", rows)
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, row := range rows {
-		if !json.Valid(row) {
-			t.Fatalf("row is not whole JSON: %q", row)
+	// Read the raw file: ReadLog skips malformed rows, which would hide a
+	// fragment left behind by rotation.
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	for _, line := range lines {
+		if line == "" || !json.Valid([]byte(line)) {
+			t.Fatalf("on-disk row is not whole JSON: %q", line)
 		}
+	}
+	if !strings.Contains(lines[len(lines)-1], `"pane_id":"new"`) {
+		t.Fatalf("last row = %q, want the appended event", lines[len(lines)-1])
 	}
 }
 
