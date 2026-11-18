@@ -18,6 +18,7 @@ import { Director } from "./director.ts";
 import { createResidents } from "./characters.ts";
 import { LogPanel, RosterPanel } from "./panels.ts";
 import { getLog } from "./log.ts";
+import { TrailerCamera } from "./trailer.ts";
 import "./style.css";
 
 declare global {
@@ -30,6 +31,10 @@ const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Missing #app");
 const statusElement = document.querySelector<HTMLDivElement>("#bridge-status");
 if (!statusElement) throw new Error("Missing #bridge-status");
+
+const params = new URLSearchParams(window.location.search);
+const trailerMode = params.get("trailer") === "1";
+if (trailerMode) document.body.classList.add("trailer");
 
 const BACKGROUND_COLOR = "#16191d";
 const scene = new THREE.Scene();
@@ -167,6 +172,10 @@ controls.minZoom = 0.55;
 controls.maxZoom = 5;
 controls.update();
 
+const trailerCamera = trailerMode
+  ? new TrailerCamera(camera, controls, focus, cameraOffset)
+  : null;
+
 const initialCameraPosition = camera.position.clone();
 const initialTarget = controls.target.clone();
 const resetButton = document.querySelector<HTMLButtonElement>("#reset-view");
@@ -198,10 +207,11 @@ resize();
 const graph = loadGraph();
 const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement, scene);
 const bridgeUrl =
-  new URLSearchParams(window.location.search).get("bridge") ||
-  `http://${location.hostname}:8731`;
-new RosterPanel(director);
-new LogPanel(director, bridgeUrl);
+  params.get("bridge") || `http://${location.hostname}:8731`;
+if (!trailerMode) {
+  new RosterPanel(director);
+  new LogPanel(director, bridgeUrl);
+}
 director.start(bridgeUrl);
 
 window.__agentMachi = { log: getLog };
@@ -210,7 +220,8 @@ const clock = new THREE.Clock();
 function frame(): void {
   const dt = Math.min(clock.getDelta(), 0.1);
   director.update(dt);
-  controls.update();
+  if (trailerCamera?.active) trailerCamera.update(dt);
+  else controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
