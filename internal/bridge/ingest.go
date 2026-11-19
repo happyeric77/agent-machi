@@ -12,14 +12,29 @@ import (
 
 const ingestBodyLimit = 8 << 10
 
+// optString tells an absent field apart from an explicit null: only a plain
+// string is accepted, so "name": null is a validation error, not a silent clear.
+type optString struct {
+	Set   bool
+	Value string
+}
+
+func (o *optString) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return errors.New("null is not allowed here; omit the field or send a string")
+	}
+	o.Set = true
+	return json.Unmarshal(data, &o.Value)
+}
+
 // reportRequest uses pointers so "absent" and "null" stay distinguishable from
 // an explicit empty string, which clears the optional field.
 type reportRequest struct {
-	Source *string `json:"source"`
-	ID     *string `json:"id"`
-	Name   *string `json:"name"`
-	Agent  *string `json:"agent"`
-	Status *string `json:"status"`
+	Source *string   `json:"source"`
+	ID     *string   `json:"id"`
+	Name   optString `json:"name"`
+	Agent  optString `json:"agent"`
+	Status *string   `json:"status"`
 }
 
 // externalAgent tracks the lease for one ingested agent. last_seen is separate
@@ -128,13 +143,21 @@ func validateReport(req reportRequest) (source, id, status string, name, agent *
 	if req.Status == nil || !validReportStatus(*req.Status) {
 		return "", "", "", nil, nil, errors.New("status must be working, blocked, done or idle")
 	}
-	if req.Name != nil && len(*req.Name) > 128 {
+	if req.Name.Set && len(req.Name.Value) > 128 {
 		return "", "", "", nil, nil, errors.New("name is limited to 128 bytes")
 	}
-	if req.Agent != nil && len(*req.Agent) > 128 {
+	if req.Agent.Set && len(req.Agent.Value) > 128 {
 		return "", "", "", nil, nil, errors.New("agent is limited to 128 bytes")
 	}
-	return *req.Source, *req.ID, *req.Status, req.Name, req.Agent, nil
+	if req.Name.Set {
+		value := req.Name.Value
+		name = &value
+	}
+	if req.Agent.Set {
+		value := req.Agent.Value
+		agent = &value
+	}
+	return *req.Source, *req.ID, *req.Status, name, agent, nil
 }
 
 // applyReport upserts an external agent and returns copies of the response

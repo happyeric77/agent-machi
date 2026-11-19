@@ -92,6 +92,8 @@ func TestReportValidatesFields(t *testing.T) {
 		{"colon in id", reportBody("ci", "a:b", "working")},
 		{"invalid json", `{"source":`},
 		{"null status", `{"source":"ci","id":"x","status":null}`},
+		{"null name", `{"source":"ci","id":"x","status":"working","name":null}`},
+		{"null agent", `{"source":"ci","id":"x","status":"working","agent":null}`},
 		{"unknown field", `{"source":"ci","id":"x","status":"working","extra":true}`},
 		{"two objects", reportBody("ci", "x", "working") + reportBody("ci", "y", "working")},
 		{"oversized body", reportBody("ci", "x", "working") + strings.Repeat(" ", 9000)},
@@ -134,6 +136,9 @@ func TestReportHeartbeatStaysSilent(t *testing.T) {
 	body := reportBody("ci", "build", "working")
 	serve(t, b, static, reportRequestFor(http.MethodPost, "/report", body, testIngestToken))
 	first := b.Snapshot()
+	b.mu.Lock()
+	leaseBefore := b.external["ext:ci:build"].lastSeen
+	b.mu.Unlock()
 
 	sse := subscribe(t, b)
 	time.Sleep(5 * time.Millisecond)
@@ -155,8 +160,8 @@ func TestReportHeartbeatStaysSilent(t *testing.T) {
 	b.mu.Lock()
 	lease := b.external["ext:ci:build"].lastSeen
 	b.mu.Unlock()
-	if !lease.After(time.Now().Add(-time.Minute)) {
-		t.Fatalf("heartbeat did not renew the lease: %s", lease)
+	if !lease.After(leaseBefore) {
+		t.Fatalf("heartbeat did not renew the lease: %v -> %v", leaseBefore, lease)
 	}
 }
 
