@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -14,6 +15,12 @@ type Config struct {
 	SocketPath   string
 	EventsLog    string
 	NoOpen       bool
+	// IngestToken enables POST/DELETE /report when non-empty; unset means the
+	// route behaves as if it did not exist.
+	IngestToken string
+	// IngestTTL is how long an external agent may stay silent before it is
+	// removed through the same path as a closed Herdr pane.
+	IngestTTL time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -45,6 +52,12 @@ func ConfigFromEnv() Config {
 	if scenario == "" {
 		scenario = "default"
 	}
+	ingestTTL := 15 * time.Minute
+	if raw := os.Getenv("AGENT_MACHI_INGEST_TTL_SECONDS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			ingestTTL = time.Duration(parsed) * time.Second
+		}
+	}
 	return Config{
 		Host:         host,
 		Port:         port,
@@ -53,5 +66,7 @@ func ConfigFromEnv() Config {
 		SocketPath:   socket,
 		EventsLog:    events,
 		NoOpen:       os.Getenv("AGENT_MACHI_NO_OPEN") == "1",
+		IngestToken:  os.Getenv("AGENT_MACHI_INGEST_TOKEN"),
+		IngestTTL:    ingestTTL,
 	}
 }

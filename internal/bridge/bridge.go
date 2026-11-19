@@ -23,6 +23,8 @@ type Bridge struct {
 	locations  map[string]agentLocation
 	firstSeen  map[string]int
 	seenSeq    int
+	external   map[string]*externalAgent
+	ingestDone chan struct{}
 	sse        map[chan []byte]struct{}
 	subs       map[string]net.Conn
 	requestSeq atomic.Uint64
@@ -39,16 +41,20 @@ func New(cfg Config) *Bridge {
 	if dir := filepath.Dir(cfg.EventsLog); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	return &Bridge{
+	b := &Bridge{
 		cfg:        cfg,
 		home:       home,
 		agents:     map[string]*AgentRow{},
 		locations:  map[string]agentLocation{},
 		firstSeen:  map[string]int{},
+		external:   map[string]*externalAgent{},
+		ingestDone: make(chan struct{}),
 		sse:        map[chan []byte]struct{}{},
 		subs:       map[string]net.Conn{},
 		retryDelay: 500 * time.Millisecond,
 	}
+	go b.expireLoop()
+	return b
 }
 
 func nowIso() string {
@@ -171,8 +177,12 @@ func newestLinesWithin(lines []string, budget int64) []string {
 
 // publishLocked requires b.mu to be held. It mirrors Node publish().
 func (b *Bridge) publishLocked(row *AgentRow) {
+	source := "herdr"
+	if ext, ok := b.external[row.PaneID]; ok {
+		source = ext.source
+	}
 	event := Event{
-		Source:             "herdr",
+		Source:             source,
 		PaneID:             row.PaneID,
 		Name:               row.Name,
 		DisplayName:        row.DisplayName,
@@ -219,6 +229,10 @@ func (b *Bridge) Stop() {
 		return
 	}
 	b.stopping = true
+	if b.ingestDone != nil {
+		close(b.ingestDone)
+		b.ingestDone = nil
+	}
 	if b.reconcileTimer != nil {
 		b.reconcileTimer.Stop()
 		b.reconcileTimer = nil
