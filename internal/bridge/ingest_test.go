@@ -22,6 +22,7 @@ func newIngestBridge(t *testing.T, token string, ttl time.Duration) (*Bridge, fs
 		IngestToken: token,
 		IngestTTL:   ttl,
 	})
+	t.Cleanup(b.Stop)
 	return b, fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("town")}}
 }
 
@@ -42,6 +43,14 @@ func serve(t *testing.T, b *Bridge, static fs.FS, request *http.Request) *httpte
 
 func reportBody(source, id, status string) string {
 	return fmt.Sprintf(`{"source":%q,"id":%q,"status":%q}`, source, id, status)
+}
+
+func subscribe(t *testing.T, b *Bridge) chan []byte {
+	t.Helper()
+	sse := make(chan []byte, 8)
+	b.addSSEClient(sse)
+	t.Cleanup(func() { b.removeSSEClient(sse) })
+	return sse
 }
 
 func TestReportRouteMissingWithoutToken(t *testing.T) {
@@ -82,12 +91,19 @@ func TestReportValidatesFields(t *testing.T) {
 		{"colon in source", reportBody("a:b", "x", "working")},
 		{"colon in id", reportBody("ci", "a:b", "working")},
 		{"invalid json", `{"source":`},
+		{"null status", `{"source":"ci","id":"x","status":null}`},
+		{"unknown field", `{"source":"ci","id":"x","status":"working","extra":true}`},
+		{"two objects", reportBody("ci", "x", "working") + reportBody("ci", "y", "working")},
+		{"oversized body", reportBody("ci", "x", "working") + strings.Repeat(" ", 9000)},
 	}
 	for _, test := range tests {
 		recorder := serve(t, b, static, reportRequestFor(http.MethodPost, "/report", test.body, testIngestToken))
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("%s = %d, want 400", test.name, recorder.Code)
 		}
+	}
+	if rows := b.Snapshot(); len(rows) != 0 {
+		t.Fatalf("rejected reports still created %d rows", len(rows))
 	}
 }
 
@@ -114,11 +130,17 @@ func TestReportIdentityCannotAlias(t *testing.T) {
 }
 
 func TestReportHeartbeatStaysSilent(t *testing.T) {
-	b, static := newIngestBridge(t, testIngestToken, 0)
+	b, static := newIngestBridge(t, testIngestToken, time.Minute)
 	body := reportBody("ci", "build", "working")
 	serve(t, b, static, reportRequestFor(http.MethodPost, "/report", body, testIngestToken))
 	first := b.Snapshot()
-	serve(t, b, static, reportRequestFor(http.MethodPost, "/report", body, testIngestToken))
+
+	sse := subscribe(t, b)
+	time.Sleep(5 * time.Millisecond)
+	recorder := serve(t, b, static, reportRequestFor(http.MethodPost, "/report", body, testIngestToken))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d %s", recorder.Code, recorder.Body.String())
+	}
 	second := b.Snapshot()
 
 	if got := len(b.ReadLog(10)); got != 1 {
@@ -127,8 +149,45 @@ func TestReportHeartbeatStaysSilent(t *testing.T) {
 	if first[0].StatusSince != second[0].StatusSince {
 		t.Fatalf("heartbeat moved status_since from %s to %s", first[0].StatusSince, second[0].StatusSince)
 	}
-	if got := len(b.ReadLog(10)); got != 1 {
-		t.Fatalf("log rows after heartbeat = %d, want 1", got)
+	if len(sse) != 0 {
+		t.Fatalf("heartbeat published %d SSE events, want 0", len(sse))
+	}
+	b.mu.Lock()
+	lease := b.external["ext:ci:build"].lastSeen
+	b.mu.Unlock()
+	if !lease.After(time.Now().Add(-time.Minute)) {
+		t.Fatalf("heartbeat did not renew the lease: %s", lease)
+	}
+}
+
+func TestReportHeartbeatKeepsMetadata(t *testing.T) {
+	b, static := newIngestBridge(t, testIngestToken, time.Minute)
+	serve(t, b, static, reportRequestFor(http.MethodPost, "/report",
+		`{"source":"ci","id":"build","name":"build-runner","agent":"ci","status":"working"}`, testIngestToken))
+	serve(t, b, static, reportRequestFor(http.MethodPost, "/report",
+		`{"source":"ci","id":"build","name":"renamed","agent":"other","status":"working"}`, testIngestToken))
+
+	row := b.Snapshot()[0]
+	if row.DisplayName != "build-runner" {
+		t.Fatalf("heartbeat renamed the resident to %q", row.DisplayName)
+	}
+	if row.Agent == nil || *row.Agent != "ci" {
+		t.Fatalf("heartbeat relabelled the agent: %v", row.Agent)
+	}
+}
+
+func TestReportTransitionReplacesMetadata(t *testing.T) {
+	b, static := newIngestBridge(t, testIngestToken, time.Minute)
+	serve(t, b, static, reportRequestFor(http.MethodPost, "/report",
+		`{"source":"ci","id":"build","name":"build-runner","agent":"ci","status":"working"}`, testIngestToken))
+	serve(t, b, static, reportRequestFor(http.MethodPost, "/report", reportBody("ci", "build", "done"), testIngestToken))
+
+	row := b.Snapshot()[0]
+	if row.AgentStatus != StatusDone || row.StatusSince == "" {
+		t.Fatalf("transition did not apply: %+v", row)
+	}
+	if row.Name != nil || row.Agent != nil {
+		t.Fatalf("transition kept stale metadata: name=%v agent=%v", row.Name, row.Agent)
 	}
 }
 
@@ -137,9 +196,7 @@ func TestDeleteRemovesWithoutEvent(t *testing.T) {
 	body := reportBody("ci", "build", "done")
 	serve(t, b, static, reportRequestFor(http.MethodPost, "/report", body, testIngestToken))
 
-	sse := make(chan []byte, 8)
-	b.addSSEClient(sse)
-	defer b.removeSSEClient(sse)
+	sse := subscribe(t, b)
 
 	recorder := serve(t, b, static, reportRequestFor(http.MethodDelete, "/report?source=ci&id=build", "", testIngestToken))
 	if recorder.Code != http.StatusOK {
@@ -162,6 +219,7 @@ func TestExpiryRemovesWithoutEvent(t *testing.T) {
 	if rows := b.Snapshot(); len(rows) != 1 {
 		t.Fatalf("snapshot has %d rows before expiry, want 1", len(rows))
 	}
+	sse := subscribe(t, b)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && len(b.Snapshot()) == 1 {
@@ -172,6 +230,9 @@ func TestExpiryRemovesWithoutEvent(t *testing.T) {
 	}
 	if got := len(b.ReadLog(10)); got != 1 {
 		t.Fatalf("expiry wrote a log row (%d total), want the report row only", got)
+	}
+	if len(sse) != 0 {
+		t.Fatalf("expiry published %d SSE events, want 0", len(sse))
 	}
 }
 
@@ -193,7 +254,6 @@ func TestServesHTTPWithoutHerdrSocket(t *testing.T) {
 	b, static := newIngestBridge(t, testIngestToken, 0)
 	b.cfg.SocketPath = filepath.Join(t.TempDir(), "missing", "herdr.sock")
 	go b.StartHerdr()
-	defer b.Stop()
 
 	handler := b.Handler(static)
 	deadline := time.Now().Add(3 * time.Second)

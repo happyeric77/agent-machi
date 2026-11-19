@@ -74,7 +74,7 @@ start_bridge "$TTL"
 [[ "$(report POST ci build working wrong-token)" == "401" ]] || fail "wrong token accepted"
 [[ "$(report POST ci build gone)" == "400" ]] || fail "status 'gone' accepted"
 
-curl -sN --max-time 14 "$BASE/events" >"$tmp/sse.txt" &
+curl -sN --max-time 40 "$BASE/events" >"$tmp/sse.txt" &
 sse_pid=$!
 sleep 0.5
 
@@ -94,10 +94,8 @@ assert h["ok"] is True, h
 assert h["agents"] == 2, h
 ' || fail "/health does not count both external agents"
 
-wait "$sse_pid" 2>/dev/null || true
-events="$(grep -c '^data: ' "$tmp/sse.txt" || true)"
-[[ "$events" == "8" ]] || fail "expected 8 SSE events, got $events"
 rows_before="$(log_rows)"
+[[ "$rows_before" -ge 8 ]] || fail "log has $rows_before rows, want at least the 8 transitions"
 
 echo "== heartbeat is silent"
 status_since="$(curl -s "$BASE/snapshot" | python3 -c '
@@ -115,15 +113,45 @@ echo "== delete removes without an event"
 [[ "$(snapshot_status ci build)" == "absent" ]] || fail "deleted agent still in snapshot"
 [[ "$(snapshot_status ci test)" == "idle" ]] || fail "DELETE removed the wrong agent"
 [[ "$(log_rows)" == "$rows_before" ]] || fail "DELETE wrote a log row"
+
+kill "$sse_pid" 2>/dev/null || true
+wait "$sse_pid" 2>/dev/null || true
+python3 - "$tmp/sse.txt" <<'PY' || fail "SSE events do not match the transitions"
+import json, sys
+pairs = []
+for line in open(sys.argv[1]):
+    if not line.startswith("data: "):
+        continue
+    event = json.loads(line[6:])
+    assert event["source"] == "ci", event
+    pairs.append((event["pane_id"], event["status"]))
+want = {(f"ext:ci:{a}", s) for a in ("build", "test") for s in ("working", "blocked", "done", "idle")}
+assert len(pairs) == 8, pairs
+assert set(pairs) == want, pairs
+PY
 cleanup; server_pid=""
 
 echo "== phase 2: expiry on the same path (TTL 2s)"
 start_bridge 2
+curl -sN --max-time 12 "$BASE/events" >"$tmp/sse2.txt" &
+sse2_pid=$!
+sleep 0.4
 report POST ci shortlived working >/dev/null
 [[ "$(snapshot_status ci shortlived)" == "working" ]] || fail "agent missing before expiry"
 log_before_expiry=$(log_rows)
+[[ "$log_before_expiry" -ge 1 ]] || fail "expiry baseline log is empty"
 sleep 3
 [[ "$(snapshot_status ci shortlived)" == "absent" ]] || fail "expired agent still in snapshot"
 [[ "$(log_rows)" == "$log_before_expiry" ]] || fail "expiry wrote a log row"
+kill "$sse2_pid" 2>/dev/null || true
+wait "$sse2_pid" 2>/dev/null || true
+python3 - "$tmp/sse2.txt" <<'PY' || fail "expiry emitted an unexpected SSE event"
+import json, sys
+events = [json.loads(line[6:]) for line in open(sys.argv[1]) if line.startswith("data: ")]
+assert len(events) == 1, events
+assert events[0]["pane_id"] == "ext:ci:shortlived", events
+assert events[0]["status"] == "working", events
+assert events[0]["source"] == "ci", events
+PY
 
 echo "PASS"

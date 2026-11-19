@@ -48,16 +48,18 @@ func main() {
 	fmt.Printf("[bridge] http://%s:%d %s\n", cfg.Host, cfg.Port, mode)
 
 	server := &http.Server{Handler: b.Handler(static)}
-	go func() {
+	serve := func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "agent-machi: server stopped: %v\n", err)
 		}
-	}()
-	// HTTP serves first: with no Herdr socket the reconcile loop retries in the
-	// background and must not delay readiness.
+	}
+	// FAKE seeds the story before the first page load, as it always has. Herdr
+	// starts after HTTP so a missing socket cannot delay readiness.
 	if cfg.Fake {
 		b.StartFake()
+		go serve()
 	} else {
+		go serve()
 		go b.StartHerdr()
 	}
 

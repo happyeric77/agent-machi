@@ -1,8 +1,10 @@
 package bridge
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -10,12 +12,14 @@ import (
 
 const ingestBodyLimit = 8 << 10
 
+// reportRequest uses pointers so "absent" and "null" stay distinguishable from
+// an explicit empty string, which clears the optional field.
 type reportRequest struct {
-	Source string `json:"source"`
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Agent  string `json:"agent"`
-	Status string `json:"status"`
+	Source *string `json:"source"`
+	ID     *string `json:"id"`
+	Name   *string `json:"name"`
+	Agent  *string `json:"agent"`
+	Status *string `json:"status"`
 }
 
 // externalAgent tracks the lease for one ingested agent. last_seen is separate
@@ -53,27 +57,26 @@ func (b *Bridge) serveReport(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Header.Get("Authorization") != "Bearer "+b.cfg.IngestToken {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("unauthorized"))
+		_, _ = w.Write([]byte("unauthorized"))
 		return
 	}
 
 	switch r.Method {
 	case http.MethodPost:
-		body := http.MaxBytesReader(w, r.Body, ingestBodyLimit)
-		var req reportRequest
-		if err := json.NewDecoder(body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid json body")
+		req, err := decodeReport(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		row, changed, err := b.applyReport(req, time.Now())
+		paneID, status, changed, err := b.applyReport(req, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{
 			"ok":      true,
-			"pane_id": row.PaneID,
-			"status":  row.AgentStatus,
+			"pane_id": paneID,
+			"status":  status,
 			"changed": changed,
 		})
 	case http.MethodDelete:
@@ -86,8 +89,27 @@ func (b *Bridge) serveReport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte("method not allowed"))
+		_, _ = w.Write([]byte("method not allowed"))
 	}
+}
+
+// decodeReport reads one complete JSON object within the body cap. Trailing
+// data and unknown fields are rejected so a report is exactly what it claims.
+func decodeReport(w http.ResponseWriter, r *http.Request) (reportRequest, error) {
+	var req reportRequest
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ingestBodyLimit))
+	if err != nil {
+		return req, errors.New("body must be a single JSON object under 8 KiB")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return req, errors.New("invalid json body")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return req, errors.New("body must contain exactly one JSON object")
+	}
+	return req, nil
 }
 
 func writeError(w http.ResponseWriter, code int, message string) {
@@ -96,23 +118,34 @@ func writeError(w http.ResponseWriter, code int, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
-// applyReport upserts an external agent. A changed status publishes an event;
-// an unchanged status is only a heartbeat and stays silent.
-func (b *Bridge) applyReport(req reportRequest, now time.Time) (*AgentRow, bool, error) {
-	if !validExternalPart(req.Source) {
-		return nil, false, errors.New("source must be non-empty and must not contain ':'")
+func validateReport(req reportRequest) (source, id, status string, name, agent *string, err error) {
+	if req.Source == nil || !validExternalPart(*req.Source) {
+		return "", "", "", nil, nil, errors.New("source must be non-empty and must not contain ':'")
 	}
-	if !validExternalPart(req.ID) {
-		return nil, false, errors.New("id must be non-empty and must not contain ':'")
+	if req.ID == nil || !validExternalPart(*req.ID) {
+		return "", "", "", nil, nil, errors.New("id must be non-empty and must not contain ':'")
 	}
-	if !validReportStatus(req.Status) {
-		return nil, false, errors.New("status must be working, blocked, done or idle")
+	if req.Status == nil || !validReportStatus(*req.Status) {
+		return "", "", "", nil, nil, errors.New("status must be working, blocked, done or idle")
 	}
-	if len(req.Name) > 128 || len(req.Agent) > 128 {
-		return nil, false, errors.New("name and agent are limited to 128 bytes")
+	if req.Name != nil && len(*req.Name) > 128 {
+		return "", "", "", nil, nil, errors.New("name is limited to 128 bytes")
 	}
+	if req.Agent != nil && len(*req.Agent) > 128 {
+		return "", "", "", nil, nil, errors.New("agent is limited to 128 bytes")
+	}
+	return *req.Source, *req.ID, *req.Status, req.Name, req.Agent, nil
+}
 
-	paneID := externalPaneID(req.Source, req.ID)
+// applyReport upserts an external agent and returns copies of the response
+// fields taken under the lock. A changed status publishes an event and replaces
+// the optional fields; an unchanged status renews only the lease.
+func (b *Bridge) applyReport(req reportRequest, now time.Time) (paneID, status string, changed bool, err error) {
+	source, id, want, name, agent, err := validateReport(req)
+	if err != nil {
+		return "", "", false, err
+	}
+	paneID = externalPaneID(source, id)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -120,52 +153,34 @@ func (b *Bridge) applyReport(req reportRequest, now time.Time) (*AgentRow, bool,
 	ext, exists := b.external[paneID]
 	row := b.agents[paneID]
 	if !exists || row == nil {
-		if req.Name == "" && req.Agent == "" {
-			// Keep the display-name fallback chain intact.
-		}
 		row = &AgentRow{
-			PaneID:        paneID,
-			AgentStatus:   AgentStatus(req.Status),
-			StatusSince:   nowIso(),
-			LastChangeSeq: 0,
+			PaneID:      paneID,
+			Name:        name,
+			Agent:       agent,
+			AgentStatus: AgentStatus(want),
+			StatusSince: nowIso(),
 		}
-		if req.Name != "" {
-			name := req.Name
-			row.Name = &name
-		}
-		if req.Agent != "" {
-			agent := req.Agent
-			row.Agent = &agent
-		}
-		b.external[paneID] = &externalAgent{source: req.Source, lastSeen: now}
+		b.external[paneID] = &externalAgent{source: source, lastSeen: now}
 		b.markSeenLocked(paneID)
 		b.agents[paneID] = row
 		b.addOrderLocked(paneID)
 		b.refreshDisplayNamesLocked()
 		b.publishLocked(row)
-		return row, true, nil
+		return paneID, want, true, nil
 	}
 
-	if req.Name != "" {
-		name := req.Name
-		row.Name = &name
-	}
-	if req.Agent != "" {
-		agent := req.Agent
-		row.Agent = &agent
-	}
 	ext.lastSeen = now
+	if row.AgentStatus == AgentStatus(want) {
+		return paneID, want, false, nil
+	}
 
-	changed := row.AgentStatus != AgentStatus(req.Status)
-	if changed {
-		row.AgentStatus = AgentStatus(req.Status)
-		row.StatusSince = nowIso()
-	}
+	row.AgentStatus = AgentStatus(want)
+	row.StatusSince = nowIso()
+	row.Name = name
+	row.Agent = agent
 	b.refreshDisplayNamesLocked()
-	if changed {
-		b.publishLocked(row)
-	}
-	return row, changed, nil
+	b.publishLocked(row)
+	return paneID, want, true, nil
 }
 
 // removeExternal mirrors a closed Herdr pane: the row disappears from the next

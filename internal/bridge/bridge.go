@@ -53,7 +53,9 @@ func New(cfg Config) *Bridge {
 		subs:       map[string]net.Conn{},
 		retryDelay: 500 * time.Millisecond,
 	}
-	go b.expireLoop()
+	if cfg.IngestToken != "" {
+		go b.expireLoop()
+	}
 	return b
 }
 
@@ -231,7 +233,6 @@ func (b *Bridge) Stop() {
 	b.stopping = true
 	if b.ingestDone != nil {
 		close(b.ingestDone)
-		b.ingestDone = nil
 	}
 	if b.reconcileTimer != nil {
 		b.reconcileTimer.Stop()
