@@ -13,6 +13,12 @@ BIN="${E2E_BIN:-./agent-machi}"
 tmp="$(mktemp -d)"
 server_pid=""
 
+# A leftover bridge would silently receive every report in this run.
+if command -v lsof >/dev/null && lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "FAIL: something already listens on $PORT; pick a free port with E2E_PORT" >&2
+  exit 1
+fi
+
 cleanup() {
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
@@ -41,15 +47,19 @@ start_bridge() { # ttl
   fail "bridge did not become ready"
 }
 
+cli() { # token args... -> exit code, stderr kept in $tmp/cli.err
+  local token="$1"
+  shift
+  AGENT_MACHI_INGEST_TOKEN="$token" "$BIN" report --url "$BASE" "$@" \
+    >/dev/null 2>"$tmp/cli.err" && echo 0 || echo $?
+}
+
 report() { # method source id [status] [token]
   local method="$1" source="$2" id="$3" status="${4:-}" token="${5:-$TOKEN}"
   if [[ "$method" == "POST" ]]; then
-    curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-      -d "{\"source\":\"$source\",\"id\":\"$id\",\"name\":\"$id\",\"agent\":\"e2e\",\"status\":\"$status\"}"
+    cli "$token" --source "$source" --id "$id" --name "$id" --agent e2e --status "$status"
   else
-    curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-      "$BASE/report?source=$source&id=$id" -H "Authorization: Bearer $token"
+    cli "$token" --source "$source" --id "$id" --remove
   fi
 }
 
@@ -81,10 +91,10 @@ wait_for_events() { # file count
 echo "== phase 1: two external agents through all four statuses (TTL ${TTL}s)"
 start_bridge "$TTL"
 
-[[ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/report")" == "401" ]] \
-  || fail "GET /report without a token should be 401: the route exists"
-[[ "$(report POST ci build working wrong-token)" == "401" ]] || fail "wrong token accepted"
-[[ "$(report POST ci build gone)" == "400" ]] || fail "status 'gone' accepted"
+[[ "$(report POST ci build working wrong-token)" == "1" ]] || fail "wrong token accepted"
+grep -q "rejected the token" "$tmp/cli.err" || fail "wrong token message: $(cat "$tmp/cli.err")"
+[[ "$(report POST ci build gone)" == "2" ]] || fail "status 'gone' accepted"
+grep -q "must be working, blocked, done or idle" "$tmp/cli.err" || fail "bad status message: $(cat "$tmp/cli.err")"
 
 curl -sN --max-time 40 "$BASE/events" >"$tmp/sse.txt" &
 sse_pid=$!
@@ -93,7 +103,7 @@ sleep 0.5
 for agent_id in build test; do
   for status in working blocked done idle; do
     code="$(report POST ci "$agent_id" "$status")"
-    [[ "$code" == "200" ]] || fail "POST $agent_id $status -> $code"
+    [[ "$code" == "0" ]] || fail "POST $agent_id $status -> exit $code: $(cat "$tmp/cli.err")"
     got="$(snapshot_status ci "$agent_id")"
     [[ "$got" == "$status" ]] || fail "snapshot $agent_id = $got, want $status"
   done
@@ -127,7 +137,7 @@ report POST ci test working >/dev/null
 wait_for_events "$tmp/sse.txt" 9
 
 echo "== delete removes without an event"
-[[ "$(report DELETE ci build)" == "200" ]] || fail "DELETE failed"
+[[ "$(report DELETE ci build)" == "0" ]] || fail "DELETE failed: $(cat "$tmp/cli.err")"
 [[ "$(snapshot_status ci build)" == "absent" ]] || fail "deleted agent still in snapshot"
 [[ "$(snapshot_status ci test)" == "working" ]] || fail "DELETE removed the wrong agent"
 [[ "$(log_rows)" == "$((rows_before + 1))" ]] || fail "DELETE wrote a log row"
@@ -183,6 +193,7 @@ cleanup
 
 if [[ "${E2E_SCREENSHOT:-0}" == "1" ]]; then
   echo "== screenshot: two external residents at their offices"
+  rm -f "$tmp/events.jsonl"
   start_bridge "$TTL"
   report POST ci build working >/dev/null
   report POST ci test working >/dev/null
@@ -191,6 +202,31 @@ if [[ "${E2E_SCREENSHOT:-0}" == "1" ]]; then
   node "$(dirname "$0")/e2e-ingest-screenshot.mjs" \
     "http://127.0.0.1:${PORT}/" "${E2E_SCREENSHOT_PATH:-$tmp/ingest-town.png}" || fail "screenshot capture failed"
   echo "screenshot: ${E2E_SCREENSHOT_PATH:-$tmp/ingest-town.png}"
+  cleanup
 fi
 
+echo "== phase 3: unreadable bridge states exit non-zero with a hint"
+HOST=127.0.0.1 PORT="$PORT" \
+  HERDR_SOCKET_PATH="$tmp/no-such-herdr.sock" \
+  AGENT_MACHI_EVENTS_LOG="$tmp/disabled.jsonl" \
+  AGENT_MACHI_NO_OPEN=1 \
+  "$BIN" >"$tmp/disabled.log" 2>&1 &
+server_pid=$!
+ready=0
+for _ in $(seq 1 60); do
+  if curl -sf "$BASE/health" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.1
+done
+[[ "$ready" == "1" ]] || fail "bridge without ingest did not start"
+code="$(cli "$TOKEN" --source ci --id build --status working)"
+[[ "$code" == "1" ]] || fail "ingest disabled exit $code"
+grep -q "ingest is disabled" "$tmp/cli.err" || fail "disabled message: $(cat "$tmp/cli.err")"
+cleanup
+
+code="$(cli "$TOKEN" --source ci --id build --status working)"
+[[ "$code" == "1" ]] || fail "bridge down exit $code"
+grep -q "cannot reach bridge" "$tmp/cli.err" || fail "unreachable message: $(cat "$tmp/cli.err")"
+
+# Client mode must not be able to bind the bridge port: every call above ran
+# while the bridge already owned $PORT, so a stray listener would have failed.
 echo "PASS"
