@@ -124,7 +124,7 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 	fs.StringVar(&opts.id, "id", "", "agent id inside the source (required)")
 	fs.StringVar(&opts.status, "status", "", "working, blocked, done or idle")
 	fs.StringVar(&opts.source, "source", opts.source, "source name; two sources may reuse an id")
-	fs.StringVar(&opts.name, "name", "", "optional name shown on the sign")
+	fs.StringVar(&opts.name, "name", "", "optional display name in the roster")
 	fs.StringVar(&opts.agent, "agent", "", "optional agent label")
 	fs.BoolVar(&opts.remove, "remove", false, "remove the agent instead of reporting a status")
 	if err := fs.Parse(args); err != nil {
