@@ -178,21 +178,21 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 // parseBridgeURL accepts an absolute http(s) base with no query or fragment,
 // so "/report" can be appended without guessing.
 func parseBridgeURL(raw string) (*url.URL, error) {
+	// None of these errors quote the value: a typo must not paste the URL (and
+	// any credentials in it) into shell history or CI logs. url.Parse itself
+	// quotes the whole input, so its error is intentionally not wrapped.
 	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
-		return nil, fmt.Errorf("bridge URL %q must be absolute http(s)", raw)
+		return nil, errors.New("bridge URL must be an absolute http(s) URL")
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("invalid bridge URL %q: %w", raw, err)
-	}
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("bridge URL %q must be absolute http(s)", raw)
+	if err != nil || parsed.Host == "" {
+		return nil, errors.New("bridge URL is invalid: check scheme, host and port")
 	}
 	if parsed.User != nil {
 		return nil, errors.New("bridge URL must not contain credentials")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
-		return nil, fmt.Errorf("bridge URL %q must not carry a query or fragment", raw)
+		return nil, errors.New("bridge URL must not carry a query or fragment")
 	}
 	return parsed, nil
 }

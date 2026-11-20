@@ -86,7 +86,7 @@ func TestParseReportArgs(t *testing.T) {
 		{
 			name:    "bridge url without scheme",
 			args:    []string{"--id", "build", "--status", "idle", "--url", "127.0.0.1:8731"},
-			wantErr: "must be absolute http(s)",
+			wantErr: "absolute http(s)",
 		},
 		{name: "missing id", args: []string{"--status", "idle"}, wantErr: "--id is required"},
 		{name: "missing status", args: []string{"--id", "build"}, wantErr: "--status is required"},
@@ -297,6 +297,17 @@ func TestRunReport(t *testing.T) {
 			if code == 0 || !strings.Contains(stderr.String(), "unexpected response") {
 				t.Errorf("%s: exit = %d, stderr = %q", tc.name, code, stderr.String())
 			}
+		}
+	})
+
+	t.Run("credentials never reach stderr", func(t *testing.T) {
+		var stderr bytes.Buffer
+		code := runReport([]string{"--url", "http://user:secret@127.0.0.1:notaport", "--id", "build", "--status", "idle"}, io.Discard, &stderr)
+		if code == 0 {
+			t.Errorf("expected non-zero exit")
+		}
+		if strings.Contains(stderr.String(), "secret") {
+			t.Errorf("stderr leaked the credential: %q", stderr.String())
 		}
 	})
 
