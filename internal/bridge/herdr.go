@@ -381,8 +381,10 @@ func (b *Bridge) syncAgents(snapshotAgents []snapshotAgent) {
 		}
 	}
 
+	// Reconcile only owns Herdr rows: external agents are pruned by DELETE or
+	// their lease, never because Herdr does not know them.
 	for _, paneID := range append([]string{}, b.order...) {
-		if !seen[paneID] {
+		if !seen[paneID] && b.external[paneID] == nil {
 			b.removeAgentRowLocked(paneID)
 		}
 	}
