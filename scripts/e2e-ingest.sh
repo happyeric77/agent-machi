@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Slice-1 E2E: the real binary, no Herdr socket, two external agents driven
-# over raw HTTP through every status, then DELETE and TTL expiry. Asserts on
-# /snapshot, /events, /log and /health. Set E2E_SCREENSHOT=1 to also capture
-# the two residents at their offices.
+# Ingest E2E: the real binary, no Herdr socket, two external agents driven by
+# `agent-machi report` through every status, then --remove and TTL expiry.
+# Asserts on /snapshot, /events, /log and /health, plus the CLI's error exits.
+# Set E2E_SCREENSHOT=1 to also capture the two residents at their offices.
 set -euo pipefail
 
 PORT="${E2E_PORT:-8899}"
@@ -12,6 +12,12 @@ TTL="${E2E_TTL_SECONDS:-30}"
 BIN="${E2E_BIN:-./agent-machi}"
 tmp="$(mktemp -d)"
 server_pid=""
+
+# A leftover bridge would silently receive every report in this run.
+if command -v lsof >/dev/null && lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "FAIL: something already listens on $PORT; pick a free port with E2E_PORT" >&2
+  exit 1
+fi
 
 cleanup() {
   if [[ -n "$server_pid" ]]; then
@@ -41,16 +47,24 @@ start_bridge() { # ttl
   fail "bridge did not become ready"
 }
 
+cli() { # token args... -> exit status, stderr kept in $tmp/cli.err
+  local token="$1"
+  shift
+  AGENT_MACHI_INGEST_TOKEN="$token" "$BIN" report --url "$BASE" "$@" \
+    >/dev/null 2>"$tmp/cli.err"
+}
+
 report() { # method source id [status] [token]
   local method="$1" source="$2" id="$3" status="${4:-}" token="${5:-$TOKEN}"
   if [[ "$method" == "POST" ]]; then
-    curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/report" \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-      -d "{\"source\":\"$source\",\"id\":\"$id\",\"name\":\"$id\",\"agent\":\"e2e\",\"status\":\"$status\"}"
+    cli "$token" --source "$source" --id "$id" --name "$id" --agent e2e --status "$status"
   else
-    curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-      "$BASE/report?source=$source&id=$id" -H "Authorization: Bearer $token"
+    cli "$token" --source "$source" --id "$id" --remove
   fi
+}
+
+must_report() { # method source id [status] [token]
+  report "$@" || fail "report $* failed (exit $?): $(cat "$tmp/cli.err")"
 }
 
 snapshot_status() { # source id -> status or absent
@@ -81,10 +95,16 @@ wait_for_events() { # file count
 echo "== phase 1: two external agents through all four statuses (TTL ${TTL}s)"
 start_bridge "$TTL"
 
-[[ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/report")" == "401" ]] \
-  || fail "GET /report without a token should be 401: the route exists"
-[[ "$(report POST ci build working wrong-token)" == "401" ]] || fail "wrong token accepted"
-[[ "$(report POST ci build gone)" == "400" ]] || fail "status 'gone' accepted"
+if report POST ci build working wrong-token; then fail "wrong token accepted"; fi
+grep -q "rejected the token" "$tmp/cli.err" || fail "wrong token message: $(cat "$tmp/cli.err")"
+if cli "" --source ci --id build --status working; then fail "missing token accepted"; fi
+grep -q "rejected the token" "$tmp/cli.err" || fail "missing token message: $(cat "$tmp/cli.err")"
+if report POST ci build gone; then fail "status 'gone' accepted"; fi
+grep -q "must be working, blocked, done or idle" "$tmp/cli.err" || fail "bad status message: $(cat "$tmp/cli.err")"
+# A valid status with an over-long name reaches the bridge and must surface its 400.
+long_name="$(python3 -c 'print("n" * 129)')"
+if cli "$TOKEN" --source ci --id build --status working --name "$long_name"; then fail "129-byte name accepted"; fi
+grep -q "limited to 128 bytes" "$tmp/cli.err" || fail "bridge 400 message: $(cat "$tmp/cli.err")"
 
 curl -sN --max-time 40 "$BASE/events" >"$tmp/sse.txt" &
 sse_pid=$!
@@ -92,8 +112,7 @@ sleep 0.5
 
 for agent_id in build test; do
   for status in working blocked done idle; do
-    code="$(report POST ci "$agent_id" "$status")"
-    [[ "$code" == "200" ]] || fail "POST $agent_id $status -> $code"
+    must_report POST ci "$agent_id" "$status"
     got="$(snapshot_status ci "$agent_id")"
     [[ "$got" == "$status" ]] || fail "snapshot $agent_id = $got, want $status"
   done
@@ -115,7 +134,7 @@ echo "== heartbeat is silent"
 status_since="$(curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
 print(next(r["status_since"] for r in json.load(sys.stdin) if r["pane_id"]=="ext:ci:build"))')"
-report POST ci build idle >/dev/null
+must_report POST ci build idle
 after_since="$(curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
 print(next(r["status_since"] for r in json.load(sys.stdin) if r["pane_id"]=="ext:ci:build"))')"
@@ -123,16 +142,16 @@ print(next(r["status_since"] for r in json.load(sys.stdin) if r["pane_id"]=="ext
 [[ "$(log_rows)" == "$rows_before" ]] || fail "heartbeat wrote a log row"
 # A real transition after the heartbeat proves the stream was consumed up to
 # this point, so "no heartbeat event" is an absence, not a late read.
-report POST ci test working >/dev/null
+must_report POST ci test working
 wait_for_events "$tmp/sse.txt" 9
 
 echo "== delete removes without an event"
-[[ "$(report DELETE ci build)" == "200" ]] || fail "DELETE failed"
+must_report DELETE ci build
 [[ "$(snapshot_status ci build)" == "absent" ]] || fail "deleted agent still in snapshot"
 [[ "$(snapshot_status ci test)" == "working" ]] || fail "DELETE removed the wrong agent"
 [[ "$(log_rows)" == "$((rows_before + 1))" ]] || fail "DELETE wrote a log row"
 # Sentinel transition after the DELETE, same reasoning as the heartbeat.
-report POST ci test idle >/dev/null
+must_report POST ci test idle
 wait_for_events "$tmp/sse.txt" 10
 
 kill "$sse_pid" 2>/dev/null || true
@@ -161,13 +180,13 @@ start_bridge 2
 curl -sN --max-time 12 "$BASE/events" >"$tmp/sse2.txt" &
 sse_pid=$!
 sleep 0.4
-report POST ci shortlived working >/dev/null
+must_report POST ci shortlived working
 [[ "$(snapshot_status ci shortlived)" == "working" ]] || fail "agent missing before expiry"
 wait_for_events "$tmp/sse2.txt" 1
 [[ "$(log_rows)" == "1" ]] || fail "create event missing from a fresh Log"
 sleep 3
 [[ "$(snapshot_status ci shortlived)" == "absent" ]] || fail "expired agent still in snapshot"
-report POST ci sentinel working >/dev/null
+must_report POST ci sentinel working
 wait_for_events "$tmp/sse2.txt" 2
 [[ "$(log_rows)" == "2" ]] || fail "expiry wrote a log row"
 kill "$sse_pid" 2>/dev/null || true
@@ -183,14 +202,39 @@ cleanup
 
 if [[ "${E2E_SCREENSHOT:-0}" == "1" ]]; then
   echo "== screenshot: two external residents at their offices"
+  rm -f "$tmp/events.jsonl"
   start_bridge "$TTL"
-  report POST ci build working >/dev/null
-  report POST ci test working >/dev/null
+  must_report POST ci build working
+  must_report POST ci test working
   [[ "$(snapshot_status ci build)" == "working" ]] || fail "build missing before capture"
   [[ "$(snapshot_status ci test)" == "working" ]] || fail "test missing before capture"
   node "$(dirname "$0")/e2e-ingest-screenshot.mjs" \
     "http://127.0.0.1:${PORT}/" "${E2E_SCREENSHOT_PATH:-$tmp/ingest-town.png}" || fail "screenshot capture failed"
   echo "screenshot: ${E2E_SCREENSHOT_PATH:-$tmp/ingest-town.png}"
+  cleanup
 fi
 
+echo "== phase 3: unreadable bridge states exit non-zero with a hint"
+HOST=127.0.0.1 PORT="$PORT" \
+  AGENT_MACHI_INGEST_TOKEN= \
+  HERDR_SOCKET_PATH="$tmp/no-such-herdr.sock" \
+  AGENT_MACHI_EVENTS_LOG="$tmp/disabled.jsonl" \
+  AGENT_MACHI_NO_OPEN=1 \
+  "$BIN" >"$tmp/disabled.log" 2>&1 &
+server_pid=$!
+ready=0
+for _ in $(seq 1 60); do
+  if curl -sf "$BASE/health" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.1
+done
+[[ "$ready" == "1" ]] || fail "bridge without ingest did not start"
+if cli "$TOKEN" --source ci --id build --status working; then fail "ingest disabled accepted the report"; fi
+grep -q "ingest is disabled" "$tmp/cli.err" || fail "disabled message: $(cat "$tmp/cli.err")"
+cleanup
+
+if cli "$TOKEN" --source ci --id build --status working; then fail "report succeeded with the bridge down"; fi
+grep -q "cannot reach bridge" "$tmp/cli.err" || fail "unreachable message: $(cat "$tmp/cli.err")"
+
+# Client mode must not be able to bind the bridge port: every call above ran
+# while the bridge already owned $PORT, so a stray listener would have failed.
 echo "PASS"

@@ -19,6 +19,12 @@ import (
 )
 
 func main() {
+	// Client mode dispatches before anything bridge-shaped exists: no embedded
+	// assets, no listener, no Herdr, no events log.
+	if len(os.Args) > 1 && os.Args[1] == "report" {
+		os.Exit(runReport(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	noOpen := flag.Bool("no-open", false, "do not open the browser")
 	flag.Parse()
 
