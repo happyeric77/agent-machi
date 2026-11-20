@@ -61,7 +61,14 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	client := &http.Client{Timeout: reportTimeout}
+	// A redirect is never the report: following one can turn POST into GET and
+	// return 200 from something that is not the bridge.
+	client := &http.Client{
+		Timeout: reportTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		fmt.Fprintf(stderr, "agent-machi report: cannot reach bridge at %s: %v\n", opts.bridgeURL, err)
@@ -75,17 +82,20 @@ func runReport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// The bridge answers every successful write with {"ok": true}; anything
+	// else on a 200 is some other page and must not look like success.
 	var result struct {
+		OK      bool   `json:"ok"`
 		PaneID  string `json:"pane_id"`
 		Status  string `json:"status"`
 		Changed bool   `json:"changed"`
 	}
+	if err := json.Unmarshal(body, &result); err != nil || !result.OK {
+		fmt.Fprintf(stderr, "agent-machi report: bridge %s returned an unexpected response\n", opts.bridgeURL)
+		return 1
+	}
 	if opts.remove {
 		fmt.Fprintf(stdout, "ok removed %s\n", opts.id)
-		return 0
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		fmt.Fprintf(stdout, "ok\n")
 		return 0
 	}
 	change := "unchanged"
@@ -139,8 +149,8 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 	if opts.source == "" || strings.Contains(opts.source, ":") || strings.Contains(opts.id, ":") {
 		return nil, errors.New("--source and --id must not be empty or contain ':'")
 	}
-	if _, err := url.Parse(opts.bridgeURL); err != nil {
-		return nil, fmt.Errorf("invalid bridge URL %q: %w", opts.bridgeURL, err)
+	if _, err := parseBridgeURL(opts.bridgeURL); err != nil {
+		return nil, err
 	}
 	if opts.remove {
 		if opts.status != "" {
@@ -157,11 +167,34 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 	return opts, nil
 }
 
+// parseBridgeURL accepts an absolute http(s) base with no query or fragment,
+// so "/report" can be appended without guessing.
+func parseBridgeURL(raw string) (*url.URL, error) {
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return nil, fmt.Errorf("bridge URL %q must be absolute http(s)", raw)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bridge URL %q: %w", raw, err)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("bridge URL %q must be absolute http(s)", raw)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return nil, fmt.Errorf("bridge URL %q must not carry a query or fragment", raw)
+	}
+	return parsed, nil
+}
+
 func buildReportRequest(opts *reportOptions) (*http.Request, error) {
-	base := strings.TrimSuffix(opts.bridgeURL, "/")
+	base, err := parseBridgeURL(opts.bridgeURL)
+	if err != nil {
+		return nil, err
+	}
+	base.Path = strings.TrimSuffix(base.Path, "/") + "/report"
 	if opts.remove {
-		query := url.Values{"source": {opts.source}, "id": {opts.id}}
-		request, err := http.NewRequest(http.MethodDelete, base+"/report?"+query.Encode(), nil)
+		base.RawQuery = url.Values{"source": {opts.source}, "id": {opts.id}}.Encode()
+		request, err := http.NewRequest(http.MethodDelete, base.String(), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +217,7 @@ func buildReportRequest(opts *reportOptions) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequest(http.MethodPost, base+"/report", bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, base.String(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

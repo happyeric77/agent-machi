@@ -26,7 +26,7 @@ func TestParseReportArgs(t *testing.T) {
 			name: "defaults",
 			args: []string{"--id", "build", "--status", "working"},
 			check: func(t *testing.T, opts *reportOptions) {
-				if opts.bridgeURL != defaultBridgeURL {
+				if opts.bridgeURL != "http://127.0.0.1:8731" {
 					t.Errorf("bridgeURL = %q", opts.bridgeURL)
 				}
 				if opts.source != defaultSource {
@@ -72,6 +72,16 @@ func TestParseReportArgs(t *testing.T) {
 					t.Error("remove not set")
 				}
 			},
+		},
+		{
+			name:    "bridge url with query",
+			args:    []string{"--id", "build", "--status", "idle", "--url", "http://127.0.0.1:8731?debug=1"},
+			wantErr: "must not carry a query or fragment",
+		},
+		{
+			name:    "bridge url without scheme",
+			args:    []string{"--id", "build", "--status", "idle", "--url", "127.0.0.1:8731"},
+			wantErr: "must be absolute http(s)",
 		},
 		{name: "missing id", args: []string{"--status", "idle"}, wantErr: "--id is required"},
 		{name: "missing status", args: []string{"--id", "build"}, wantErr: "--status is required"},
@@ -230,6 +240,32 @@ func TestRunReport(t *testing.T) {
 			if !strings.Contains(stderr.String(), tc.message) {
 				t.Errorf("%d: stderr = %q, want containing %q", tc.code, stderr.String(), tc.message)
 			}
+		}
+	})
+
+	t.Run("redirect is not success", func(t *testing.T) {
+		redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/login", http.StatusFound)
+		}))
+		defer redirecting.Close()
+
+		var stderr bytes.Buffer
+		code := runReport([]string{"--url", redirecting.URL, "--id", "build", "--status", "idle"}, io.Discard, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "returned 302") {
+			t.Errorf("exit = %d, stderr = %q", code, stderr.String())
+		}
+	})
+
+	t.Run("200 without ok is not success", func(t *testing.T) {
+		impostor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("<html>hello</html>"))
+		}))
+		defer impostor.Close()
+
+		var stderr bytes.Buffer
+		code := runReport([]string{"--url", impostor.URL, "--id", "build", "--status", "idle"}, io.Discard, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "unexpected response") {
+			t.Errorf("exit = %d, stderr = %q", code, stderr.String())
 		}
 	})
 
