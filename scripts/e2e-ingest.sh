@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Slice-1 E2E: the real binary, no Herdr socket, two external agents driven
-# over raw HTTP through every status, then DELETE and TTL expiry. Asserts on
-# /snapshot, /events, /log and /health. Set E2E_SCREENSHOT=1 to also capture
-# the two residents at their offices.
+# Ingest E2E: the real binary, no Herdr socket, two external agents driven by
+# `agent-machi report` through every status, then --remove and TTL expiry.
+# Asserts on /snapshot, /events, /log and /health, plus the CLI's error exits.
+# Set E2E_SCREENSHOT=1 to also capture the two residents at their offices.
 set -euo pipefail
 
 PORT="${E2E_PORT:-8899}"
