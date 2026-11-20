@@ -115,6 +115,7 @@ func (b *Bridge) removeAgentRowLocked(paneID string) {
 	delete(b.agents, paneID)
 	delete(b.locations, paneID)
 	delete(b.firstSeen, paneID)
+	delete(b.external, paneID)
 	b.removeOrderLocked(paneID)
 	b.refreshDisplayNamesLocked()
 }

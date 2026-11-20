@@ -22,6 +22,12 @@ func (b *Bridge) Handler(static fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Cache-Control", "no-store")
+		// /report writes state, so it handles its own methods before the
+		// GET-only dispatcher below.
+		if r.URL.Path == "/report" {
+			b.serveReport(w, r)
+			return
+		}
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = w.Write([]byte("method not allowed"))
