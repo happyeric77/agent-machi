@@ -118,7 +118,9 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 
 	fs := flag.NewFlagSet("agent-machi report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&opts.bridgeURL, "url", opts.bridgeURL, "bridge base URL (env AGENT_MACHI_BRIDGE_URL)")
+	// The env-supplied value is deliberately not the flag default: usage and
+	// flag errors echo defaults, and a URL should not be copied into logs.
+	fs.StringVar(&opts.bridgeURL, "url", "", "bridge base URL, default http://127.0.0.1:8731 (env AGENT_MACHI_BRIDGE_URL)")
 	fs.StringVar(&opts.id, "id", "", "agent id inside the source (required)")
 	fs.StringVar(&opts.status, "status", "", "working, blocked, done or idle")
 	fs.StringVar(&opts.source, "source", opts.source, "source name; two sources may reuse an id")
@@ -130,6 +132,12 @@ func parseReportArgs(args []string, getenv func(string) string, stderr io.Writer
 			return nil, flag.ErrHelp
 		}
 		return nil, errUsageReported
+	}
+	if opts.bridgeURL == "" {
+		opts.bridgeURL = getenv("AGENT_MACHI_BRIDGE_URL")
+	}
+	if opts.bridgeURL == "" {
+		opts.bridgeURL = defaultBridgeURL
 	}
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("unexpected argument %q", fs.Arg(0))
@@ -180,6 +188,9 @@ func parseBridgeURL(raw string) (*url.URL, error) {
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("bridge URL %q must be absolute http(s)", raw)
 	}
+	if parsed.User != nil {
+		return nil, errors.New("bridge URL must not contain credentials")
+	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
 		return nil, fmt.Errorf("bridge URL %q must not carry a query or fragment", raw)
 	}
@@ -191,7 +202,7 @@ func buildReportRequest(opts *reportOptions) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	base.Path = strings.TrimSuffix(base.Path, "/") + "/report"
+	base = base.JoinPath("report")
 	if opts.remove {
 		base.RawQuery = url.Values{"source": {opts.source}, "id": {opts.id}}.Encode()
 		request, err := http.NewRequest(http.MethodDelete, base.String(), nil)

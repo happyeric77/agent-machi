@@ -79,6 +79,11 @@ func TestParseReportArgs(t *testing.T) {
 			wantErr: "must not carry a query or fragment",
 		},
 		{
+			name:    "bridge url with credentials",
+			args:    []string{"--id", "build", "--status", "idle", "--url", "http://user:pass@127.0.0.1:8731"},
+			wantErr: "must not contain credentials",
+		},
+		{
 			name:    "bridge url without scheme",
 			args:    []string{"--id", "build", "--status", "idle", "--url", "127.0.0.1:8731"},
 			wantErr: "must be absolute http(s)",
@@ -153,6 +158,20 @@ func TestBuildReportRequest(t *testing.T) {
 		if payload[key] != value {
 			t.Errorf("payload[%q] = %q, want %q", key, payload[key], value)
 		}
+	}
+
+	escaped := &reportOptions{
+		bridgeURL: "http://127.0.0.1:8731/town%2Fv1",
+		source:    "ci",
+		id:        "build",
+		status:    "idle",
+	}
+	request, err = buildReportRequest(escaped)
+	if err != nil {
+		t.Fatalf("buildReportRequest escaped base: %v", err)
+	}
+	if got := request.URL.EscapedPath(); got != "/town%2Fv1/report" {
+		t.Errorf("escaped path = %q", got)
 	}
 
 	opts.remove = true
@@ -257,15 +276,27 @@ func TestRunReport(t *testing.T) {
 	})
 
 	t.Run("200 without ok is not success", func(t *testing.T) {
-		impostor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte("<html>hello</html>"))
-		}))
-		defer impostor.Close()
-
-		var stderr bytes.Buffer
-		code := runReport([]string{"--url", impostor.URL, "--id", "build", "--status", "idle"}, io.Discard, &stderr)
-		if code == 0 || !strings.Contains(stderr.String(), "unexpected response") {
-			t.Errorf("exit = %d, stderr = %q", code, stderr.String())
+		cases := []struct {
+			name string
+			body string
+			args []string
+		}{
+			{"html", "<html>hello</html>", []string{"--status", "idle"}},
+			{"ok false", `{"ok":false}`, []string{"--status", "idle"}},
+			{"ok false on remove", `{"ok":false}`, []string{"--remove"}},
+			{"missing ok on remove", `{}`, []string{"--remove"}},
+		}
+		for _, tc := range cases {
+			impostor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			var stderr bytes.Buffer
+			args := append([]string{"--url", impostor.URL, "--id", "build"}, tc.args...)
+			code := runReport(args, io.Discard, &stderr)
+			impostor.Close()
+			if code == 0 || !strings.Contains(stderr.String(), "unexpected response") {
+				t.Errorf("%s: exit = %d, stderr = %q", tc.name, code, stderr.String())
+			}
 		}
 	})
 
