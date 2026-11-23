@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+// Mode is the one feeding source for a bridge process.
+type Mode int
+
+const (
+	ModeLocalHerdr Mode = iota
+	ModeFake
+	ModeExternal
+)
+
+// Mode applies the fixed precedence external > FAKE > local Herdr. External
+// mode is exactly the condition that enables /report: a non-empty raw token.
+func (c Config) Mode() Mode {
+	if c.IngestToken != "" {
+		return ModeExternal
+	}
+	if c.Fake {
+		return ModeFake
+	}
+	return ModeLocalHerdr
+}
+
 type Config struct {
 	Host         string
 	Port         int

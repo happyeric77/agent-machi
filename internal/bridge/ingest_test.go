@@ -256,7 +256,9 @@ func TestHerdrReconcileKeepsExternalRows(t *testing.T) {
 }
 
 func TestServesHTTPWithoutHerdrSocket(t *testing.T) {
-	b, static := newIngestBridge(t, testIngestToken, 0)
+	// Tokenless: local mode with a missing socket keeps serving /health. With a
+	// token this would be external mode, where Herdr is never dialed at all.
+	b, static := newIngestBridge(t, "", 0)
 	b.cfg.SocketPath = filepath.Join(t.TempDir(), "missing", "herdr.sock")
 	go b.StartHerdr()
 
