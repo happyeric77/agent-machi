@@ -24,6 +24,14 @@ if command -v lsof >/dev/null && lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>
   exit 1
 fi
 
+stop_server() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+  fi
+}
+
 cleanup() {
   if [[ -n "$sse_pid" ]]; then
     kill "$sse_pid" 2>/dev/null || true
@@ -35,15 +43,11 @@ cleanup() {
     wait "$dom_pid" 2>/dev/null || true
     dom_pid=""
   fi
+  stop_server
   if [[ -n "$fixture_pid" ]]; then
     kill "$fixture_pid" 2>/dev/null || true
     wait "$fixture_pid" 2>/dev/null || true
     fixture_pid=""
-  fi
-  if [[ -n "$server_pid" ]]; then
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
-    server_pid=""
   fi
 }
 trap cleanup EXIT
@@ -448,8 +452,16 @@ done
 control_accepts="$(cat "$accepts")"
 [[ "$control_accepts" -ge 2 ]] || fail "control run accepted only $control_accepts connections"
 echo "control: pane seen and moved to working; $control_accepts fixture connections accepted"
-cleanup
-# The fixture keeps counting; zero the counter so the token run is measured alone.
+# Stop only the bridge: the fixture must stay listening, otherwise the token
+# run's zero accepts would prove nothing.
+stop_server
+# Prove the fixture still accepts connections right now: a dead fixture would
+# make the token run's zero accept proof of nothing. Then zero the counter so
+# the token run is measured alone.
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.close()' "$fixture_sock"
+probe_accepts="$(cat "$accepts")"
+[[ "$probe_accepts" -gt "$control_accepts" ]] \
+  || fail "the fixture stopped accepting connections (count $probe_accepts)"
 printf 0 >"$accepts"
 
 echo "-- token run: same socket path, external mode"
@@ -495,11 +507,15 @@ for _ in $(seq 1 60); do
   [[ "$(cat "$accepts")" != "0" ]] && break
   sleep 0.1
 done
+# Shut the bridge down first, then read the count: a dial at shutdown counts too.
+stop_server
 external_accepts="$(cat "$accepts")"
 [[ "$external_accepts" == "0" ]] \
   || fail "external mode dialed the Herdr socket $external_accepts time(s)"
-cleanup
+[[ -S "$fixture_sock" ]] || fail "the fixture socket vanished, so its accept count proved nothing"
+kill -0 "$fixture_pid" 2>/dev/null || fail "the fixture process died, so its accept count proved nothing"
 echo "external: no FAKE rows, only ext:ci:ext-only, $external_accepts fixture connections accepted"
+cleanup
 
 if [[ "${E2E_REAL_TTL:-0}" == "1" ]]; then
   echo "== phase 6: expiry at the default 15-minute TTL"
