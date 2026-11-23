@@ -412,6 +412,27 @@ fixture_pid=$!
 for _ in $(seq 1 50); do [[ -S "$fixture_sock" ]] && break; sleep 0.1; done
 [[ -S "$fixture_sock" ]] || fail "Herdr fixture did not listen"
 
+fixture_probe() { # socket -> 0 only after the fixture has counted and replied
+  # A connect() alone proves nothing: the count is safe to read only once the
+  # fixture has accepted and answered, so use a real request as the barrier.
+  python3 -c '
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"id": "probe", "method": "session.snapshot"}) + "\n").encode())
+buffer = b""
+while b"\n" not in buffer:
+    chunk = s.recv(4096)
+    if not chunk:
+        sys.exit(1)
+    buffer += chunk
+reply = json.loads(buffer.split(b"\n", 1)[0])
+assert reply.get("id") == "probe", reply
+s.close()
+' "$1"
+}
+
 fixture_status() { # pane id -> status or absent
   curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
@@ -455,14 +476,13 @@ echo "control: pane seen and moved to working; $control_accepts fixture connecti
 # Stop only the bridge: the fixture must stay listening, otherwise the token
 # run's zero accepts would prove nothing.
 stop_server
-# Prove the fixture still accepts connections right now: a dead fixture would
-# make the token run's zero accept proof of nothing. Then zero the counter so
-# the token run is measured alone.
-python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.close()' "$fixture_sock"
-probe_accepts="$(cat "$accepts")"
-[[ "$probe_accepts" -gt "$control_accepts" ]] \
-  || fail "the fixture stopped accepting connections (count $probe_accepts)"
-printf 0 >"$accepts"
+# Prove the fixture still accepts right now, and take the count only after it
+# has answered: otherwise a connect() racing the counter read could look dead.
+count_before_probe="$(cat "$accepts")"
+fixture_probe "$fixture_sock" || fail "the fixture stopped answering before the token run"
+baseline_accepts="$(cat "$accepts")"
+[[ "$baseline_accepts" -gt "$count_before_probe" ]] \
+  || fail "the fixture accepted nothing during the probe ($count_before_probe -> $baseline_accepts)"
 
 echo "-- token run: same socket path, external mode"
 rm -f "$tmp/events.jsonl"
@@ -504,17 +524,20 @@ assert rows[0]["pane_id"]=="ext:ci:ext-only", rows
 
 # Herdr startup is async, so watch for a bounded window rather than one glance.
 for _ in $(seq 1 60); do
-  [[ "$(cat "$accepts")" != "0" ]] && break
+  [[ "$(cat "$accepts")" != "$baseline_accepts" ]] && break
   sleep 0.1
 done
-# Shut the bridge down first, then read the count: a dial at shutdown counts too.
+# Stop the bridge, then probe again. The fixture counts an accept before it
+# replies, so a dial at shutdown cannot hide in the accept queue: the final
+# probe is the only connection allowed, so the count must be exactly +1.
 stop_server
-external_accepts="$(cat "$accepts")"
-[[ "$external_accepts" == "0" ]] \
-  || fail "external mode dialed the Herdr socket $external_accepts time(s)"
 [[ -S "$fixture_sock" ]] || fail "the fixture socket vanished, so its accept count proved nothing"
 kill -0 "$fixture_pid" 2>/dev/null || fail "the fixture process died, so its accept count proved nothing"
-echo "external: no FAKE rows, only ext:ci:ext-only, $external_accepts fixture connections accepted"
+fixture_probe "$fixture_sock" || fail "the fixture stopped answering after shutdown"
+final_accepts="$(cat "$accepts")"
+[[ "$final_accepts" -eq $((baseline_accepts + 1)) ]] \
+  || fail "external mode dialed the Herdr socket $((final_accepts - baseline_accepts - 1)) time(s)"
+echo "external: no FAKE rows, only ext:ci:ext-only, 0 fixture connections accepted"
 cleanup
 
 if [[ "${E2E_REAL_TTL:-0}" == "1" ]]; then
