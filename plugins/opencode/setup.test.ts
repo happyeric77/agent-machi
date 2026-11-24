@@ -58,6 +58,12 @@ interface Options {
   failListOnCall?: number;
   /** Fail a `get` for this session, as a transient read error would. */
   getFails?: (sessionID: string, call: number) => boolean;
+  /** Replace a context method wholesale, for probes that need their own gate. */
+  override?: {
+    get?: (sessionID: string) => Promise<any>;
+    list?: () => Promise<any>;
+    permissions?: (sessionID: string) => Promise<any>;
+  };
 }
 
 function makeCtx(shared: World, opts: Options = {}) {
@@ -74,6 +80,7 @@ function makeCtx(shared: World, opts: Options = {}) {
     session: {
       async list() {
         calls.list += 1;
+        if (opts.override?.list) return opts.override.list();
         if (listFails > 0) {
           listFails -= 1;
           throw new Error("list is down");
@@ -83,6 +90,7 @@ function makeCtx(shared: World, opts: Options = {}) {
       },
       async get({ sessionID }: { sessionID: string }) {
         calls.get += 1;
+        if (opts.override?.get) return opts.override.get(sessionID);
         if (opts.getFails?.(sessionID, calls.get)) throw new Error("get is down");
         if (opts.gate) {
           await new Promise<void>((resolve) => {
@@ -98,6 +106,7 @@ function makeCtx(shared: World, opts: Options = {}) {
     permission: {
       async list({ sessionID }: { sessionID: string }) {
         permitCalls += 1;
+        if (opts.override?.permissions) return opts.override.permissions(sessionID);
         if (!opts.permissions) return [];
         const ids = opts.permissions(sessionID, permitCalls);
         // A null stands for an unreadable answer, which must not clear a prompt.
@@ -1391,5 +1400,168 @@ test("a prompt read still clears a block when the metadata read fails", async ()
     () => shared.writes.slice(seen).some((w) => w.id === "mini-ses_b" && w.status === "working"),
   );
   assert.ok(ctx.permits() > before, "the prompt list was consulted despite the failing get");
+  stop?.();
+});
+
+test("a start is not lost when its metadata read fails twice", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  const gate = { release: null as (() => void) | null };
+  let reads = 0;
+  const ctx = makeCtx(shared, {
+    override: {
+      get: async (sessionID) => {
+        reads += 1;
+        if (reads === 2) {
+          // The read the event waits on never settles before the deadline.
+          await new Promise<void>((resolve) => (gate.release = resolve));
+          throw new Error("deadline");
+        }
+        if (reads > 2) throw new Error("transient");
+        return shared.rows.get(sessionID)!;
+      },
+    },
+  });
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_x", {
+    id: "ses_x",
+    title: "x",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_x" } });
+  await until("admitted", () => shared.writes.some((w) => w.id === "mini-ses_x"));
+  forcePass();
+  await until("the gated read starts", () => reads === 2);
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_x" } });
+  await wait(50);
+  gate.release?.();
+  await wait(400);
+  // No read ever answered, so the event itself must be published: a lost
+  // transition is worse than a possibly stale one.
+  assert.ok(
+    shared.writes.some((w) => w.id === "mini-ses_x" && w.status === "working"),
+    `expected a working write, got ${JSON.stringify(shared.writes)}`,
+  );
+  stop?.();
+});
+
+test("a list page captured before an archive cannot suppress it", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  const page = { release: null as (() => void) | null };
+  let lists = 0;
+  const ctx = makeCtx(shared, {
+    override: {
+      list: async () => {
+        lists += 1;
+        if (lists === 1) {
+          await new Promise<void>((resolve) => (page.release = resolve));
+          return { data: [{ ...shared.rows.get("ses_a")! }] };
+        }
+        return { data: [] };
+      },
+      get: async () => {
+        throw new Error("transient");
+      },
+    },
+  });
+  shared.rows.set("ses_a", {
+    id: "ses_a",
+    title: "a",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() + 100 },
+  });
+  const stop = await plugin.setup(ctx.ctx);
+  await until("first page requested", () => lists === 1);
+  shared.emit({ type: "session.archived", data: { sessionID: "ses_a" } });
+  await wait(60);
+  page.release?.();
+  await wait(400);
+  // The page was requested before the archive, so the archive is newer: the
+  // resident must be deleted, not admitted from the stale snapshot.
+  assert.ok(
+    shared.writes.some((w) => w.method === "DELETE" && w.id === "mini-ses_a"),
+    `expected a DELETE, got ${JSON.stringify(shared.writes)}`,
+  );
+  stop?.();
+});
+
+test("a discarded prompt read never suppresses an ask", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  const held = { release: null as (() => void) | null };
+  let permits = 0;
+  const a = makeCtx(shared, {
+    directory: "/tmp/a",
+    override: {
+      permissions: async () => {
+        permits += 1;
+        if (permits >= 2) await new Promise<void>((resolve) => (held.release = resolve));
+        return [];
+      },
+    },
+  });
+  const stopA = await plugin.setup(a.ctx);
+  shared.rows.set("ses_p", {
+    id: "ses_p",
+    title: "p",
+    location: { directory: "/tmp/a" },
+    time: { created: Date.now(), busy: Date.now() + 100 },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_p" } });
+  await until("admitted", () => shared.writes.some((w) => w.id === "mini-ses_p"));
+  forcePass();
+  await until("the prompt read is in flight", () => permits >= 1);
+  shared.emit({ type: "permission.asked", data: { sessionID: "ses_p", id: "p_1" } });
+  await wait(60);
+  // A second setup retires the context whose read is still pending: its answer
+  // describes prompts nobody asked it about any more.
+  const b = makeCtx(shared, { directory: "/tmp/a", bridgeUrl: "http://127.0.0.1:9/other" });
+  const stopB = await plugin.setup(b.ctx);
+  stopA?.();
+  held.release?.();
+  await wait(400);
+  assert.ok(
+    shared.writes.some((w) => w.id === "mini-ses_p" && w.status === "blocked"),
+    `expected a blocked write, got ${JSON.stringify(shared.writes)}`,
+  );
+  stopB?.();
+});
+
+test("a live read clears a failed create so the session is reported once", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  let reads = 0;
+  const ctx = makeCtx(shared, {
+    override: {
+      get: async (sessionID) => {
+        reads += 1;
+        if (reads === 1) throw new Error("transient");
+        return { ...shared.rows.get(sessionID)!, time: { busy: Date.now() + 100 } };
+      },
+    },
+  });
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_c", {
+    id: "ses_c",
+    title: "c",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_c" } });
+  await wait(80);
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_c" } });
+  await until("reported", () => shared.writes.some((w) => w.id === "mini-ses_c" && w.status === "working"));
+  // The marker is gone, so a removal event is a real removal and must delete
+  // the resident exactly once.
+  shared.emit({ type: "session.deleted", data: { sessionID: "ses_c" } });
+  await until("deleted", () => shared.writes.some((w) => w.method === "DELETE" && w.id === "mini-ses_c"));
+  const deletes = shared.writes.filter((w) => w.method === "DELETE" && w.id === "mini-ses_c");
+  assert.equal(deletes.length, 1, `expected one DELETE, got ${JSON.stringify(shared.writes)}`);
   stop?.();
 });
