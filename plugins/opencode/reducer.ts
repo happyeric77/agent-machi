@@ -1,8 +1,12 @@
 /**
  * Pure state reducer for the Agent Machi reporter.
  *
- * Normalized OpenCode events go in, `/report` actions come out. No I/O, no
+ * Normalized observations go in, `/report` actions come out. No I/O, no
  * timers, no OpenCode types: the whole state model is testable on its own.
+ *
+ * The wiring applies one observation at a time, in arrival order, so this
+ * reducer never has to decide which of two conflicting reads was fresher. It
+ * only decides what the resulting resident status is.
  */
 
 export type Underlying = "working" | "idle";
@@ -14,7 +18,7 @@ export interface SessionView {
   readonly parentID?: string | null;
   readonly title?: string | null;
   readonly directory?: string | null;
-  /** True when the session is executing right now (bootstrap only). */
+  /** True when the session is executing right now. */
   readonly executing?: boolean;
 }
 
@@ -23,10 +27,12 @@ export interface Tracked {
   readonly permissions: Set<string>;
   readonly forms: Set<string>;
   name: string;
-  /** The location this session lives in; prompt reads are location-scoped. */
-  directory: string | null;
   reported: Status | null;
-  /** Deleted or archived: no resident until the session runs again. */
+  /**
+   * Deleted or archived: no resident until a fresh, non-archived read finds it
+   * again. The row stays as the tombstone, because the reducer needs to
+   * remember that a bare event may not bring it back.
+   */
   removed: boolean;
 }
 
@@ -49,13 +55,13 @@ export type Input =
   | {
       kind: "reconcile";
       sessionID: string;
-      /** Fresh metadata, or null when the session is gone. */
+      /** Fresh metadata, or null when the session is confirmed gone. */
       view: SessionView | null;
-      /** The server answered "no such session" (never a failed read). */
+      /** The server answered "no such session", or it is archived. */
       missing?: boolean;
       /**
        * Pending permission ids, null for a failed read, or absent when the
-       * read was skipped. A skipped or failed read never clears the set.
+       * read was skipped. Neither clears the event-derived set.
        */
       permissions?: readonly string[] | null;
     };
@@ -111,6 +117,20 @@ function sync(state: State, sessionID: string, out: Action[]): void {
   out.push({ type: "post", sessionID, status, ...(tracked.name ? { name: tracked.name } : {}) });
 }
 
+/** A session admitted for the first time. */
+function admit(state: State, view: SessionView): Tracked {
+  const tracked: Tracked = {
+    underlying: view.executing ? "working" : "idle",
+    permissions: new Set(),
+    forms: new Set(),
+    name: displayName(view),
+    reported: null,
+    removed: false,
+  };
+  state.sessions.set(view.id, tracked);
+  return tracked;
+}
+
 export function reduce(state: State, input: Input): Action[] {
   const out: Action[] = [];
 
@@ -119,37 +139,10 @@ export function reduce(state: State, input: Input): Action[] {
       for (const view of input.sessions) {
         // Child sessions live inside their parent's work and get no resident.
         if (view.parentID) continue;
-        const known = state.sessions.get(view.id);
-        if (known) {
-          // Admission for a resident that already exists is a no-op: a second
-          // metadata read (a seed racing a lookup) must never overwrite a name
-          // or an execution state that newer events already established. A
-          // rename comes from its own event; a status comes from `check()`.
-          if (!known.removed) continue;
-          // A confirmed-gone session comes back only with a fresh view, which
-          // is what a metadata read just proved. A start event alone must not
-          // revive it: the row may still be archived.
-          known.removed = false;
-          known.reported = null;
-          known.underlying = view.executing ? "working" : "idle";
-          // A row that was removed may have collected prompts while it was
-          // gone; they belong to a resident that no longer exists.
-          known.permissions.clear();
-          known.forms.clear();
-          const name = displayName(view);
-          if (name !== "") known.name = name;
-          sync(state, view.id, out);
-          continue;
-        }
-        state.sessions.set(view.id, {
-          underlying: view.executing ? "working" : "idle",
-          permissions: new Set(),
-          forms: new Set(),
-          name: displayName(view),
-          directory: view.directory ?? null,
-          reported: null,
-          removed: false,
-        });
+        // Admission only. A resident that already exists is updated by the
+        // observations that follow it, in order — never by a second admission.
+        if (state.sessions.has(view.id)) continue;
+        admit(state, view);
         sync(state, view.id, out);
       }
       return out;
@@ -157,18 +150,18 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "renamed": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
-      const name = displayName({ id: input.sessionID, title: input.title, directory: tracked.directory });
+      if (!tracked || tracked.removed) return out;
+      const name = displayName({ id: input.sessionID, title: input.title });
       // The bridge refreshes metadata only when the status changes, so this
       // only caches the name: the next real transition carries it.
-      if (name !== "" && name !== tracked.name) tracked.name = name;
+      if (name !== "") tracked.name = name;
       return out;
     }
 
     case "execution-started": {
       const tracked = state.sessions.get(input.sessionID);
       // A start alone never undoes a confirmed removal: the row may still be
-      // archived. Revival goes through `discovered` with a fresh view.
+      // archived. Revival goes through a fresh read that proves otherwise.
       if (!tracked || tracked.removed) return out;
       tracked.underlying = "working";
       sync(state, input.sessionID, out);
@@ -177,7 +170,7 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "execution-ended": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
+      if (!tracked || tracked.removed) return out;
       tracked.underlying = "idle";
       // Pending prompts are cleared only by their own terminal events or a
       // successful read: a prompt can outlive the turn that raised it.
@@ -187,8 +180,6 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "permission-asked": {
       const tracked = state.sessions.get(input.sessionID);
-      // A removed resident takes no prompt state: a late event would otherwise
-      // be waiting on the row when a later revival re-reads it.
       if (!tracked || tracked.removed) return out;
       tracked.permissions.add(input.requestID);
       sync(state, input.sessionID, out);
@@ -205,8 +196,6 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "form-created": {
       const tracked = state.sessions.get(input.sessionID);
-      // A removed resident takes no prompt state: a late event would otherwise
-      // be waiting on the row when a later revival re-reads it.
       if (!tracked || tracked.removed) return out;
       tracked.forms.add(input.formID);
       sync(state, input.sessionID, out);
@@ -259,10 +248,13 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "reconcile": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
-      // An authoritative "no such session" removes the resident now instead of
-      // waiting for the bridge's TTL. A failed read never gets here.
+      // An authoritative absence removes the resident now instead of waiting for
+      // the bridge's TTL. A failed read never reaches here.
       if (input.missing) {
+        if (!tracked) {
+          out.push({ type: "delete", sessionID: input.sessionID });
+          return out;
+        }
         if (tracked.removed) return out;
         tracked.removed = true;
         tracked.reported = null;
@@ -271,32 +263,36 @@ export function reduce(state: State, input: Input): Action[] {
         out.push({ type: "delete", sessionID: input.sessionID });
         return out;
       }
-      if (!input.view || tracked.removed) return out;
-      tracked.underlying = input.view.executing ? "working" : "idle";
-      const name = displayName(input.view);
-      if (name !== "" && name !== tracked.name) tracked.name = name;
-      tracked.directory = input.view.directory ?? tracked.directory;
+      if (!input.view) return out;
+      if (!tracked) {
+        admit(state, input.view);
+      } else {
+        // An observation is the freshest thing there is: it is applied in
+        // arrival order, so it may correct the resident directly.
+        const name = displayName(input.view);
+        if (name !== "") tracked.name = name;
+        if (tracked.removed) {
+          // A read proved the session live again: it is a new run, and prompt
+          // state from before its removal does not carry over.
+          tracked.removed = false;
+          tracked.reported = null;
+          tracked.permissions.clear();
+          tracked.forms.clear();
+        }
+        tracked.underlying = input.view.executing ? "working" : "idle";
+      }
       // A set is replaced only on a successful read; a skipped read leaves the
       // event-derived set alone because prompt reads are location-scoped.
       if (input.permissions) {
-        tracked.permissions.clear();
-        for (const id of input.permissions) tracked.permissions.add(id);
+        const current = state.sessions.get(input.sessionID);
+        if (current) {
+          current.permissions.clear();
+          for (const id of input.permissions) current.permissions.add(id);
+        }
       }
       sync(state, input.sessionID, out);
       return out;
     }
-  }
-}
-
-/**
- * Drop a removed session's row once nothing can still commit against it: call
- * after a full pass, when every read that started before the removal has
- * finished. The tombstone in the reporter is what keeps a later rename or
- * metadata read from admitting the row again.
- */
-export function pruneRemoved(state: State): void {
-  for (const [sessionID, tracked] of state.sessions) {
-    if (tracked.removed) state.sessions.delete(sessionID);
   }
 }
 

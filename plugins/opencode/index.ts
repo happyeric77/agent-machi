@@ -4,29 +4,34 @@
  * Normalized events go into the pure reducer in reducer.ts; the actions it
  * emits are queued in delivery.ts, which talks to the bridge off the hook
  * path. This file is only the wiring: read options, subscribe, reconcile.
+ *
+ * All context reads run through one serial queue. Reads are the only place a
+ * stale answer could commit — a metadata lookup racing a delete, a seed racing
+ * a rename — and the queue makes that impossible rather than guarded: work
+ * applied in arrival order means the last thing observed is always the thing
+ * applied last. Renewals do not go through the queue; they are on their own
+ * clock so a slow read can never let a lease lapse.
  */
 import { createDelivery, reportURL, type Delivery, type Write } from "./delivery.ts";
 import {
   createState,
   liveSessions,
-  pruneRemoved,
   reduce,
   type Action,
   type Input,
   type SessionView,
-  type State,
 } from "./reducer.ts";
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const RECONNECT_MS = 2_000;
-/** Retry interval for a bootstrap list read that failed. */
-const SEED_RETRY_MS = 2_000;
-/** Bound for one metadata read, so a stall can never hold a session's chain. */
+/** Bound for one context read, so a stalled call cannot hold the queue. */
 const READ_TIMEOUT_MS = 5_000;
 /** Sessions per listing page while seeding; the API returns 50 by default. */
 const SEED_PAGE = 200;
 /** Hard stop for bootstrap paging, so a huge history cannot delay seeding. */
 const SEED_MAX_PAGES = 25;
+/** Retry interval for a bootstrap list read that failed. */
+const SEED_RETRY_MS = 5_000;
 
 export interface ReporterOptions {
   readonly bridgeUrl?: unknown;
@@ -103,10 +108,9 @@ function isArchived(row: SessionRow): boolean {
   return typeof row.time?.archived === "number";
 }
 
-/** Returned when a read takes longer than the deadline. */
+/** Returned when a read takes longer than its deadline. */
 const TIMEOUT = Symbol("timeout");
 
-/** Resolves to TIMEOUT on a stall; rejects exactly as the work rejects. */
 async function within<T>(work: Promise<T>, ms = READ_TIMEOUT_MS): Promise<T | typeof TIMEOUT> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const late = new Promise<typeof TIMEOUT>((resolve) => {
@@ -131,29 +135,8 @@ function uptimeMs(): number {
   return Number.isFinite(seconds) ? seconds * 1000 : 0;
 }
 
-/**
- * Reads a session's pending permission ids; a failed read is `null`.
- * Prompt reads are location-scoped, so the context must be the one loaded for
- * the session's own directory.
- */
-async function readPermissions(ctx: any, sessionID: string): Promise<readonly string[] | null> {
-  let pending: any;
-  try {
-    pending = await within(Promise.resolve(ctx?.permission?.list?.({ sessionID })));
-  } catch {
-    return null;
-  }
-  if (pending === TIMEOUT) return null; // a failed read is never an empty set
-  // Only an actual list is authoritative. A missing method or an unexpected
-  // payload is an unknown answer, not "nothing pending".
-  if (Array.isArray(pending)) return ids(pending);
-  if (Array.isArray(pending?.data)) return ids(pending.data);
-  return null;
-}
-
-function ids(rows: any[]): string[] {
-  return rows.map((row) => String(row?.id ?? "")).filter((id) => id !== "");
-}
+/** A read's outcome: a row, an authoritative absence, or "no answer". */
+type Read = { kind: "row"; row: SessionRow } | { kind: "absent" } | { kind: "unknown" };
 
 /** A live plugin setup: the context it was handed, and where that lives. */
 interface Registration {
@@ -162,36 +145,33 @@ interface Registration {
 }
 
 /**
- * One reporter per bridge configuration, shared by every live setup.
+ * One reporter per report endpoint, shared by every live setup.
  *
  * The event stream spans every location while plugin setup runs once per
- * location, so a reporter must outlive any single setup: opening another
- * location, or unloading one, may not discard the state of the others, and a
- * surviving setup has to keep renewing leases. Setups therefore register their
- * context here; state and delivery belong to the reporter, not to a setup.
+ * location, so a reporter cannot belong to a setup: opening another location,
+ * or unloading one, may not discard another location's residents, and a
+ * surviving setup has to keep renewing them. Setups register their context
+ * here; state and delivery belong to the reporter.
+ *
  * The registry lives on `globalThis` because a config reload may re-evaluate
  * this module, which would otherwise forget a reporter that is still running.
  */
 class Reporter {
   private readonly config: Config;
-  private readonly state: State = createState();
+  private readonly state = createState();
   private readonly delivery: Delivery;
-  private readonly versions = new Map<string, number>();
-  private readonly chains = new Map<string, Promise<void>>();
-  /** Sessions confirmed gone, including ones this reporter never tracked. */
-  private readonly removed = new Set<string>();
   private readonly setups: Registration[] = [];
+  /** Where each known session lives; the reducer only holds resident state. */
+  private readonly directories = new Map<string, string | null>();
   private readonly bootSince = Date.now() - uptimeMs();
+  /** Work applied in arrival order: the whole point of this class. */
+  private readonly queue: Array<() => Promise<unknown>> = [];
+  private draining = false;
   private stream: { controller: AbortController; owner: Registration } | null = null;
-  /** Which registration owns the running stream. */
   private streamOwner: Registration | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
-  private running = false;
-  private again = false;
-  /** A folded pass asked for a bootstrap, not just a re-check. */
-  private againSeed = false;
   private seeded = false;
-  private retry: ReturnType<typeof setTimeout> | null = null;
+  private seedRetry: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
 
   constructor(config: Config) {
@@ -218,12 +198,12 @@ class Reporter {
     if (index < 0) return; // already unregistered: cleanup is idempotent
     this.setups.splice(index, 1);
     if (this.setups.length === 0) {
-      this.close();
+      this.stop();
       return;
     }
     if (this.streamOwner === registration) {
-      // The owner is gone but others remain: re-elect by restarting the stream
-      // against a surviving context instead of reporting nothing.
+      // The owner is gone but others remain: re-elect against a survivor
+      // instead of reporting nothing.
       this.stream?.controller.abort();
       this.stream = null;
       this.streamOwner = null;
@@ -231,14 +211,20 @@ class Reporter {
     }
   }
 
-  private ctx(): any {
-    return this.setups[0]?.ctx ?? null;
-  }
-
-  /** The context loaded for a directory, for location-scoped reads. */
-  private registrationFor(directory: string | null): Registration | null {
-    if (directory === null) return null;
-    return this.setups.find((setup) => setup.directory === directory) ?? null;
+  /** Shut down from outside (tests); the same path an unload takes. */
+  stop(): void {
+    this.setups.length = 0;
+    this.closed = true;
+    this.stream?.controller.abort();
+    this.stream = null;
+    this.streamOwner = null;
+    if (this.heartbeat !== null) clearInterval(this.heartbeat);
+    this.heartbeat = null;
+    if (this.seedRetry !== null) clearTimeout(this.seedRetry);
+    this.seedRetry = null;
+    this.delivery.close();
+    this.queue.length = 0;
+    this.directories.clear();
   }
 
   private send(action: Action): void {
@@ -247,14 +233,6 @@ class Reporter {
         ? { type: "delete", sessionID: action.sessionID }
         : { type: "post", sessionID: action.sessionID, status: action.status, name: action.name };
     this.delivery.enqueue(write);
-  }
-
-  private bump(sessionID: string): void {
-    this.versions.set(sessionID, (this.versions.get(sessionID) ?? 0) + 1);
-  }
-
-  private unchanged(sessionID: string, mark: number): boolean {
-    return (this.versions.get(sessionID) ?? 0) === mark;
   }
 
   private dispatch(input: Input): void {
@@ -266,79 +244,110 @@ class Reporter {
     }
   }
 
-  private enqueueFor(sessionID: string, work: () => Promise<void> | void): void {
-    const previous = this.chains.get(sessionID) ?? Promise.resolve();
-    const next = previous.then(work).catch(() => undefined);
-    this.chains.set(sessionID, next);
-    void next.then(() => {
-      if (this.chains.get(sessionID) === next) this.chains.delete(sessionID);
-    });
+  /**
+   * Append work and drain the queue. Tasks run strictly one at a time, so no
+   * two reads can be in flight for the same state.
+   */
+  private enqueue(task: () => Promise<unknown>): void {
+    if (this.closed) return;
+    this.queue.push(task);
+    if (!this.draining) void this.drain();
   }
 
-  private viewOf(info: any): SessionView {
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      for (;;) {
+        const task = this.queue.shift();
+        if (!task || this.closed) return;
+        try {
+          await task();
+        } catch {
+          // One failed task must not stop the queue.
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  /** The context loaded for a directory, for location-scoped reads. */
+  private registrationFor(directory: string | null): Registration | null {
+    if (directory === null) return null;
+    return this.setups.find((setup) => setup.directory === directory) ?? null;
+  }
+
+  private viewOf(row: SessionRow): SessionView {
     return {
-      id: String(info.id),
-      parentID: info.parentID ?? null,
-      title: info.title ?? null,
-      directory: info.location?.directory ?? null,
-      executing: isExecuting(info, this.bootSince),
+      id: String(row.id),
+      parentID: row.parentID ?? null,
+      title: row.title ?? null,
+      directory: row.location?.directory ?? null,
+      executing: isExecuting(row, this.bootSince),
     };
   }
 
-  /**
-   * Resolve one session's metadata and admit it as a resident.
-   *
-   * Deliberately NOT version-fenced: a rename arriving while this read is in
-   * flight must not invalidate it, because the queued event waiting on this
-   * admission (a prompt, a start) has nowhere else to go — dropping the read
-   * loses that event for good. Admission is identity only, and every later
-   * event applies on top in arrival order.
-   */
-  private async discover(sessionID: string): Promise<void> {
+  /** Read one session, through the setup loaded for a directory when known. */
+  private async readSession(sessionID: string, directory: string | null): Promise<Read> {
+    const owner = this.registrationFor(directory) ?? this.setups[0];
+    if (!owner) return { kind: "unknown" };
     let info: any;
     try {
-      info = await within(Promise.resolve(this.ctx()?.session?.get?.({ sessionID })));
-    } catch {
-      return; // unknown or gone: nothing to admit
+      info = await within(Promise.resolve(owner.ctx?.session?.get?.({ sessionID })));
+    } catch (error) {
+      // A specific not-found is authoritative; a failure or a stall is not.
+      return isMissing(error) ? { kind: "absent" } : { kind: "unknown" };
     }
-    if (info === TIMEOUT || this.closed) return;
+    if (info === TIMEOUT) return { kind: "unknown" };
     const row = info?.data ?? info;
-    if (!row?.id) return;
-    // An archived row still answers reads, and a delete for a session this
-    // reporter never tracked leaves no trace. Admitting it would resurrect a
-    // resident the user removed, so it is refused here as well.
-    if (isArchived(row)) {
-      if (this.knownRemoved(sessionID)) this.dispatch({ kind: "deleted", sessionID });
+    if (!row?.id) return { kind: "unknown" };
+    // Archiving leaves the row readable; it is not a resident either way.
+    return isArchived(row) ? { kind: "absent" } : { kind: "row", row };
+  }
+
+  /**
+   * Apply one session's current truth. An authoritative absence removes the
+   * resident; a row admits it, or corrects it if it changed.
+   */
+  private applyRead(sessionID: string, read: Read, permissions?: readonly string[] | null): void {
+    if (read.kind === "unknown") return;
+    if (read.kind === "absent") {
+      this.directories.delete(sessionID);
+      this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
       return;
     }
-    // A confirmed-gone session comes back only for a row that is provably live:
-    // a fresh, non-archived read, which is exactly what this path just proved.
-    this.dispatch({ kind: "discovered", sessions: [this.viewOf(row)] });
+    this.directories.set(sessionID, read.row.location?.directory ?? null);
+    this.dispatch({
+      kind: "reconcile",
+      sessionID,
+      view: this.viewOf(read.row),
+      permissions,
+    });
   }
 
-  private knownRemoved(sessionID: string): boolean {
-    return (this.state.sessions.get(sessionID)?.removed ?? false) || this.removed.has(sessionID);
-  }
-
-  private async ensure(sessionID: string): Promise<void> {
+  /**
+   * Make sure a session is known before an event that needs it is applied.
+   *
+   * A removed session is re-read, so a genuine revival (a fresh, non-archived
+   * row) is admitted and an archived one is not. Nothing else needs a read.
+   */
+  private async admit(sessionID: string): Promise<void> {
     const tracked = this.state.sessions.get(sessionID);
-    // A removed session needs a fresh non-archived row to come back, so it is
-    // re-read rather than assumed alive.
-    if (tracked && !tracked.removed) return;
-    await this.discover(sessionID);
+    const known = tracked !== undefined && !tracked.removed;
+    if (known) return;
+    this.applyRead(sessionID, await this.readSession(sessionID, this.directories.get(sessionID) ?? null));
   }
 
   /** Page the whole session list: the API returns 50 newest by default. */
-  private async allRows(): Promise<SessionRow[] | null> {
+  private async listRows(owner: Registration): Promise<SessionRow[] | null> {
     const rows: SessionRow[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < SEED_MAX_PAGES; page += 1) {
       let listed: any;
       try {
         listed = await within(
-          Promise.resolve(
-            this.ctx()?.session?.list?.({ limit: SEED_PAGE, ...(cursor ? { cursor } : {}) }),
-          ),
+          Promise.resolve(owner.ctx?.session?.list?.({ limit: SEED_PAGE, ...(cursor ? { cursor } : {}) })),
         );
       } catch {
         return null;
@@ -353,136 +362,100 @@ class Reporter {
     return rows;
   }
 
-  /** Seed sessions executing at load; false when the list read failed. */
+  /**
+   * Seed sessions executing at load. Returns false when the read failed, which
+   * is what schedules a retry: a session that starts during an outage would
+   * otherwise never be found.
+   */
   private async seed(): Promise<boolean> {
-    const marks = new Map(this.versions);
-    const rows = await this.allRows();
-    // A failed bootstrap is retried by the next pass: without it a session that
-    // started while the list was down would never be found.
-    if (rows === null || this.closed) return false;
+    const owner = this.setups[0];
+    if (!owner) return false;
+    const rows = await this.listRows(owner);
+    if (rows === null) return false;
     const views: SessionView[] = [];
     for (const row of rows) {
       if (!row.id || row.parentID || isArchived(row) || !isExecuting(row, this.bootSince)) continue;
-      // A newer event for this session already reported it: a seeded view may
-      // be older than that event, so it must not overwrite it.
-      if (!this.unchanged(row.id, marks.get(row.id) ?? 0)) continue;
+      // A known resident keeps whatever its events and checks established; the
+      // list is here to find the ones nothing has mentioned yet.
+      if (this.state.sessions.has(row.id)) continue;
       views.push(this.viewOf(row));
     }
     if (views.length > 0) this.dispatch({ kind: "discovered", sessions: views });
     return true;
   }
 
-  /** One session's ground truth: gone, executing, name, pending prompts. */
+  /** One session's ground truth: execution, name, pending prompts. */
   private async check(sessionID: string): Promise<void> {
-    const v = this.versions.get(sessionID) ?? 0;
-    let info: any;
-    try {
-      info = await within(this.ctx()?.session?.get?.({ sessionID }));
-    } catch (error) {
-      // A specific not-found is authoritative; a failed or timed-out read is
-      // not, so the resident stays until the next pass.
-      if (isMissing(error) && this.unchanged(sessionID, v)) {
-        this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
-      }
+    const read = await this.readSession(sessionID, this.directories.get(sessionID) ?? null);
+    if (read.kind !== "row") {
+      this.applyRead(sessionID, read);
       return;
     }
-    if (info === TIMEOUT || this.closed || !this.unchanged(sessionID, v)) return;
-    const row = info?.data ?? info;
-    if (!row?.id) return;
-    if (isArchived(row)) {
-      this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
-      return;
-    }
-    const view = this.viewOf(row);
-    // Prompt reads are location-scoped: only the context loaded for this
-    // session's own directory can describe its prompts. Without one, the
-    // session stays event-only rather than being read from the wrong place.
+    // Prompt reads are location-scoped: only the setup for this session's own
+    // directory can describe its prompts. Without one it stays event-only.
     let permissions: readonly string[] | null | undefined;
-    const location = this.registrationFor(view.directory ?? null);
-    if (location) {
-      const read = await readPermissions(location.ctx, sessionID);
-      // A retired setup's read describes a world that may already have moved
-      // on, and the session may have changed while it ran: drop it either way.
-      if (!this.unchanged(sessionID, v) || !this.setups.includes(location)) return;
-      permissions = read;
-    }
-    this.dispatch({ kind: "reconcile", sessionID, view, permissions });
+    const location = this.registrationFor(read.row.location?.directory ?? null);
+    if (location) permissions = await this.readPermissions(location, sessionID);
+    this.applyRead(sessionID, read, permissions);
   }
 
-  /** A reconcile pass over everything this reporter owns. */
-  private async reconcile(seed: boolean): Promise<void> {
-    if (this.closed) return;
-    // Recovery for a bootstrap that never landed: any pass may be asked to
-    // seed, and until one succeeds every later pass retries.
-    if (seed || !this.seeded) {
-      if (await this.seed()) this.seeded = true;
-      else this.scheduleBootstrapRetry();
+  private async readPermissions(
+    owner: Registration,
+    sessionID: string,
+  ): Promise<readonly string[] | null> {
+    let pending: any;
+    try {
+      pending = await within(Promise.resolve(owner.ctx?.permission?.list?.({ sessionID })));
+    } catch {
+      return null;
     }
-    for (const sessionID of liveSessions(this.state)) {
-      if (this.closed) return;
-      await this.check(sessionID);
-    }
-    // Every read that began before a removal has now finished, so a removed row
-    // can be dropped. The reporter's tombstone is what still refuses to admit
-    // the session again; the row itself would otherwise pile up forever.
-    for (const sessionID of [...this.state.sessions.keys()]) {
-      if (this.state.sessions.get(sessionID)?.removed) this.versions.delete(sessionID);
-    }
-    pruneRemoved(this.state);
+    // Only an actual list is authoritative. A stall, a missing method or an
+    // unexpected payload is an unknown answer, not "nothing pending".
+    if (pending === TIMEOUT || pending === null) return null;
+    const rows = Array.isArray(pending) ? pending : pending?.data;
+    if (!Array.isArray(rows)) return null;
+    return rows.map((row: any) => String(row?.id ?? "")).filter((id) => id !== "");
   }
 
   /**
-   * A bootstrap that never landed is retried on its own timer. The stream only
-   * re-runs a pass when it reconnects, and a live stream may stay up for hours,
-   * so relying on that would leave a missed session undiscovered indefinitely.
-   */
-  private scheduleBootstrapRetry(): void {
-    if (this.closed || this.seeded || this.retry !== null) return;
-    this.retry = setTimeout(() => {
-      this.retry = null;
-      this.runReconcile(true);
-    }, SEED_RETRY_MS);
-    (this.retry as unknown as { unref?: () => void }).unref?.();
-  }
-
-  /**
-   * One reconcile pass at a time, for startup, every reconnect and every
-   * heartbeat. Overlapping passes would race: two reads for the same session
-   * can return in either order and neither bumps a version, so a late stale
-   * read would win.
+   * A whole pass: seed until it lands, then check every live resident.
    *
-   * A pass requested while one runs is folded into exactly one more, and the
-   * seed request is OR-ed in rather than dropped: a folded reconnect must still
-   * bootstrap, whatever the heartbeat's own argument was.
+   * It is queued like any other work, so it cannot interleave with an event's
+   * read — that is what makes the last applied observation the true one.
    */
-  private runReconcile(seed: boolean): void {
-    if (this.closed) return;
-    if (this.running) {
-      this.again = true;
-      this.againSeed = this.againSeed || seed;
-      return;
-    }
-    this.running = true;
-    void (async () => {
-      let next = seed;
-      try {
-        do {
-          this.again = false;
-          const wantSeed = next;
-          next = false;
-          this.againSeed = false;
-          // A pass that throws keeps its seed request for the next one.
-          try {
-            await this.reconcile(wantSeed);
-          } catch {
-            if (wantSeed) this.againSeed = true;
-          }
-        } while ((this.again || this.againSeed) && !this.closed);
-      } finally {
-        this.running = false;
-        if (!this.closed && this.againSeed) this.runReconcile(this.againSeed);
+  private runPass(seedNow: boolean): void {
+    this.enqueue(async () => {
+      if (this.closed) return;
+      if (seedNow || !this.seeded) {
+        const ok = await this.seed();
+        if (ok) {
+          this.seeded = true;
+          this.clearSeedRetry();
+        } else {
+          this.scheduleSeedRetry();
+        }
       }
-    })();
+      // Snapshot the ids: a session admitted by the seed above is checked on
+      // the next pass, and a resident removed mid-pass is skipped.
+      for (const sessionID of liveSessions(this.state)) {
+        if (this.closed) return;
+        await this.check(sessionID);
+      }
+    });
+  }
+
+  private scheduleSeedRetry(): void {
+    if (this.closed || this.seeded || this.seedRetry !== null) return;
+    this.seedRetry = setTimeout(() => {
+      this.seedRetry = null;
+      this.runPass(true);
+    }, SEED_RETRY_MS);
+    (this.seedRetry as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private clearSeedRetry(): void {
+    if (this.seedRetry !== null) clearTimeout(this.seedRetry);
+    this.seedRetry = null;
   }
 
   private onEvent(event: any): void {
@@ -492,17 +465,17 @@ class Reporter {
       case "session.created":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, () => this.discover(sessionID));
+          this.enqueue(() => this.admit(sessionID));
         }
         return;
       case "session.renamed":
         if (typeof data.sessionID === "string" && "title" in data) {
           const sessionID = data.sessionID;
           const title = typeof data.title === "string" ? data.title : null;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, async () => {
-            await this.ensure(sessionID);
+          // A rename carries the new name itself, but a session that was never
+          // seen still has to be admitted before the reducer knows it.
+          this.enqueue(async () => {
+            await this.admit(sessionID);
             this.dispatch({ kind: "renamed", sessionID, title });
           });
         }
@@ -510,9 +483,8 @@ class Reporter {
       case "session.execution.started":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, async () => {
-            await this.ensure(sessionID);
+          this.enqueue(async () => {
+            await this.admit(sessionID);
             this.dispatch({ kind: "execution-started", sessionID });
           });
         }
@@ -522,10 +494,9 @@ class Reporter {
       case "session.execution.interrupted":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, async () => {
-            // A start that never resolved must not swallow the end.
-            await this.ensure(sessionID);
+          this.enqueue(async () => {
+            // A start that was never admitted must not swallow the end.
+            await this.admit(sessionID);
             this.dispatch({ kind: "execution-ended", sessionID });
           });
         }
@@ -534,9 +505,8 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.id === "string") {
           const sessionID = data.sessionID;
           const requestID = data.id;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, async () => {
-            await this.ensure(sessionID);
+          this.enqueue(async () => {
+            await this.admit(sessionID);
             this.dispatch({ kind: "permission-asked", sessionID, requestID });
           });
         }
@@ -545,19 +515,17 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
           const sessionID = data.sessionID;
           const requestID = data.requestID;
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, () =>
-            this.dispatch({ kind: "permission-replied", sessionID, requestID }),
-          );
+          this.enqueue(async () => {
+            this.dispatch({ kind: "permission-replied", sessionID, requestID });
+          });
         }
         return;
       case "form.created": {
         const formID = data?.form?.id;
         const sessionID = data?.form?.sessionID;
         if (typeof sessionID === "string" && typeof formID === "string") {
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, async () => {
-            await this.ensure(sessionID);
+          this.enqueue(async () => {
+            await this.admit(sessionID);
             this.dispatch({ kind: "form-created", sessionID, formID });
           });
         }
@@ -569,22 +537,20 @@ class Reporter {
           const sessionID = data.sessionID;
           const formID = data.id;
           const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
-          this.bump(sessionID);
-          this.enqueueFor(sessionID, () => this.dispatch({ kind, sessionID, formID }));
+          this.enqueue(async () => {
+            this.dispatch({ kind, sessionID, formID });
+          });
         }
         return;
       case "session.deleted":
       case "session.archived":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          this.bump(sessionID);
-          // Remember it even when it was never tracked: the DELETE that follows
-          // clears the resident, and this keeps a later rename or metadata read
-          // from admitting the row again.
-          this.removed.add(sessionID);
-          // Behind any pending lookup, so a delete always outranks the birth
-          // that lookup was about to report.
-          this.enqueueFor(sessionID, () => this.dispatch({ kind: "deleted", sessionID }));
+          // Queued behind any pending admission, so a delete always outranks
+          // the birth that admission was about to report.
+          this.enqueue(async () => {
+            this.dispatch({ kind: "deleted", sessionID });
+          });
         }
         return;
       default:
@@ -596,33 +562,28 @@ class Reporter {
     if (this.closed || this.stream || this.setups.length === 0) return;
     const owner = this.setups[0];
     if (!owner) return;
-    const ctx = owner.ctx;
     const controller = new AbortController();
     this.stream = { controller, owner };
     this.streamOwner = owner;
-    // A retired stream must not keep publishing: an abort is cooperative, and a
-    // generator may still yield one last event after it.
+    // An abort is cooperative: a generator may still yield one last event, and
+    // a retired stream must not publish it.
     const live = (): boolean =>
       !this.closed && !controller.signal.aborted && this.streamOwner === owner;
     void (async () => {
-      // A dropped stream is retried, because events are the only live signal:
-      // an ended stream must not leave the town frozen on stale state.
       while (live()) {
         try {
-          const events = ctx?.event?.subscribe?.({ signal: controller.signal });
-          // Start consuming before reconciling. An async generator is
-          // pull-based: while the read is awaiting, nothing is reading it and
-          // every event in that window is lost.
+          const events = owner.ctx?.event?.subscribe?.({ signal: controller.signal });
+          // Start consuming before the pass. An async generator is pull-based:
+          // while a read is pending nothing pulls it, so events are dropped.
           const reader = (async () => {
             for await (const event of events ?? []) {
               if (!live()) return;
               this.onEvent(event);
             }
           })();
-          // Every reconnect re-bootstraps: a session can have started and
-          // finished entirely while the stream was down, and only a fresh list
-          // read can find it.
-          this.runReconcile(true);
+          // Every reconnect re-seeds: a session can have started and finished
+          // entirely while the stream was down.
+          this.runPass(true);
           await reader;
         } catch {
           // Fall through to the backoff below.
@@ -649,30 +610,12 @@ class Reporter {
       // Catch up immediately after a suspend/resume where it is overdue.
       if (Date.now() - lastBeat < HEARTBEAT_MS) return;
       lastBeat = Date.now();
-      // Renewal is independent of reading: a stalled metadata read must never
-      // hold back the lease on sessions that are perfectly healthy.
+      // Renewal is independent of reading: a stalled read must never let a
+      // healthy resident's lease lapse.
       this.dispatch({ kind: "tick" });
-      this.runReconcile(false);
+      this.runPass(false);
     }, Math.min(60_000, HEARTBEAT_MS));
     (this.heartbeat as unknown as { unref?: () => void }).unref?.();
-  }
-
-  /** Shut down from outside (tests); the same path an unload takes. */
-  stop(): void {
-    this.setups.length = 0;
-    this.close();
-  }
-
-  private close(): void {
-    this.closed = true;
-    this.stream?.controller.abort();
-    this.stream = null;
-    if (this.heartbeat !== null) clearInterval(this.heartbeat);
-    this.heartbeat = null;
-    this.delivery.close();
-    this.chains.clear();
-    if (this.retry !== null) clearTimeout(this.retry);
-    this.retry = null;
   }
 }
 
@@ -683,19 +626,20 @@ function reporters(): Map<string, Reporter> {
   return (host[REGISTRY] ??= new Map());
 }
 
+/**
+ * Keyed by where writes actually go, not by how the option was spelled: two
+ * setups that land on the same report endpoint for the same resident namespace
+ * must share one writer, or their requests are not serialised at all. The token
+ * decides credentials, not destination, so it is not part of the key.
+ */
+function keyOf(config: Config): string {
+  return [reportURL(config.bridgeUrl).toString(), config.machineId, config.source].join("\n");
+}
+
 /** Shut every live reporter down. Tests use this; nothing in the plugin does. */
 export function stopAllReporters(): void {
   for (const reporter of reporters().values()) reporter.stop();
   reporters().clear();
-}
-
-/**
- * Keyed by where writes actually go, not by how the option was spelled: two
- * setups that land on the same report endpoint for the same resident namespace
- * must share one writer, or their requests are not serialised at all.
- */
-function keyOf(config: Config): string {
-  return [reportURL(config.bridgeUrl).toString(), config.machineId, config.source].join("\n");
 }
 
 export const AgentMachiReporter = {
@@ -712,15 +656,18 @@ export const AgentMachiReporter = {
       reporter = new Reporter(config);
       registry.set(key, reporter);
     }
+    const owner = reporter;
     const registration: Registration = {
       directory: typeof ctx?.location?.directory === "string" ? ctx.location.directory : null,
       ctx,
     };
-    reporter.register(registration);
+    owner.register(registration);
 
     return () => {
-      reporter.unregister(registration);
-      if (!reporter.live) registry.delete(key);
+      owner.unregister(registration);
+      // Remove the entry only if this reporter is the one still registered and
+      // it is gone: a duplicate cleanup must not evict its replacement.
+      if (!owner.live && registry.get(key) === owner) registry.delete(key);
     };
   },
 };

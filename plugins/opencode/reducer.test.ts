@@ -153,8 +153,18 @@ test("an authoritative not-found removes the resident at once", () => {
   created(state);
   const actions = reduce(state, { kind: "reconcile", sessionID: "ses_a", view: null, missing: true });
   assert.deepEqual(actions, [{ type: "delete", sessionID: "ses_a" }]);
-  // And it stays gone: a later read cannot resurrect it.
-  assert.deepEqual(reduce(state, { kind: "reconcile", sessionID: "ses_a", view: { ...session("ses_a"), executing: true } }), []);
+  assert.deepEqual(liveSessions(state), []);
+  // A read that proves the session live again is a new run: it is reported once
+  // and carries no prompt state from before the removal.
+  const revived = reduce(state, {
+    kind: "reconcile",
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+    permissions: [],
+  });
+  assert.deepEqual(revived, [
+    { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
+  ]);
 });
 
 test("a rename is cached so the next transition carries it", () => {
@@ -212,8 +222,10 @@ test("a session that runs again after deletion is reported again", () => {
   reduce(state, { kind: "deleted", sessionID: "ses_a" });
   // Revival requires a fresh non-archived metadata read, not a bare event.
   const again = reduce(state, {
-    kind: "discovered",
-    sessions: [{ id: "ses_a", title: "ses_a", directory: "/tmp/project", executing: true }],
+    kind: "reconcile",
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+    permissions: [],
   });
   assert.deepEqual(again, [
     { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
@@ -287,9 +299,19 @@ test("a late start does not revive a confirmed removal", () => {
   // The event may belong to a row that is still archived: only a fresh view
   // may bring the resident back.
   assert.deepEqual(reduce(state, { kind: "execution-started", sessionID: "ses_a" }), []);
+  // Nor does a second admission: only a read can prove the row is live.
+  assert.deepEqual(
+    reduce(state, {
+      kind: "discovered",
+      sessions: [{ id: "ses_a", title: "ses_a", directory: "/tmp/project", executing: true }],
+    }),
+    [],
+  );
   const revived = reduce(state, {
-    kind: "discovered",
-    sessions: [{ id: "ses_a", title: "ses_a", directory: "/tmp/project", executing: true }],
+    kind: "reconcile",
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+    permissions: [],
   });
   assert.deepEqual(revived, [
     { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },

@@ -196,3 +196,22 @@ test("drain after close resolves instead of starting a keep-alive", async () => 
   await delivery.drain();
   assert.ok(true);
 });
+
+test("alternating states do not reset the outage backoff", async () => {
+  let requests = 0;
+  const fetch = (async () => {
+    requests += 1;
+    return new Response("nope", { status: 503 });
+  }) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 10 });
+  // Flip between two states under a sustained outage. Each flip is "new work",
+  // but the outage has not changed, so the delay must keep growing.
+  for (let i = 0; i < 8; i += 1) {
+    delivery.enqueue({ type: "post", sessionID: "ses_a", status: i % 2 === 0 ? "working" : "idle" });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+  // Eight flips in ~half a second: with exponential pacing only the first few
+  // requests can go out. Without it, every flip would be attempted at once.
+  assert.ok(requests <= 5, `backoff was respected (${requests} requests)`);
+  delivery.close();
+});

@@ -1,7 +1,10 @@
 /**
  * Reporter wiring tests: these go through `setup()` with a fake context, so
- * handoff, bootstrap retry and deferred reads are exercised in the shape the
- * plugin actually runs in, not just in the reducer.
+ * handoff, bootstrap retry, removal and location-scoped reads are exercised in
+ * the shape the plugin actually runs in.
+ *
+ * Every assertion here is on an observable effect — a bridge write or the
+ * number of live subscriptions — never on an internal field.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -20,30 +23,46 @@ interface World {
   rows: Map<string, Row>;
   bus: Array<(event: any) => void>;
   emit(event: any): void;
+  /** Every bridge request the plugin made, in order. */
+  writes: Array<{ method: string; id: string; status?: string; name?: string }>;
+  /** Live event subscriptions: a leak shows up as a count above one. */
+  subscriptions: number;
 }
 
 function world(): World {
   const rows = new Map<string, Row>();
   const bus: Array<(event: any) => void> = [];
-  return { rows, bus, emit: (event) => bus.forEach((listener) => listener(event)) };
+  const writes: World["writes"] = [];
+  const state = {
+    rows,
+    bus,
+    writes,
+    subscriptions: 0,
+    emit: (event: any) => bus.forEach((listener) => listener(event)),
+  };
+  return state;
 }
 
 interface Options {
   bridgeUrl?: string;
   machineId?: string;
   listFails?: number;
-  permissions?: (sessionID: string) => string[];
   directory?: string;
+  /** Permission ids to report for a session. */
+  permissions?: (sessionID: string, calls: number) => string[] | null;
+  /** Resolve a `get` only when released, to hold a read open. */
+  gate?: { release: () => void } | null;
 }
 
 function makeCtx(shared: World, opts: Options = {}) {
   const directory = opts.directory ?? "/tmp/project";
   let listFails = opts.listFails ?? 0;
-  const calls = { list: 0, get: 0, permit: 0 };
+  let permitCalls = 0;
+  const calls = { list: 0, get: 0 };
   const ctx: any = {
     location: { directory },
     options: {
-      bridgeUrl: opts.bridgeUrl ?? "http://127.0.0.1:9/",
+      bridgeUrl: opts.bridgeUrl ?? "http://127.0.0.1:9/town",
       machineId: opts.machineId ?? "mini",
     },
     session: {
@@ -57,6 +76,12 @@ function makeCtx(shared: World, opts: Options = {}) {
       },
       async get({ sessionID }: { sessionID: string }) {
         calls.get += 1;
+        if (opts.gate) {
+          await new Promise<void>((resolve) => {
+            const gate = opts.gate as { release: () => void };
+            gate.release = () => resolve();
+          });
+        }
         const row = shared.rows.get(sessionID);
         if (!row) throw Object.assign(new Error("not found"), { _tag: "Session.NotFoundError" });
         return row;
@@ -64,94 +89,155 @@ function makeCtx(shared: World, opts: Options = {}) {
     },
     permission: {
       async list({ sessionID }: { sessionID: string }) {
-        calls.permit += 1;
-        return (opts.permissions?.(sessionID) ?? []).map((id) => ({ id }));
+        permitCalls += 1;
+        if (!opts.permissions) return [];
+        const ids = opts.permissions(sessionID, permitCalls);
+        // A null stands for an unreadable answer, which must not clear a prompt.
+        return ids === null ? { unexpected: true } : ids.map((id) => ({ id }));
       },
     },
     event: {
       async *subscribe({ signal }: { signal?: AbortSignal }) {
+        shared.subscriptions += 1;
         const queue: any[] = [];
         shared.bus.push((event) => queue.push(event));
-        while (!signal?.aborted) {
-          const next = queue.shift();
-          if (next) {
-            yield next;
-            continue;
+        try {
+          while (!signal?.aborted) {
+            const next = queue.shift();
+            if (next) {
+              yield next;
+              continue;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 10));
           }
-          await new Promise((resolve) => setTimeout(resolve, 10));
+        } finally {
+          shared.subscriptions -= 1;
         }
       },
     },
   };
-  return { ctx, calls, directory };
+  return { ctx, calls, permits: () => permitCalls };
 }
-
-/** A fetch that records nothing and always succeeds. */
-const okFetch = (async () =>
-  new Response('{"ok":true}', { status: 200 })) as unknown as typeof globalThis.fetch;
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function loadPlugin() {
+/** Wait until a condition holds, or fail with what was observed. */
+async function until(label: string, check: () => boolean, ms = 4_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await wait(20);
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
+let fetchCount = 0;
+/** A fetch that records bridge writes and always succeeds. */
+function installFetch(shared: World): void {
+  globalThis.fetch = (async (input: any, init: any = {}) => {
+    fetchCount += 1;
+    const url = new URL(String(input));
+    const method = String(init.method ?? "GET");
+    const id = method === "DELETE" ? (url.searchParams.get("id") ?? "") : (JSON.parse(String(init.body)).id ?? "");
+    const body = method === "DELETE" ? null : JSON.parse(String(init.body));
+    shared.writes.push({ method, id, status: body?.status, name: body?.name });
+    return new Response('{"ok":true}', { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+}
+
+async function loadPlugin(): Promise<any> {
   const mod: any = await import("./index.ts");
-  mod.stopAllReporters(); // each test starts from an empty registry
+  mod.stopAllReporters();
   return mod.default;
 }
 
-test("a second setup keeps the first location's state and reports its own", async () => {
+test("a second location keeps the first's resident renewing, and unloading it re-elects", async () => {
   const plugin = await loadPlugin();
   const shared = world();
+  installFetch(shared);
 
   const a = makeCtx(shared, { directory: "/tmp/a" });
   const stopA = await plugin.setup(a.ctx);
-  assert.ok(typeof stopA === "function");
+  assert.equal(typeof stopA, "function");
+  // An idle resident that only A can see.
+  shared.rows.set("ses_idle", {
+    id: "ses_idle",
+    title: "idle-a",
+    location: { directory: "/tmp/a" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_idle" } });
+  await until("A reports its resident", () => shared.writes.some((w) => w.id === "mini-ses_idle"));
+  const before = shared.writes.length;
 
-  const b = makeCtx(shared, { directory: "/tmp/b" });
+  const b = makeCtx(shared, { directory: "/tmp/b", bridgeUrl: "http://127.0.0.1:9/town/" });
   const stopB = await plugin.setup(b.ctx);
+  // One shared writer: a second location must not open a second subscription.
+  await wait(50);
+  assert.equal(shared.subscriptions, 1, "one live subscription, not one per setup");
 
-  // Both are registered on one reporter: unloading B must not stop A.
+  const idle = shared.rows.get("ses_idle");
+  assert.ok(idle && idle.title === "idle-a", "the first location's row is still there");
   stopB?.();
-  await wait(20);
+  await wait(50);
+  assert.equal(shared.subscriptions, 1, "a survivor took the stream over");
+  assert.ok(shared.writes.length >= before, "reporting continued");
   stopA?.();
+  await wait(50);
+  assert.equal(shared.subscriptions, 0, "the last unload closed the stream");
 });
 
-test("a failed bootstrap is retried by the next pass", async () => {
+test("a failed bootstrap is retried and the executing session still appears", async () => {
   const plugin = await loadPlugin();
   const shared = world();
-  // One executing session that only a successful list read can find.
+  installFetch(shared);
+  // Only a successful list read can find this one.
   shared.rows.set("ses_boot", {
     id: "ses_boot",
     title: "boot",
-    location: { directory: "/tmp/proj" },
+    location: { directory: "/tmp/project" },
     time: { created: Date.now(), busy: Date.now() },
   });
+
   const one = makeCtx(shared, { listFails: 1 });
   const stop = await plugin.setup(one.ctx);
-  // The first pass fails; a timer retries it without waiting for a reconnect.
-  await wait(2600);
-  assert.ok(one.calls.list >= 2, `bootstrap was retried (list calls: ${one.calls.list})`);
+  await until(
+    "the retried bootstrap discovers the session",
+    () => shared.writes.some((w) => w.id === "mini-ses_boot" && w.status === "working"),
+    8_000,
+  );
+  assert.ok(one.calls.list >= 2, `list was retried (${one.calls.list})`);
   stop?.();
 });
 
-test("cleanup is idempotent and never evicts a replacement", async () => {
+test("a duplicate cleanup never evicts the replacement reporter", async () => {
   const plugin = await loadPlugin();
   const shared = world();
+  installFetch(shared);
+
   const a = makeCtx(shared);
   const stopA = await plugin.setup(a.ctx);
   stopA?.();
-  stopA?.(); // a duplicate cleanup must be harmless
+  stopA?.(); // duplicate cleanup, before anything replaces it
+
   const b = makeCtx(shared);
   const stopB = await plugin.setup(b.ctx);
-  assert.ok(typeof stopB === "function");
+  // A third setup must join B, not create a second writer beside it.
+  const c = makeCtx(shared);
+  const stopC = await plugin.setup(c.ctx);
+  await wait(50);
+  assert.equal(shared.subscriptions, 1, "one reporter, one subscription");
+  stopC?.();
   stopB?.();
 });
 
-test("a read for a session in a location with no setup is skipped", async () => {
+test("a session in a location with no setup is never read from another one", async () => {
   const plugin = await loadPlugin();
   const shared = world();
+  installFetch(shared);
+
   const local = makeCtx(shared, { directory: "/tmp/local" });
   const stop = await plugin.setup(local.ctx);
-  // A session that lives elsewhere: nothing here can describe its prompts.
   shared.rows.set("ses_far", {
     id: "ses_far",
     title: "far",
@@ -159,22 +245,81 @@ test("a read for a session in a location with no setup is skipped", async () => 
     time: { created: Date.now() },
   });
   shared.emit({ type: "session.created", data: { sessionID: "ses_far" } });
-  await wait(60);
-  assert.equal(local.calls.permit, 0, "no prompt read was issued from the wrong location");
+  await until("the foreign session is reported", () =>
+    shared.writes.some((w) => w.id === "mini-ses_far"),
+  );
+  // It is reported, but its prompts are never read: the only setup here lives
+  // in another directory.
+  assert.equal(local.permits(), 0, "no prompt read came from the wrong location");
   stop?.();
 });
 
-test("two spellings of one endpoint share a single reporter", async () => {
+test("an archived session stays gone, and a fresh read is what brings one back", async () => {
   const plugin = await loadPlugin();
   const shared = world();
-  const a = makeCtx(shared, { bridgeUrl: "http://127.0.0.1:9/town" });
-  const b = makeCtx(shared, { bridgeUrl: "http://127.0.0.1:9/town/" });
-  const stopA = await plugin.setup(a.ctx);
-  const stopB = await plugin.setup(b.ctx);
-  // Both setups are alive at once; neither evicts the other.
-  assert.ok(typeof stopA === "function" && typeof stopB === "function");
-  stopB?.();
-  stopA?.();
+  installFetch(shared);
+
+  const ctxh = makeCtx(shared);
+  const stop = await plugin.setup(ctxh.ctx);
+  shared.rows.set("ses_gone", {
+    id: "ses_gone",
+    title: "gone",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_gone" } });
+  await until("it is reported", () => shared.writes.some((w) => w.id === "mini-ses_gone"));
+
+  shared.rows.get("ses_gone")!.time.archived = Date.now();
+  shared.emit({ type: "session.archived", data: { sessionID: "ses_gone" } });
+  await until("the delete lands", () => shared.writes.some((w) => w.method === "DELETE"));
+  const afterDelete = shared.writes.length;
+
+  // A bare event (a rename) must not bring it back: the row is still archived.
+  shared.emit({ type: "session.renamed", data: { sessionID: "ses_gone", title: "revived?" } });
+  await wait(120);
+  assert.equal(
+    shared.writes.slice(afterDelete).filter((w) => w.method === "POST").length,
+    0,
+    "no POST resurrected an archived resident",
+  );
+  stop?.();
 });
 
-export { okFetch };
+test("a prompt read that cannot answer never clears a pending prompt", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  // The first read is unreadable, later ones are a real empty list.
+  const ctx = makeCtx(shared, {
+    permissions: (_sessionID, calls) => (calls === 1 ? null : []),
+  });
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_p", {
+    id: "ses_p",
+    title: "p",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_p" } });
+  await until("it is reported", () => shared.writes.some((w) => w.id === "mini-ses_p"));
+  shared.emit({ type: "permission.asked", data: { sessionID: "ses_p", id: "per_1" } });
+  await until("the prompt blocks it", () =>
+    shared.writes.some((w) => w.id === "mini-ses_p" && w.status === "blocked"),
+  );
+  const blockedCount = shared.writes.filter(
+    (w) => w.id === "mini-ses_p" && w.status === "idle",
+  ).length;
+  // A reconcile pass with an unreadable prompt list must not unblock it.
+  shared.emit({ type: "tick" });
+  await wait(200);
+  assert.equal(
+    shared.writes.filter((w) => w.id === "mini-ses_p" && w.status === "idle").length,
+    blockedCount,
+    "an unreadable list did not clear the prompt",
+  );
+  stop?.();
+});
+
+export { fetchCount };

@@ -68,6 +68,7 @@ const MAX_ATTEMPTS = 8;
 
 interface Pending {
   write: Write;
+  /** Attempts spent on this exact write; a different write starts at zero. */
   attempts: number;
   notBefore: number;
 }
@@ -81,6 +82,8 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
   const inflight = new Map<string, AbortController>();
   let idle: Array<() => void> = [];
   let stopped = false;
+  /** Consecutive failed requests across all writes; reset by any success. */
+  let transportFailures = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   /** When the armed timer fires; 0 when none is armed. */
   let timerDue = 0;
@@ -201,7 +204,11 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     } finally {
       clearTimeout(deadline);
     }
-    if (response.ok) return;
+    if (response.ok) {
+      // The bridge is answering: outage pacing starts over.
+      transportFailures = 0;
+      return;
+    }
     // A rejected write (bad id, wrong token, ingest off) will not be fixed by
     // retrying, but a transient 5xx or a stalled bridge might be.
     if (response.status >= 500) retryOrDrop(sessionID, write, pending);
@@ -212,7 +219,11 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     if (stopped) return;
     const attempts = pending.attempts + 1;
     if (attempts > MAX_ATTEMPTS) return;
-    const backoff = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (attempts - 1));
+    // Two separate budgets. `attempts` bounds one write; `transportFailures`
+    // paces the outage. Without the second, alternating states would reset the
+    // delay on every flip and hammer a bridge that is simply down.
+    transportFailures += 1;
+    const backoff = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (transportFailures - 1));
     const notBefore = Date.now() + backoff;
     const queued = queue.get(sessionID);
     if (queued) {

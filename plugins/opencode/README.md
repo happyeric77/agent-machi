@@ -101,7 +101,13 @@ plugin stays silent and the session works exactly as before.
 - Closing a tab or quitting the TUI reports nothing, and it does not stop
   renewals while the server that owns that session is still running. The
   resident expires only after renewals stop: 15 minutes of silence at the
-  bridge's default TTL. Only deleting or archiving a session sends `DELETE`.
+  bridge's default TTL. `DELETE` is sent for a delete event, an archive event,
+  or an authoritative absence (a not-found or archived read of a tracked
+  session); those are queued like any other write, not sent instantly.
+- A reload only reseeds sessions that are executing. A resident that was
+  tracked and then went idle is not re-added by the replacement reporter; it
+  returns when an event for that session arrives, and until then it keeps
+  whatever the bridge last held and expires at TTL.
 
 ## What the plugin context cannot read
 
@@ -155,8 +161,12 @@ anything.
 
 ```sh
 node --experimental-strip-types --test plugins/opencode/*.test.ts
+npm run typecheck:plugin
 ```
 
-`reducer.ts` is pure: it takes normalized events and returns report actions, so
-the state model is tested without OpenCode or a bridge. `delivery.ts` is tested
-against a fake `fetch`.
+`reducer.ts` is pure: it takes normalized observations and returns report
+actions, so the state model is tested without OpenCode or a bridge.
+`delivery.ts` is tested against a fake `fetch`. `setup.test.ts` goes through
+`setup()` with a fake context and asserts on bridge writes and live
+subscription counts, so handoff, bootstrap retry and removal are exercised in
+the shape the plugin actually runs in.
