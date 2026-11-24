@@ -86,12 +86,19 @@ plugin stays silent and the session works exactly as before.
 - A session's latest state always wins over one still queued: a session that
   comes back after a delete is reported again. Writes go out one at a time and
   the queue is short, but delivery is best-effort: a write can be dropped after
-  its retry budget, and outage backoff is shared by the whole endpoint.
+  its retry budget, and outage backoff is shared by the whole endpoint — every
+  machine slug aimed at the same bridge shares one request lane and one outage
+  window, and each queued write keeps its own reporter's token and id.
 - Write ordering is not guaranteed across a proxy. An unload aborts anything
   still on the wire, but a proxy that already buffered an earlier POST can
   still forward it after a newer DELETE reaches the bridge, and the bridge has
   no sequence check. If a stale write must never win, that needs a write
   generation enforced at the bridge; aborting the client is not enough.
+- A prompt event whose admission read fails is kept, not dropped: it is applied
+  once the session is genuinely admitted, and discarded if the session turns out
+  not to exist. It can admit a session this reporter has never seen, but it can
+  never revive one it removed — only a lifecycle event, backed by a fresh
+  non-archived read, does that.
 - For a resident this reporter is tracking, a `Session.NotFoundError`, an
   archived read, or an archived list row queues a `DELETE` instead of waiting
   out the bridge's TTL; it does not require a delete or archive event. A session it never tracked is not

@@ -42,7 +42,13 @@ export interface State {
 
 export type Input =
   | { kind: "discovered"; sessions: readonly SessionView[] }
-  | { kind: "renamed"; sessionID: string; title: string | null }
+  | {
+      kind: "renamed";
+      sessionID: string;
+      title: string | null;
+      /** Used when the title is cleared, so the name falls back like admission. */
+      directory?: string | null;
+    }
   | { kind: "execution-started"; sessionID: string }
   | { kind: "execution-ended"; sessionID: string }
   | { kind: "permission-asked"; sessionID: string; requestID: string }
@@ -171,7 +177,11 @@ export function reduce(state: State, input: Input): Action[] {
     case "renamed": {
       const tracked = state.sessions.get(input.sessionID);
       if (!tracked) return out;
-      const name = displayName({ id: input.sessionID, title: input.title });
+      const name = displayName({
+        id: input.sessionID,
+        title: input.title,
+        directory: input.directory ?? null,
+      });
       // The bridge refreshes metadata only when the status changes, so this
       // only caches the name: the next accepted transition carries it.
       if (name !== "") tracked.name = name;

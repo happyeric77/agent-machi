@@ -470,3 +470,84 @@ test("a failed seed on reconnect is retried after a successful startup", async (
 });
 
 export { fetchCount };
+
+test("a prompt whose admission read failed is kept, not dropped", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  // A `get` that fails once per session, so the first prompt admission fails
+  // transiently and the session is really there afterwards.
+  let failures = 2;
+  const base = makeCtx(shared);
+  const flaky = {
+    ...base.ctx,
+    session: {
+      ...base.ctx.session,
+      async get({ sessionID }: { sessionID: string }) {
+        shared.rows.get(sessionID);
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error("get is briefly down");
+        }
+        const row = shared.rows.get(sessionID);
+        if (!row) throw Object.assign(new Error("not found"), { _tag: "Session.NotFoundError" });
+        return row;
+      },
+    },
+  };
+
+  shared.rows.set("ses_form", {
+    id: "ses_form",
+    title: "form",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  const stop = await plugin.setup(flaky);
+  // Both prompt events arrive while `get` is failing.
+  shared.emit({ type: "form.created", data: { form: { id: "frm_1", sessionID: "ses_form" } } });
+  await wait(200);
+  // Now the lifecycle event admits the session, and the held form must apply.
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_form" } });
+  await until(
+    "the held form is applied after admission",
+    () => shared.writes.some((w) => w.status === "blocked"),
+    6_000,
+  );
+  stop?.();
+});
+
+test("a stale form cannot revive a resident admitted only from the list", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  shared.rows.set("ses_seeded", {
+    id: "ses_seeded",
+    title: "seeded",
+    location: { directory: "/tmp/project" },
+    // Executing, so bootstrap admits it from the list alone.
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  const ctx = makeCtx(shared, { listFails: 0 });
+  const stop = await plugin.setup(ctx.ctx);
+  await until("the list admitted it", () => shared.writes.some((w) => w.id === "mini-ses_seeded"));
+
+  // Archive it: the resident goes away.
+  shared.rows.get("ses_seeded")!.time.archived = Date.now();
+  shared.emit({ type: "session.archived", data: { sessionID: "ses_seeded" } });
+  await until("deleted", () => shared.writes.some((w) => w.method === "DELETE"));
+  const afterDelete = shared.writes.length;
+
+  // The row is live again, but no lifecycle event has arrived: only a stale
+  // form that was created before the archive.
+  delete shared.rows.get("ses_seeded")!.time.archived;
+  shared.emit({ type: "form.created", data: { form: { id: "frm_old", sessionID: "ses_seeded" } } });
+  await wait(600);
+  assert.deepEqual(
+    shared.writes.slice(afterDelete).map((w) => w.method),
+    [],
+    "a stale form did not recreate the resident",
+  );
+  stop?.();
+});

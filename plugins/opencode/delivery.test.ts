@@ -244,3 +244,65 @@ test("outage pacing is endpoint-wide, not per resident", async () => {
   assert.ok(stamps[0] - started < 300);
   delivery.close();
 });
+
+test("a shared lane sends each write with its own reporter's identity", async () => {
+  const seen: string[] = [];
+  const held: Array<() => void> = [];
+  const fetch = (async (input: any, init: any = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const url = new URL(String(input));
+    seen.push(body.id ?? url.searchParams.get("id") ?? "");
+    // Hold the first response so both writes start before either settles.
+    if (seen.length === 1) await new Promise<void>((resolve) => held.push(resolve));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  const lane = `http://127.0.0.1:9/lane${++endpoint}/`;
+  const alpha = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "alpha" });
+  const beta = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "beta" });
+  alpha.enqueue({ type: "post", sessionID: "a", status: "working" });
+  beta.enqueue({ type: "post", sessionID: "b", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  for (const release of held) release();
+  await alpha.drain();
+  await beta.drain();
+  assert.deepEqual(seen.sort(), ["alpha-a", "beta-b"]);
+  alpha.close();
+  beta.close();
+});
+
+test("unloading one reporter does not strand a survivor's queued write", async () => {
+  const calls: string[] = [];
+  const fetch = (async (input: any, init: any = {}) => {
+    calls.push(init.method ?? "GET");
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  const lane = `http://127.0.0.1:9/lane${++endpoint}/`;
+  const alpha = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "alpha" });
+  const beta = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "beta" });
+  beta.enqueue({ type: "post", sessionID: "b", status: "working" });
+  alpha.close();
+  await beta.drain();
+  assert.deepEqual(calls, ["POST"], "the survivor's write still went out");
+  beta.close();
+});
+
+test("closing one machine id never aborts a longer machine id's write", async () => {
+  const aborted: string[] = [];
+  const held: Array<() => void> = [];
+  const fetch = (async (_input: any, init: any = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    await new Promise<void>((resolve) => held.push(resolve));
+    if (init.signal?.aborted) aborted.push(body.id);
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  const lane = `http://127.0.0.1:9/lane${++endpoint}/`;
+  const short = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "mini" });
+  const long = createDelivery({ ...base(), bridgeUrl: new URL(lane), fetch, machineId: "mini-lab" });
+  long.enqueue({ type: "post", sessionID: "b", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  short.close();
+  for (const release of held) release();
+  await long.drain();
+  assert.deepEqual(aborted, [], "mini-lab's request was not aborted by mini's unload");
+  long.close();
+});
