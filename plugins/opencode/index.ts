@@ -111,6 +111,16 @@ function isArchived(row: SessionRow): boolean {
 /** Returned when a read takes longer than its deadline. */
 const TIMEOUT = Symbol("timeout");
 
+/**
+ * What an admission attempt established:
+ * - `admitted`: the session is a resident now.
+ * - `refused`: a read proved it is absent/archived, or a prompt event tried to
+ *   revive a removed resident. Nothing may be parked.
+ * - `unknown`: the read failed or stalled. A prompt must be kept, because the
+ *   session may well exist and the event has no other way back.
+ */
+type Admission = "admitted" | "refused" | "absent" | "unknown";
+
 async function within<T>(work: Promise<T>, ms = READ_TIMEOUT_MS): Promise<T | typeof TIMEOUT> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const late = new Promise<typeof TIMEOUT>((resolve) => {
@@ -422,23 +432,28 @@ class Reporter {
    * no other way back), but it may not revive one this reporter removed, because
    * a form that outlived its session would bring the resident back blocked.
    */
-  private async admit(sessionID: string, fromPrompt = false): Promise<boolean> {
-    if (this.state.sessions.has(sessionID)) return true;
+  private async admit(sessionID: string, fromPrompt = false): Promise<Admission> {
+    if (this.state.sessions.has(sessionID)) return "admitted";
     // A prompt event never revives a session this reporter already removed;
-    // only a lifecycle event (which rereads the row) may.
-    if (fromPrompt && this.seen.has(sessionID)) return false;
+    // only a lifecycle event (which rereads the row) may. This is a refusal,
+    // not a transient failure, so nothing may be parked for later.
+    if (fromPrompt && this.seen.has(sessionID)) return "refused";
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0] ?? null;
     const read = await this.readSession(sessionID, directory);
-    if (read.kind === "unknown") return false;
+    if (read.kind === "unknown") return "unknown";
     // An absent row is not a resident, so nothing is admitted and nothing is
     // deleted on behalf of an event: only a pass removes a resident, and only
-    // after a read proved it gone.
-    if (read.kind === "absent") return false;
+    // after a read proved it gone. Any parked prompt for it is dead too, even
+    // when there is no tracked resident to remove.
+    if (read.kind === "absent") {
+      this.discardHeld(sessionID);
+      return "absent";
+    }
     // The owner is passed on so a context that retired between the read and
     // this line cannot publish the row through the survivor.
     this.applyRead(sessionID, read, undefined, owner ?? undefined);
-    return true;
+    return this.state.sessions.has(sessionID) ? "admitted" : "refused";
   }
 
   /**
@@ -488,6 +503,7 @@ class Reporter {
       // failing must not keep renewing because the list is the only source
       // left: that is exactly the state a delete would leave behind.
       if (isArchived(row)) {
+        this.discardHeld(row.id);
         if (tracked) {
           this.directories.delete(row.id);
           this.dispatch({ kind: "reconcile", sessionID: row.id, view: null, missing: true });
@@ -520,7 +536,12 @@ class Reporter {
       this.seen.add(view.id);
       views.push(view);
     }
-    if (views.length > 0) this.dispatch({ kind: "discovered", sessions: views });
+    if (views.length === 0) return;
+    this.dispatch({ kind: "discovered", sessions: views });
+    // A prompt parked behind a failing `get` is released here: the list just
+    // admitted the session, and for a form there is no read that could recover
+    // the block later.
+    for (const view of views) this.releaseHeld(view.id);
   }
 
   /** One session's ground truth: execution, name, pending prompts. */
@@ -714,10 +735,12 @@ class Reporter {
             // very first prompt would be dropped. A fresh read decides whether
             // the session exists at all; a read that merely failed keeps the
             // event for the next pass instead of losing it.
-            if (!(await this.admit(sessionID, true))) {
+            const admission = await this.admit(sessionID, true);
+            if (admission === "unknown") {
               this.holdPrompt({ kind: "permission-asked", sessionID, requestID });
               return;
             }
+            if (admission !== "admitted") return;
             this.dispatch({ kind: "permission-asked", sessionID, requestID });
           });
         }
@@ -726,8 +749,14 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
           const sessionID = data.sessionID;
           const requestID = data.requestID;
-          this.dropHeld(sessionID, (input) => input.kind === "permission-asked" && input.requestID === requestID);
           this.enqueue(async () => {
+            // Dropped in the queue, not on arrival: a parked event whose
+            // admission read is still in flight must be cancelled before that
+            // task resumes and dispatches it.
+            this.dropHeld(
+              sessionID,
+              (input) => input.kind === "permission-asked" && input.requestID === requestID,
+            );
             this.dispatch({ kind: "permission-replied", sessionID, requestID });
           });
         }
@@ -743,10 +772,12 @@ class Reporter {
             // never revive a removed resident: `readSession` reports an
             // archived or absent row as absent, and absent admits nothing.
             const input = { kind: "form-created" as const, sessionID, formID };
-            if (!(await this.admit(sessionID, true))) {
+            const admission = await this.admit(sessionID, true);
+            if (admission === "unknown") {
               this.holdPrompt(input);
               return;
             }
+            if (admission !== "admitted") return;
             this.dispatch(input);
           });
         }
@@ -758,10 +789,11 @@ class Reporter {
           const sessionID = data.sessionID;
           const formID = data.id;
           const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
-          // A form answered before its session was admitted leaves nothing to
-          // report: the held open event and its terminal event cancel out.
-          this.dropHeld(sessionID, (input) => input.kind === "form-created" && input.formID === formID);
           this.enqueue(async () => {
+            // Same ordering rule as a permission reply: a form answered before
+            // its session was admitted leaves nothing to report, and the drop
+            // must happen before the parked admission task can resume.
+            this.dropHeld(sessionID, (input) => input.kind === "form-created" && input.formID === formID);
             this.dispatch({ kind, sessionID, formID });
           });
         }
