@@ -266,7 +266,7 @@ class Reporter {
    * because an event cannot be re-derived and a missing transition is worse than
    * a possibly stale one.
    */
-  private readonly pendingExec = new Map<string, "working" | "ended">();
+  private readonly pendingExec = new Map<string, { kind: "working" | "ended"; at: number }>();
   /**
    * Prompt opens that lost to an in-flight prompt read, kept per session until a
    * read answers for them. A failed read cannot disprove an ask the host told us
@@ -274,6 +274,17 @@ class Reporter {
    * recover it at all.
    */
   private readonly pendingPrompts = new Map<string, Input[]>();
+  /**
+   * Forget work parked for a session that is gone. A parked event describes a
+   * resident; once the resident is removed, replaying it would attach an old
+   * transition or an old prompt to whatever incarnation comes next.
+   */
+  private forget(sessionID: string): void {
+    this.pendingExec.delete(sessionID);
+    this.pendingPrompts.delete(sessionID);
+    this.pendingCreate.delete(sessionID);
+    this.discardHeld(sessionID);
+  }
   private observation = 0;
 
   private nextObservation(): number {
@@ -298,11 +309,19 @@ class Reporter {
    * evidence left, so it is published rather than dropped.
    */
   private flushPendingExec(sessionID: string): void {
-    const kind = this.pendingExec.get(sessionID);
-    if (!kind) return;
+    const parked = this.pendingExec.get(sessionID);
+    if (!parked) return;
     this.pendingExec.delete(sessionID);
+    // A newer observation has already spoken for this session's execution
+    // state, so the parked event is older than the truth: keep the truth.
+    if ((this.observed.get(sessionID) ?? 0) > parked.at) return;
+    // A resident that no longer exists has nothing to receive this event.
+    if (!this.state.sessions.has(sessionID)) return;
+    // The fallback is itself an observation: recording it keeps an older queued
+    // event from overwriting what this one just published.
+    this.observed.set(sessionID, parked.at);
     this.dispatch(
-      kind === "working"
+      parked.kind === "working"
         ? { kind: "execution-started", sessionID }
         : { kind: "execution-ended", sessionID },
     );
@@ -332,7 +351,16 @@ class Reporter {
     const waiting = this.pendingPrompts.get(sessionID);
     if (!waiting) return;
     this.pendingPrompts.delete(sessionID);
-    for (const input of waiting) this.dispatch(input);
+    for (const input of waiting) {
+      // The answer may already have arrived while this prompt was parked. Its
+      // own reply task is queued behind unrelated work, but the answer is
+      // already a fact: reporting the block here would be a status the user
+      // already dismissed.
+      const key = Reporter.heldKey(input);
+      if (key !== null && this.isAnswered(key)) continue;
+      if (!this.state.sessions.has(sessionID)) continue;
+      this.dispatch(input);
+    }
   }
 
   private recheck(sessionID: string): void {
@@ -646,12 +674,9 @@ class Reporter {
     if ((this.observed.get(sessionID) ?? 0) > startedAt) return;
     if (read.kind === "absent") {
       this.directories.delete(sessionID);
-      this.discardHeld(sessionID);
-      // The read answered for execution too: the session is gone, so an event
-      // still waiting on it must not be applied to a resident that no longer
-      // exists.
-      this.pendingExec.delete(sessionID);
-      this.pendingCreate.delete(sessionID);
+      // The read answered for everything: a parked event or prompt describes a
+      // resident that no longer exists and must not survive to its revival.
+      this.forget(sessionID);
       this.removed.add(sessionID);
       this.observed.set(sessionID, startedAt);
       this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
@@ -739,10 +764,7 @@ class Reporter {
       // Absence proves the session is gone, so a prompt that arrives later must
       // not be what brings it back — even though this reporter never admitted
       // it and therefore has no resident to delete.
-      this.discardHeld(sessionID);
-      this.dropPendingPrompts(sessionID);
-      this.pendingExec.delete(sessionID);
-      this.pendingCreate.delete(sessionID);
+      this.forget(sessionID);
       this.removed.add(sessionID);
       return "absent";
     }
@@ -803,7 +825,7 @@ class Reporter {
       // left: that is exactly the state a delete would leave behind.
       if (isArchived(row)) {
         this.pendingCreate.delete(row.id);
-        this.discardHeld(row.id);
+        this.forget(row.id);
         this.removed.add(row.id);
         if (tracked) {
           if ((this.observed.get(row.id) ?? 0) > pageAt) continue;
@@ -893,7 +915,11 @@ class Reporter {
     const locationDirectory = read.kind === "row" ? (read.row.location?.directory ?? null) : directory;
     const location = this.registrationFor(locationDirectory);
     if (!location) {
-      this.applyRead(sessionID, read, undefined, owner, startedAt);
+      // No live setup serves this session's location: this reporter cannot read
+      // its prompts at all. Waiting for a reader that may never come back would
+      // strand a parked ask forever, so it is treated as an inconclusive prompt
+      // read and the ask is applied.
+      this.applyRead(sessionID, read, null, owner, startedAt);
       return;
     }
     const promptsStartedAt = this.nextObservation();
@@ -987,13 +1013,14 @@ class Reporter {
    * be applied after that location unloaded.
    */
   private queueSeedPage(pass: number, owner: Registration, cursor: string | null, page: number): void {
-    // Taken before the page is requested: this page cannot know about an
-    // archive or rename that arrives while it is in flight, so those events must
-    // outrank it. Stamping on arrival of the response would let a stale page
-    // suppress them.
-    const pageAt = this.nextObservation();
     this.enqueue(async () => {
       if (!this.alive(pass)) return this.finishPass(pass);
+      // Taken immediately before the request, inside the task: the page cannot
+      // know about an archive or rename that arrives while it is in flight, so
+      // those events must outrank it. Taking it when the step was queued would
+      // make the page claim to be older than work that ran before it ever asked,
+      // and an archived row it returned would then be dismissed as stale.
+      const pageAt = this.nextObservation();
       const listed = await this.listPage(owner, cursor);
       if (!this.alive(pass) || this.retired(owner)) return this.finishPass(pass);
       if (listed === null) {
@@ -1119,10 +1146,14 @@ class Reporter {
               return;
             }
             if (raced) {
+              // Only a resident can receive a parked transition. A child or an
+              // absent row was refused above, and parking for it would leak an
+              // entry nothing will ever apply.
+              if (!this.state.sessions.has(sessionID)) return;
               // Hold the event until a read answers for the session. If every
               // recheck fails, flushPendingExec applies it: a lost transition is
               // worse than a possibly stale one.
-              this.pendingExec.set(sessionID, "working");
+              this.pendingExec.set(sessionID, { kind: "working", at });
               this.recheck(sessionID);
               return;
             }
@@ -1147,7 +1178,8 @@ class Reporter {
               return;
             }
             if (raced) {
-              this.pendingExec.set(sessionID, "ended");
+              if (!this.state.sessions.has(sessionID)) return;
+              this.pendingExec.set(sessionID, { kind: "ended", at });
               this.recheck(sessionID);
               return;
             }
@@ -1281,10 +1313,9 @@ class Reporter {
             // The directory entry is what routes later reads; a removed session
             // must not keep one.
             this.directories.delete(sessionID);
-            this.discardHeld(sessionID);
-            // A failed create for this id is dead too: otherwise a later idle
-            // list row would admit a session the reporter saw removed.
-            this.pendingCreate.delete(sessionID);
+            // Everything parked for this id is dead, including a failed create:
+            // otherwise a later list row or revival would carry it forward.
+            this.forget(sessionID);
             // Remembered even for an id this reporter never admitted: a later
             // stale prompt must not be the event that revives it.
             this.removed.add(sessionID);
