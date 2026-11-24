@@ -148,3 +148,31 @@ test("a resident id the bridge would reject is never sent", async () => {
   await delivery.drain();
   assert.equal(calls.length, 0);
 });
+
+test("a state that arrives while a delete is in flight survives", async () => {
+  let release: (() => void) | null = null;
+  const calls: string[] = [];
+  const fetch = async (_input: any, init: any = {}) => {
+    calls.push(init.method ?? "GET");
+    if (init.method === "DELETE") await new Promise<void>((resolve) => (release = resolve));
+    return new Response("{}", { status: 200 });
+  };
+  const delivery = createDelivery({ ...base, fetch: fetch as unknown as typeof globalThis.fetch });
+  delivery.enqueue({ type: "delete", sessionID: "ses_a" });
+  // Let the DELETE start, then reactivate the resident while it is in flight.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  release?.();
+  await delivery.drain();
+  assert.deepEqual(calls, ["DELETE", "POST"]);
+});
+
+test("close stops the writer without keeping the process alive", async () => {
+  const { calls, fetch } = recorder(() => "throw");
+  const delivery = createDelivery({ ...base, fetch });
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  delivery.close();
+  const before = calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(calls.length, before, "no write is attempted after close");
+});

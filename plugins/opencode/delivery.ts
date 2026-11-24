@@ -25,8 +25,10 @@ export type Write =
 
 export interface Delivery {
   enqueue(write: Write): void;
-  /** Resolves once nothing is queued or in flight. Used by tests and unload. */
+  /** Resolves once nothing is queued or in flight. Used by tests. */
   drain(): Promise<void>;
+  /** Drop everything and stop: used on unload, never holds the process open. */
+  close(): void;
 }
 
 /** `<machineId>-<sessionID>`, or null when the result cannot be a valid id. */
@@ -74,12 +76,14 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     if (write.type === "delete") {
       // A delete always supersedes a queued post for the same resident.
       queue.set(write.sessionID, { write, attempts: 0, notBefore: 0 });
-    } else if (existing && existing.write.type === "delete") {
+    } else if (existing && existing.write.type === "delete" && !inflight.has(write.sessionID)) {
       // A resident already removed must not be recreated by a stale post;
       // only its own later events may do that, and those arrive as new writes
       // after the delete has been taken off the queue.
       return;
     } else {
+      // Carrying the attempt count keeps a superseding state behind the same
+      // backoff the failed attempt earned, instead of retrying immediately.
       queue.set(write.sessionID, { write, attempts: existing?.attempts ?? 0, notBefore: existing?.notBefore ?? 0 });
     }
     schedule();
@@ -102,7 +106,9 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
 
   function nextDue(): number | null {
     let due: number | null = null;
-    for (const pending of queue.values()) {
+    for (const [sessionID, pending] of queue) {
+      // An in-flight id cannot be sent again yet; counting its deadline spins.
+      if (inflight.has(sessionID)) continue;
       if (due === null || pending.notBefore < due) due = pending.notBefore;
     }
     return due;
@@ -191,6 +197,15 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
 
   return {
     enqueue,
+    close(): void {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      queue.clear();
+      const waiters = idle;
+      idle = [];
+      for (const resolve of waiters) resolve();
+    },
     drain(): Promise<void> {
       return new Promise((resolve) => {
         if (queue.size === 0 && inflight.size === 0) {
@@ -198,7 +213,7 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
           return;
         }
         // The retry timer is unref'd, so keep the loop alive explicitly while
-        // somebody is waiting, without making the wait impossible to abort.
+        // somebody is waiting. Unload uses close(), which never does this.
         const keepAlive = setInterval(() => undefined, 250);
         idle.push(() => {
           clearInterval(keepAlive);

@@ -16,6 +16,7 @@ import {
 } from "./reducer.ts";
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
+const RECONNECT_MS = 2_000;
 
 export interface ReporterOptions {
   readonly bridgeUrl?: unknown;
@@ -53,6 +54,10 @@ function parseOptions(options: unknown, token: string | undefined) {
   if (bridgeUrl.protocol !== "http:" && bridgeUrl.protocol !== "https:") return null;
   // The bearer token travels in a header; never send it in the clear off-box.
   if (bridgeUrl.protocol !== "https:" && !isLoopback(bridgeUrl)) return null;
+  // An id the bridge cannot accept is a configuration error, not a session
+  // error: reject it before anything is tracked or logged.
+  if (!/^[!-~]+$/.test(raw.machineId) || raw.machineId.includes(":")) return null;
+  if (new TextEncoder().encode(raw.machineId).length > 100) return null;
   return {
     bridgeUrl,
     machineId: raw.machineId,
@@ -101,7 +106,9 @@ export const AgentMachiReporter = {
     // Every event bumps this. A reconcile read takes time, so a value that
     // changed underneath it is stale and must not overwrite the newer event.
     let mutations = 0;
+    let unloaded = false;
     const dispatch = (input: Input, fromRead = false): void => {
+      if (unloaded) return;
       if (!fromRead) mutations += 1;
       try {
         const actions = reduce(state, input);
@@ -109,6 +116,18 @@ export const AgentMachiReporter = {
       } catch {
         // A reducer fault must never surface in the host's event loop.
       }
+    };
+
+    // Events and metadata lookups for one session run in arrival order, so a
+    // deferred lookup can never land after the terminal event it precedes.
+    const chains = new Map<string, Promise<void>>();
+    const enqueueFor = (sessionID: string, work: () => Promise<void> | void): void => {
+      const previous = chains.get(sessionID) ?? Promise.resolve();
+      const next = previous.then(work).catch(() => undefined);
+      chains.set(sessionID, next);
+      void next.then(() => {
+        if (chains.get(sessionID) === next) chains.delete(sessionID);
+      });
     };
 
     const bootSince = Date.now() - uptimeMs();
@@ -135,7 +154,7 @@ export const AgentMachiReporter = {
     };
 
     const reconcile = async (seed: boolean): Promise<void> => {
-      let at = mutations;
+      const at = mutations;
       let rows: SessionRow[];
       try {
         rows = await listRows();
@@ -154,19 +173,33 @@ export const AgentMachiReporter = {
             directory: row.location?.directory ?? null,
             executing: true,
           }));
-        dispatch({ kind: "discovered", sessions: views });
-        // Seeding is our own write; only events during the prompt reads count.
-        at = mutations;
+        // Our own seeding is not a newer event, so it must not invalidate the
+        // membership snapshot taken just above it.
+        dispatch({ kind: "discovered", sessions: views }, true);
       }
       // Pending prompts outlive a turn, so read them for every live resident,
       // not just the ones executing right now. Permission requests have a read
       // endpoint on the plugin context; forms do not on 2.2.6, so form state is
       // event-only and a form that opens and clears between two checks can be
       // missed (see README).
+      // A delete or archive event that never arrived would let a dead resident
+      // renew forever. One authoritative read per tracked session settles it;
+      // a failed read changes nothing.
+      const gone: string[] = [];
+      for (const sessionID of liveSessions(state)) {
+        try {
+          const got: any = await ctx?.session?.get?.({ sessionID });
+          const info = got?.data ?? got;
+          if (!info?.id) gone.push(sessionID);
+        } catch {
+          // Unknown outcome: keep the resident.
+        }
+      }
       const permissions = await readPermissions(liveSessions(state));
       // An event landed while reading; its state is newer than this snapshot.
       if (mutations !== at) return;
       dispatch({ kind: "reconcile", active, permissions }, true);
+      for (const sessionID of gone) dispatch({ kind: "deleted", sessionID });
     };
 
     /** Resolve a session's metadata before reporting anything for it. */
@@ -192,58 +225,89 @@ export const AgentMachiReporter = {
       }
     };
 
+    /** Resolve an unknown session before the event it carries is applied. */
+    const ensure = async (sessionID: string): Promise<void> => {
+      if (state.sessions.has(sessionID)) return;
+      await discover(sessionID);
+    };
+
     const onEvent = (event: any): void => {
       const data = event?.data;
       if (!data) return;
       switch (event?.type) {
         case "session.created":
-          if (typeof data.sessionID === "string") void discover(data.sessionID);
+          if (typeof data.sessionID === "string") {
+            enqueueFor(data.sessionID, () => discover(data.sessionID));
+          }
           return;
         case "session.execution.started":
           if (typeof data.sessionID === "string") {
-            void discover(data.sessionID).then(() => dispatch({ kind: "execution-started", sessionID: data.sessionID }));
+            const { sessionID } = data;
+            enqueueFor(sessionID, async () => {
+              await ensure(sessionID);
+              dispatch({ kind: "execution-started", sessionID });
+            });
           }
           return;
         case "session.execution.succeeded":
         case "session.execution.failed":
         case "session.execution.interrupted":
-          if (typeof data.sessionID === "string") dispatch({ kind: "execution-ended", sessionID: data.sessionID });
+          if (typeof data.sessionID === "string") {
+            const { sessionID } = data;
+            enqueueFor(sessionID, async () => {
+              // A start that never resolved must not swallow the end.
+              await ensure(sessionID);
+              dispatch({ kind: "execution-ended", sessionID });
+            });
+          }
           return;
         case "permission.asked":
           if (typeof data.sessionID === "string" && typeof data.id === "string") {
-            const { sessionID, id } = data;
-            // A prompt can arrive before any execution event for its session;
-            // resolve the session first so the prompt is not dropped.
-            void discover(sessionID).then(() => dispatch({ kind: "permission-asked", sessionID, requestID: id }));
+            const sessionID = data.sessionID;
+            const requestID = data.id;
+            enqueueFor(sessionID, async () => {
+              await ensure(sessionID);
+              dispatch({ kind: "permission-asked", sessionID, requestID });
+            });
           }
           return;
         case "permission.replied":
           if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
-            dispatch({ kind: "permission-replied", sessionID: data.sessionID, requestID: data.requestID });
+            const sessionID = data.sessionID;
+            const requestID = data.requestID;
+            enqueueFor(sessionID, () =>
+              dispatch({ kind: "permission-replied", sessionID, requestID }),
+            );
           }
           return;
         case "form.created": {
           const formID = data?.form?.id;
           const sessionID = data?.form?.sessionID;
           if (typeof sessionID === "string" && typeof formID === "string") {
-            const { sessionID: sid, id } = data.form;
-            void discover(sid).then(() => dispatch({ kind: "form-created", sessionID: sid, formID: id }));
+            enqueueFor(sessionID, async () => {
+              await ensure(sessionID);
+              dispatch({ kind: "form-created", sessionID, formID });
+            });
           }
           return;
         }
         case "form.replied":
         case "form.cancelled":
           if (typeof data.sessionID === "string" && typeof data.id === "string") {
-            dispatch({
-              kind: event.type === "form.replied" ? "form-replied" : "form-cancelled",
-              sessionID: data.sessionID,
-              formID: data.id,
-            });
+            const sessionID = data.sessionID;
+            const formID = data.id;
+            const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
+            enqueueFor(sessionID, () => dispatch({ kind, sessionID, formID }));
           }
           return;
         case "session.deleted":
         case "session.archived":
-          if (typeof data.sessionID === "string") dispatch({ kind: "deleted", sessionID: data.sessionID });
+          if (typeof data.sessionID === "string") {
+            const { sessionID } = data;
+            // Behind any pending lookup, so a delete always outranks the birth
+            // that lookup was about to report.
+            enqueueFor(sessionID, () => dispatch({ kind: "deleted", sessionID }));
+          }
           return;
         default:
           return;
@@ -251,27 +315,64 @@ export const AgentMachiReporter = {
     };
 
     const controller = new AbortController();
+    let seeded = false;
     const stream = (async () => {
-      try {
-        // Subscribe before reconciling so no event lands between the two.
-        const events = ctx?.event?.subscribe?.({ signal: controller.signal });
-        // Kick the bootstrap off after the subscription is established.
-        void reconcile(true);
-        for await (const event of events ?? []) onEvent(event);
-      } catch {
-        // The stream ended (server shutdown or reload); cleanup follows.
+      // A dropped stream is retried, because events are the only live signal:
+      // an ended stream must not leave the town frozen on stale state.
+      while (!unloaded && !controller.signal.aborted) {
+        try {
+          const events = ctx?.event?.subscribe?.({ signal: controller.signal });
+          if (!seeded) {
+            // Subscribe before reconciling so no event lands between the two.
+            seeded = true;
+            void reconcile(true);
+          } else {
+            // Reconnect: events were missed, so re-read ground truth once.
+            void reconcile(false);
+          }
+          for await (const event of events ?? []) onEvent(event);
+        } catch {
+          // Fall through to the backoff below.
+        }
+        if (unloaded || controller.signal.aborted) return;
+        await new Promise((resolve) => {
+          const retry = setTimeout(resolve, RECONNECT_MS);
+          (retry as unknown as { unref?: () => void }).unref?.();
+        });
       }
     })();
 
+    // One reconcile at a time: a stalled read must not stack up behind the
+    // heartbeat. It also catches up immediately after a suspend/resume where
+    // the interval was overdue, so a renewal never waits a full period.
+    let lastBeat = Date.now();
+    let beating = false;
+    const beat = async (): Promise<void> => {
+      if (beating || unloaded) return;
+      beating = true;
+      lastBeat = Date.now();
+      try {
+        await reconcile(false);
+        dispatch({ kind: "tick" });
+      } catch {
+        // A heartbeat fault must never surface; the next one retries.
+      } finally {
+        beating = false;
+      }
+    };
     const heartbeat = setInterval(() => {
-      void reconcile(false).then(() => dispatch({ kind: "tick" }));
-    }, HEARTBEAT_MS);
+      if (Date.now() - lastBeat >= HEARTBEAT_MS) void beat();
+    }, Math.min(60_000, HEARTBEAT_MS));
     (heartbeat as unknown as { unref?: () => void }).unref?.();
 
     return () => {
+      // Unload: stop producing events and drop queued writes. Late lookups are
+      // fenced by `unloaded` so they cannot enqueue after cleanup returns.
+      unloaded = true;
       controller.abort();
       clearInterval(heartbeat);
-      void delivery.drain().catch(() => undefined);
+      delivery.close();
+      chains.clear();
       void stream;
     };
   },

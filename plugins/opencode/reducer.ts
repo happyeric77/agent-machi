@@ -113,8 +113,17 @@ export function reduce(state: State, input: Input): Action[] {
       for (const view of input.sessions) {
         // Child sessions live inside their parent's work and get no resident.
         if (view.parentID) continue;
-        // A deleted resident stays gone until its own events revive it.
-        if (state.sessions.has(view.id)) continue;
+        const known = state.sessions.get(view.id);
+        if (known) {
+          // Already tracked: a later metadata read may only refresh the name.
+          const name = displayName(view);
+          if (name !== "" && name !== known.name) {
+            known.name = name;
+            // The bridge keeps metadata from the last status report, so the
+            // new name lands with the next transition or heartbeat.
+          }
+          continue;
+        }
         state.sessions.set(view.id, {
           underlying: view.executing ? "working" : "idle",
           permissions: new Set(),
@@ -141,11 +150,8 @@ export function reduce(state: State, input: Input): Action[] {
       const tracked = state.sessions.get(input.sessionID);
       if (!tracked) return out;
       tracked.underlying = "idle";
-      // A turn cannot end while it is waiting on a prompt, so any prompt still
-      // in the set died with it. This also self-heals a missed reply event,
-      // which would otherwise leave the resident blocked forever.
-      tracked.permissions.clear();
-      tracked.forms.clear();
+      // Pending prompts are cleared only by their own terminal events or a
+      // successful read: a prompt can outlive the turn that raised it.
       sync(state, input.sessionID, out);
       return out;
     }

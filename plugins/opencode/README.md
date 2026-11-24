@@ -33,17 +33,19 @@ step. Tested against OpenCode 2.2.6.
    slug for this machine (letters, digits, punctuation; no spaces or colons).
    It is part of every resident id, so do not copy it to a second machine.
 
-3. The token must be in the **OpenCode server process** environment, because
-   that is where the plugin runs:
+3. The token must be in the environment of the **process that owns the
+   sessions**, because that is where the plugin runs. A TUI started from a
+   shell usually attaches to an already-running `opencode serve`, and exporting
+   a variable in that shell does not reach it:
 
    ```sh
-   export AGENT_MACHI_INGEST_TOKEN=choose-a-long-random-value
-   opencode
+   # Start the server yourself, with the token in its environment.
+   AGENT_MACHI_INGEST_TOKEN=choose-a-long-random-value opencode serve
    ```
 
-   If OpenCode is started by a desktop launcher rather than a shell, set the
-   variable in that launcher's environment. The plugin never reads the token
-   from config.
+   An OpenCode started by a desktop launcher needs the variable set in that
+   launcher's environment. The plugin never reads the token from config, and
+   never logs it.
 
 4. Load the plugin. A config edit reloads it, or restart OpenCode. On 2.2.6
    `OPENCODE_CONFIG_CONTENT` does not load plugins, so this must be a real file.
@@ -73,9 +75,10 @@ plugin stays silent and the session works exactly as before.
   context, so form state is event-only: a form that opens and is answered
   entirely between two heartbeats can be missed. A failed read never counts as
   "no prompts pending".
-- Closing a tab or quitting the TUI reports nothing: the bridge expires that
-  resident after its 15-minute TTL. Only deleting or archiving a session sends
-  `DELETE`.
+- Closing a tab or quitting the TUI reports nothing, and it does not stop
+  renewals while the server that owns that session is still running. The
+  resident expires only after renewals stop: 15 minutes of silence at the
+  bridge's default TTL. Only deleting or archiving a session sends `DELETE`.
 
 ## Uninstall
 

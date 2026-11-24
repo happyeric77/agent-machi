@@ -213,13 +213,24 @@ test("events for an unknown session are ignored rather than inventing a resident
   assert.deepEqual(liveSessions(state), []);
 });
 
-test("a turn ending clears prompts whose terminal event was missed", () => {
+test("a prompt outliving its turn keeps the resident blocked", () => {
   const state = createState();
   created(state);
   reduce(state, { kind: "execution-started", sessionID: "ses_a" });
   reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_1" });
-  reduce(state, { kind: "form-created", sessionID: "ses_a", formID: "frm_1" });
-  // The interrupted turn ends; without this the resident would stay blocked.
   const actions = reduce(state, { kind: "execution-ended", sessionID: "ses_a" });
-  assert.deepEqual(actions, [{ type: "post", sessionID: "ses_a", status: "idle", name: "ses_a" }]);
+  assert.deepEqual(actions, []);
+  assert.equal(reduce(state, { kind: "tick" })[0].status, "blocked");
+});
+
+test("a later metadata read refreshes the name on the next transition", () => {
+  const state = createState();
+  created(state);
+  reduce(state, {
+    kind: "discovered",
+    sessions: [{ id: "ses_a", title: "renamed", directory: null }],
+  });
+  assert.deepEqual(reduce(state, { kind: "execution-started", sessionID: "ses_a" }), [
+    { type: "post", sessionID: "ses_a", status: "working", name: "renamed" },
+  ]);
 });
