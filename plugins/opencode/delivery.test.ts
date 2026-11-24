@@ -143,23 +143,30 @@ test("close aborts an in-flight request and nothing lands afterwards", async () 
   assert.equal(aborted, true, "the in-flight request was cancelled");
 });
 
-test("a ready write for another session is not delayed by a retry timer", async () => {
+test("a failing write does not stop another session from being sent", async () => {
   const seen: string[] = [];
+  let firstFailure = true;
   const fetch = (async (input: any, init: any = {}) => {
     const url = new URL(String(input));
     const body = init.body ? JSON.parse(String(init.body)) : {};
     const id = body.id ?? url.searchParams.get("id") ?? "";
     seen.push(id);
-    // ses_a fails once so a retry timer exists; ses_b must not wait for it.
-    if (id === "mini-ses_a") return new Response("nope", { status: 503 });
+    // One failure from ses_a opens the outage window; after that the bridge is
+    // healthy again.
+    if (firstFailure) {
+      firstFailure = false;
+      return new Response("nope", { status: 503 });
+    }
     return new Response('{"ok":true}', { status: 200 });
   }) as unknown as typeof globalThis.fetch;
   const delivery = createDelivery({ ...base, fetch, timeoutMs: 50 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   delivery.enqueue({ type: "post", sessionID: "ses_b", status: "working" });
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  assert.ok(seen.includes("mini-ses_b"), "ses_b was sent without waiting for ses_a's backoff");
+  // Pacing is endpoint-wide, so ses_b waits out the shared outage window, but
+  // it is still sent without waiting for ses_a's whole retry schedule.
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  assert.ok(seen.includes("mini-ses_b"), "ses_b was sent despite ses_a failing");
   delivery.close();
 });
 
@@ -213,5 +220,24 @@ test("alternating states do not reset the outage backoff", async () => {
   // Eight flips in ~half a second: with exponential pacing only the first few
   // requests can go out. Without it, every flip would be attempted at once.
   assert.ok(requests <= 5, `backoff was respected (${requests} requests)`);
+  delivery.close();
+});
+
+test("outage pacing is endpoint-wide, not per resident", async () => {
+  const stamps: number[] = [];
+  const fetch = (async () => {
+    stamps.push(Date.now());
+    return new Response("nope", { status: 503 });
+  }) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 50 });
+  const started = Date.now();
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  delivery.enqueue({ type: "post", sessionID: "ses_b", status: "working" });
+  delivery.enqueue({ type: "post", sessionID: "ses_c", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  // The first failure opens a one-second window; the other two must not slip
+  // inside it.
+  assert.equal(stamps.length, 1, `saw ${stamps.length} requests inside the outage window`);
+  assert.ok(stamps[0] - started < 300);
   delivery.close();
 });

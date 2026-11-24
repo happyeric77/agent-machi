@@ -52,6 +52,10 @@ interface Options {
   permissions?: (sessionID: string, calls: number) => string[] | null;
   /** Resolve a `get` only when released, to hold a read open. */
   gate?: { release: () => void } | null;
+  /** Drop the event stream this many times, as a flapping connection would. */
+  streamDrops?: number;
+  /** Fail the list read on exactly this call number. */
+  failListOnCall?: number;
 }
 
 function makeCtx(shared: World, opts: Options = {}) {
@@ -72,6 +76,7 @@ function makeCtx(shared: World, opts: Options = {}) {
           listFails -= 1;
           throw new Error("list is down");
         }
+        if (opts.failListOnCall === calls.list) throw new Error("list is down");
         return { data: [...shared.rows.values()] };
       },
       async get({ sessionID }: { sessionID: string }) {
@@ -99,6 +104,12 @@ function makeCtx(shared: World, opts: Options = {}) {
     event: {
       async *subscribe({ signal }: { signal?: AbortSignal }) {
         shared.subscriptions += 1;
+        if ((opts.streamDrops ?? 0) > 0) {
+          opts.streamDrops! -= 1;
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          shared.subscriptions -= 1;
+          throw new Error("stream dropped");
+        }
         const queue: any[] = [];
         shared.bus.push((event) => queue.push(event));
         try {
@@ -120,6 +131,18 @@ function makeCtx(shared: World, opts: Options = {}) {
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Drive one reconcile pass, so a test can assert what a pass reads instead of
+ * waiting five minutes for the heartbeat. Reaching into the reporter is
+ * deliberate: there is no public trigger, and the assertion is still on the
+ * resulting bridge writes.
+ */
+function forcePass(): void {
+  const host = globalThis as any;
+  const reporters: Map<string, any> = host[Symbol.for("agent-machi.reporter")];
+  for (const reporter of reporters?.values() ?? []) reporter.runPass();
+}
 
 /** Wait until a condition holds, or fail with what was observed. */
 async function until(label: string, check: () => boolean, ms = 4_000): Promise<void> {
@@ -151,7 +174,7 @@ async function loadPlugin(): Promise<any> {
   return mod.default;
 }
 
-test("a second location keeps the first's resident renewing, and unloading it re-elects", async () => {
+test("unloading the stream owner hands the stream to a survivor", async () => {
   const plugin = await loadPlugin();
   const shared = world();
   installFetch(shared);
@@ -159,7 +182,6 @@ test("a second location keeps the first's resident renewing, and unloading it re
   const a = makeCtx(shared, { directory: "/tmp/a" });
   const stopA = await plugin.setup(a.ctx);
   assert.equal(typeof stopA, "function");
-  // An idle resident that only A can see.
   shared.rows.set("ses_idle", {
     id: "ses_idle",
     title: "idle-a",
@@ -168,21 +190,29 @@ test("a second location keeps the first's resident renewing, and unloading it re
   });
   shared.emit({ type: "session.created", data: { sessionID: "ses_idle" } });
   await until("A reports its resident", () => shared.writes.some((w) => w.id === "mini-ses_idle"));
-  const before = shared.writes.length;
 
   const b = makeCtx(shared, { directory: "/tmp/b", bridgeUrl: "http://127.0.0.1:9/town/" });
   const stopB = await plugin.setup(b.ctx);
-  // One shared writer: a second location must not open a second subscription.
   await wait(50);
   assert.equal(shared.subscriptions, 1, "one live subscription, not one per setup");
 
-  const idle = shared.rows.get("ses_idle");
-  assert.ok(idle && idle.title === "idle-a", "the first location's row is still there");
-  stopB?.();
-  await wait(50);
-  assert.equal(shared.subscriptions, 1, "a survivor took the stream over");
-  assert.ok(shared.writes.length >= before, "reporting continued");
+  // A owns the stream, so unloading it is the handoff case.
   stopA?.();
+  await wait(80);
+  assert.equal(shared.subscriptions, 1, "the survivor took the stream over");
+
+  // Prove the survivor delivers: its own event must reach the bridge.
+  shared.rows.set("ses_after", {
+    id: "ses_after",
+    title: "after",
+    location: { directory: "/tmp/b" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_after" } });
+  await until("the survivor reported a new session", () =>
+    shared.writes.some((w) => w.id === "mini-ses_after"),
+  );
+  stopB?.();
   await wait(50);
   assert.equal(shared.subscriptions, 0, "the last unload closed the stream");
 });
@@ -218,39 +248,56 @@ test("a duplicate cleanup never evicts the replacement reporter", async () => {
   const a = makeCtx(shared);
   const stopA = await plugin.setup(a.ctx);
   stopA?.();
-  stopA?.(); // duplicate cleanup, before anything replaces it
 
   const b = makeCtx(shared);
   const stopB = await plugin.setup(b.ctx);
+  // A's cleanup runs a second time, now that B has replaced it.
+  stopA?.();
+
   // A third setup must join B, not create a second writer beside it.
   const c = makeCtx(shared);
   const stopC = await plugin.setup(c.ctx);
-  await wait(50);
-  assert.equal(shared.subscriptions, 1, "one reporter, one subscription");
+  await wait(80);
+  assert.equal(shared.subscriptions, 1, "B and C share one subscription");
+
+  // And B is still the live owner: unloading C must not close the stream.
   stopC?.();
+  await wait(50);
+  assert.equal(shared.subscriptions, 1, "C's cleanup left B reporting");
   stopB?.();
+  await wait(50);
+  assert.equal(shared.subscriptions, 0, "the last unload closed the stream");
 });
 
-test("a session in a location with no setup is never read from another one", async () => {
+test("prompts are read only for sessions in this setup's own location", async () => {
   const plugin = await loadPlugin();
   const shared = world();
   installFetch(shared);
 
-  const local = makeCtx(shared, { directory: "/tmp/local" });
+  const local = makeCtx(shared, { directory: "/tmp/local", permissions: () => ["per_local"] });
   const stop = await plugin.setup(local.ctx);
+  shared.rows.set("ses_near", {
+    id: "ses_near",
+    title: "near",
+    location: { directory: "/tmp/local" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
   shared.rows.set("ses_far", {
     id: "ses_far",
     title: "far",
     location: { directory: "/tmp/elsewhere" },
-    time: { created: Date.now() },
+    time: { created: Date.now(), busy: Date.now() },
   });
-  shared.emit({ type: "session.created", data: { sessionID: "ses_far" } });
-  await until("the foreign session is reported", () =>
+  // Force a pass so both residents are actually reconciled: otherwise zero
+  // reads would prove nothing.
+  forcePass();
+  await until("the local resident is blocked by its prompt", () =>
+    shared.writes.some((w) => w.id === "mini-ses_near" && w.status === "blocked"),
+  );
+  await until("the foreign resident is still reported", () =>
     shared.writes.some((w) => w.id === "mini-ses_far"),
   );
-  // It is reported, but its prompts are never read: the only setup here lives
-  // in another directory.
-  assert.equal(local.permits(), 0, "no prompt read came from the wrong location");
+  assert.equal(local.permits(), 1, "only the local session's prompts were read");
   stop?.();
 });
 
@@ -300,7 +347,7 @@ test("a prompt read that cannot answer never clears a pending prompt", async () 
     id: "ses_p",
     title: "p",
     location: { directory: "/tmp/project" },
-    time: { created: Date.now() },
+    time: { created: Date.now(), busy: Date.now() },
   });
   shared.emit({ type: "session.created", data: { sessionID: "ses_p" } });
   await until("it is reported", () => shared.writes.some((w) => w.id === "mini-ses_p"));
@@ -308,16 +355,22 @@ test("a prompt read that cannot answer never clears a pending prompt", async () 
   await until("the prompt blocks it", () =>
     shared.writes.some((w) => w.id === "mini-ses_p" && w.status === "blocked"),
   );
-  const blockedCount = shared.writes.filter(
-    (w) => w.id === "mini-ses_p" && w.status === "idle",
-  ).length;
-  // A reconcile pass with an unreadable prompt list must not unblock it.
-  shared.emit({ type: "tick" });
-  await wait(200);
-  assert.equal(
-    shared.writes.filter((w) => w.id === "mini-ses_p" && w.status === "idle").length,
-    blockedCount,
+
+  // Force a real pass: its first prompt read cannot answer, so the block must
+  // survive.
+  forcePass();
+  await until("the unreadable read actually happened", () => ctx.permits() >= 1);
+  await wait(120);
+  assert.ok(
+    shared.writes.filter((w) => w.id === "mini-ses_p").at(-1)?.status === "blocked" ||
+      shared.writes.filter((w) => w.id === "mini-ses_p" && w.status === "blocked").length === 1,
     "an unreadable list did not clear the prompt",
+  );
+
+  // And a valid empty list is authoritative: the next pass unblocks it.
+  forcePass();
+  await until("a real empty list unblocks it", () =>
+    shared.writes.filter((w) => w.id === "mini-ses_p").at(-1)?.status === "working",
   );
   stop?.();
 });
@@ -387,38 +440,32 @@ test("a failed seed on reconnect is retried after a successful startup", async (
   const shared = world();
   installFetch(shared);
 
-  // Startup succeeds with one resident.
-  const ctx = makeCtx(shared);
-  // Bootstrap only seeds sessions that are executing: an idle one is not
-  // re-added by a reload, by design.
+  // Bootstrap succeeds with one resident, then the stream drops once.
   shared.rows.set("ses_seen", {
     id: "ses_seen",
     title: "seen",
     location: { directory: "/tmp/project" },
     time: { created: Date.now(), busy: Date.now() },
   });
+  // The list read that the reconnect performs (call 2) fails once; only the
+  // retry can find the session that appeared in the meantime.
+  const ctx = makeCtx(shared, { streamDrops: 1, failListOnCall: 2 });
   const stop = await plugin.setup(ctx.ctx);
   await until("startup seed reported", () => shared.writes.some((w) => w.id === "mini-ses_seen"));
 
-  // A session that starts while the list is failing must still be found once
-  // the list recovers: retry is owed for the failed read, not for "first ever".
   shared.rows.set("ses_late", {
     id: "ses_late",
     title: "late",
     location: { directory: "/tmp/project" },
     time: { created: Date.now(), busy: Date.now() },
   });
-  // A separate reporter (its own machine id): the point is that ITS failed seed
-  // is retried even though another reporter started successfully long before.
-  const failing = makeCtx(shared, { listFails: 1, machineId: "mini2" });
-  // A second location re-seeds; its first list read fails.
-  const stop2 = await plugin.setup(failing.ctx);
+
   await until(
-    "the retried seed finds the late session",
-    () => shared.writes.some((w) => w.id === "mini2-ses_late"),
-    12_000,
+    "the reconnect retried its failed list and found the late session",
+    () => shared.writes.some((w) => w.id === "mini-ses_late"),
+    15_000,
   );
-  stop2?.();
+  assert.ok(ctx.calls.list >= 3, `the failed reconnect list was retried (${ctx.calls.list})`);
   stop?.();
 });
 

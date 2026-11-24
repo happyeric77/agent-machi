@@ -81,16 +81,20 @@ plugin stays silent and the session works exactly as before.
   soon a correction lands depends on how many sessions are tracked and whether
   reads are failing — treat five minutes as the idle case, not a guarantee.
   Reads for one session never discard another session's.
-- A write in flight is never replaced, and a session's latest state always
-  wins: a session that comes back after a delete is reported again.
+- A session's latest state always wins over one still queued: a session that
+  comes back after a delete is reported again. Writes go out one at a time and
+  the queue is short, but delivery is best-effort: a write can be dropped after
+  its retry budget, and outage backoff is shared by the whole endpoint.
 - Write ordering is not guaranteed across a proxy. An unload aborts anything
   still on the wire, but a proxy that already buffered an earlier POST can
   still forward it after a newer DELETE reaches the bridge, and the bridge has
   no sequence check. If a stale write must never win, that needs a write
   generation enforced at the bridge; aborting the client is not enough.
-- A session the server answers `Session.NotFoundError` for is deleted at once
-  instead of waiting out the bridge's TTL — that is an authoritative absence,
-  and it does not require a delete or archive event. A failed or timed-out
+- For a resident this reporter is tracking, a `Session.NotFoundError` (or an
+  archived read) queues a `DELETE` instead of waiting out the bridge's TTL; it
+  does not require a delete or archive event. A session it never tracked is not
+  read at all, so the earlier instance's resident waits for `DELETE` on the next
+  archive/delete event or for the TTL. A failed or timed-out
   read never counts as "gone". An archived session is treated the same way: it
   still answers reads and still appears in the list, and the only trace is
   `time.archived`, so it is excluded wherever rows are read.

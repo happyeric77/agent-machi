@@ -84,6 +84,8 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
   let stopped = false;
   /** Consecutive failed requests across all writes; reset by any success. */
   let transportFailures = 0;
+  /** No request at all goes out before this: pacing is endpoint-wide. */
+  let outageUntil = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   /** When the armed timer fires; 0 when none is armed. */
   let timerDue = 0;
@@ -155,26 +157,47 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
       if (inflight.has(sessionID)) continue;
       if (due === null || pending.notBefore < due) due = pending.notBefore;
     }
-    return due;
+    if (due === null) return null;
+    // A fresh write for another session must not slip inside the outage
+    // window: the bridge is down for everyone, not per resident.
+    return Math.max(due, outageUntil);
   }
 
+  /**
+   * Send one write at a time.
+   *
+   * One request on the wire per endpoint makes the outage window actually
+   * apply: a burst of three writes for three residents would otherwise all
+   * leave before the first failure could open it. Delivery is best-effort and
+   * the queue is short, so serialising costs nothing that matters.
+   */
   async function pump(): Promise<void> {
-    if (stopped) return;
+    if (stopped || inflight.size > 0) return;
     const now = Date.now();
-    for (const [sessionID, pending] of [...queue]) {
-      if (pending.notBefore > now) continue;
-      if (inflight.has(sessionID)) continue;
-      queue.delete(sessionID);
-      const abort = new AbortController();
-      inflight.set(sessionID, abort);
-      void send(sessionID, pending, abort).finally(() => {
-        if (inflight.get(sessionID) === abort) inflight.delete(sessionID);
-        schedule();
-        settleIfIdle();
-      });
+    if (outageUntil > now) {
+      schedule();
+      return;
     }
+    let next: [string, Pending] | null = null;
+    for (const entry of queue) {
+      if (entry[1].notBefore > now) continue;
+      next = entry;
+      break;
+    }
+    if (next === null) {
+      settleIfIdle();
+      return;
+    }
+    const [sessionID, pending] = next;
+    queue.delete(sessionID);
+    const abort = new AbortController();
+    inflight.set(sessionID, abort);
+    void send(sessionID, pending, abort).finally(() => {
+      if (inflight.get(sessionID) === abort) inflight.delete(sessionID);
+      schedule();
+      settleIfIdle();
+    });
     schedule();
-    settleIfIdle();
   }
 
   async function send(
@@ -207,6 +230,7 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     if (response.ok) {
       // The bridge is answering: outage pacing starts over.
       transportFailures = 0;
+      outageUntil = 0;
       return;
     }
     // A rejected write (bad id, wrong token, ingest off) will not be fixed by
@@ -218,13 +242,21 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     // Unload already dropped the queue and cancelled this request.
     if (stopped) return;
     const attempts = pending.attempts + 1;
-    if (attempts > MAX_ATTEMPTS) return;
+    if (attempts > MAX_ATTEMPTS) {
+      // This write is out of budget. An identical queued copy is the same work
+      // and goes with it; a different write (a DELETE after a failing POST) is
+      // new work and keeps its own budget.
+      const queued = queue.get(sessionID);
+      if (queued && sameWrite(queued.write, write)) queue.delete(sessionID);
+      return;
+    }
     // Two separate budgets. `attempts` bounds one write; `transportFailures`
     // paces the outage. Without the second, alternating states would reset the
     // delay on every flip and hammer a bridge that is simply down.
     transportFailures += 1;
     const backoff = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (transportFailures - 1));
     const notBefore = Date.now() + backoff;
+    outageUntil = Math.max(outageUntil, notBefore);
     const queued = queue.get(sessionID);
     if (queued) {
       // A newer state arrived while this one was failing. It runs into the same
