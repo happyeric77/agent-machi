@@ -302,6 +302,22 @@ class Reporter {
    */
   private readonly goneAt = new Map<string, number>();
   /**
+   * How many removal marks to keep. A mark only matters while a read that began
+   * before it is still in flight, so a bounded window is enough; without it the
+   * map grows for every session ever removed.
+   */
+  private static readonly GONE_MAX = 256;
+
+  private markGone(sessionID: string, at: number): void {
+    this.goneAt.delete(sessionID);
+    this.goneAt.set(sessionID, Math.max(this.goneAt.get(sessionID) ?? 0, at));
+    while (this.goneAt.size > Reporter.GONE_MAX) {
+      const oldest = this.goneAt.keys().next();
+      if (oldest.done) break;
+      this.goneAt.delete(oldest.value);
+    }
+  }
+  /**
    * Forget work parked for a session that is gone. A parked event describes a
    * resident; once the resident is removed, replaying it would attach an old
    * transition or an old prompt to whatever incarnation comes next.
@@ -314,6 +330,13 @@ class Reporter {
     this.inbound.delete(sessionID);
     this.pendingCreate.delete(sessionID);
     this.discardHeld(sessionID);
+    // The ordering marks describe an incarnation that is over. Keeping them
+    // would let a dead session's freshness suppress a later, genuine one, and
+    // they would accumulate for every session ever seen.
+    this.observed.delete(sessionID);
+    this.promptsAt.delete(sessionID);
+    this.titleAt.delete(sessionID);
+    this.openAsks.delete(sessionID);
   }
   private observation = 0;
 
@@ -370,6 +393,32 @@ class Reporter {
    * authoritative and supersedes whatever was waiting, while a failed one leaves
    * the ask as the sole evidence that a prompt exists.
    */
+  /**
+   * Prompt asks this reporter knows are open, with the arrival number of the
+   * event that announced them.
+   *
+   * A snapshot only describes the prompts that existed when its read was
+   * issued, so an ask announced after that moment cannot be disproved by it —
+   * and the ask's own queued task may already have finished by the time the
+   * snapshot lands. This keeps the fact that it is open, without keeping the
+   * event.
+   */
+  private readonly openAsks = new Map<string, Map<string, { at: number; permission: boolean }>>();
+
+  private noteAsk(sessionID: string, promptID: string, at: number, permission: boolean): void {
+    const entry = this.openAsks.get(sessionID);
+    const value = { at, permission };
+    if (entry) entry.set(promptID, value);
+    else this.openAsks.set(sessionID, new Map([[promptID, value]]));
+  }
+
+  private closeAsk(sessionID: string, promptID: string): void {
+    const entry = this.openAsks.get(sessionID);
+    if (!entry) return;
+    entry.delete(promptID);
+    if (entry.size === 0) this.openAsks.delete(sessionID);
+  }
+
   /** Note a prompt event the moment it reaches the reporter. */
   private noteInbound(input: Input, at: number): void {
     const sessionID = heldSession(input);
@@ -755,6 +804,24 @@ class Reporter {
       return;
     }
     // A live row proves the session exists again, so the removal mark — which
+    // only exists to block stale prompts — is cleared. But only by a read that
+    // began after the removal: a row captured before it describes the
+    // incarnation that ended, and clearing the mark with it would let a parked
+    // ask publish a block for a session the host already archived.
+    // A live row proves the session exists again, so the removal mark — which
+    // only exists to block stale prompts — is cleared. But only by a read that
+    // began after the removal: a row captured before it describes the
+    // incarnation that ended, and clearing the mark with it would let a parked
+    // ask publish a block for a session the host already archived.
+    const goneBefore = (this.goneAt.get(sessionID) ?? 0) > startedAt;
+    if (goneBefore) {
+      // The row describes an incarnation the host has already ended. It cannot
+      // revive it, rename it, or speak for its prompts: the queued removal task
+      // owns this session, and a read that begins after it will settle whatever
+      // comes next.
+      return;
+    }
+    // A live row proves the session exists again, so the removal mark — which
     // only exists to block stale prompts — is cleared.
     this.removed.delete(sessionID);
     this.goneAt.delete(sessionID);
@@ -781,6 +848,7 @@ class Reporter {
     // A successful prompt read is authoritative: any ask parked behind an older
     // read is now either in this set or disproved by it.
     const promptsFresh =
+      !goneBefore &&
       permissions !== undefined &&
       permissions !== null &&
       promptsStartedAt !== undefined &&
@@ -796,7 +864,11 @@ class Reporter {
       // Asks that arrived after this read began are newer than the snapshot, so
       // the snapshot cannot disprove them: publish the union, which keeps a real
       // block rather than briefly clearing it.
-      nextPermissions = this.mergeParkedPrompts(sessionID, permissions as readonly string[]);
+      nextPermissions = this.mergeParkedPrompts(
+        sessionID,
+        permissions as readonly string[],
+        promptsStartedAt as number,
+      );
       this.promptsAt.set(sessionID, promptsStartedAt as number);
       this.dropPendingPrompts(sessionID);
     }
@@ -962,6 +1034,10 @@ class Reporter {
       // start: an event captured after the page was requested is newer, and the
       // row must not overwrite it.
       if ((this.observed.get(view.id) ?? 0) > pageAt) continue;
+      // A removal that arrived after this page was requested is newer than it:
+      // the page's live row describes the incarnation the host already ended, so
+      // admitting it would replay that incarnation's parked prompt.
+      if ((this.goneAt.get(view.id) ?? 0) > pageAt) continue;
       this.observed.set(view.id, pageAt);
       this.titleAt.set(view.id, pageAt);
       // A removed resident is not in the map at all, so this readmits it: the
@@ -1029,7 +1105,8 @@ class Reporter {
       // own rather than discarding a good answer with a bad one. The stamp goes
       // with it, because this set is the newest prompt truth either way.
       if (permissions && promptsStartedAt > (this.promptsAt.get(sessionID) ?? 0)) {
-        const merged = this.mergeParkedPrompts(sessionID, permissions);
+        const gone = (this.goneAt.get(sessionID) ?? 0) > promptsStartedAt;
+      const merged = gone ? this.answeredOnly(permissions) : this.mergeParkedPrompts(sessionID, permissions, promptsStartedAt);
         this.promptsAt.set(sessionID, promptsStartedAt);
         this.dropPendingPrompts(sessionID);
         this.dispatch({ kind: "permissions", sessionID, permissions: merged });
@@ -1054,8 +1131,14 @@ class Reporter {
    *
    * Those asks are newer than the read, so it cannot disprove them: dropping
    * them would publish `idle` for a resident the host already says is waiting.
+   * An ask that predates the read is a different matter — the snapshot *can*
+   * see it, so its absence from the set is the host saying it is closed.
    */
-  private mergeParkedPrompts(sessionID: string, permissions: readonly string[]): string[] {
+  private mergeParkedPrompts(
+    sessionID: string,
+    permissions: readonly string[],
+    promptsStartedAt: number,
+  ): string[] {
     const merged = this.answeredOnly(permissions);
     const seen = new Set(merged);
     // Both places an ask can be: parked behind an older read, or delivered but
@@ -1066,11 +1149,24 @@ class Reporter {
     ];
     for (const { input, at } of waiting) {
       if (input.kind !== "permission-asked") continue;
+      // The read was issued after this ask arrived, so it could see it: an
+      // absent id is the host's answer, not a gap in the snapshot.
+      if (at < promptsStartedAt) continue;
       if ((this.goneAt.get(sessionID) ?? 0) > at) continue;
       if (seen.has(input.requestID)) continue;
       if (this.isAnswered(Reporter.promptKey("permission", input.requestID))) continue;
       seen.add(input.requestID);
       merged.push(input.requestID);
+    }
+    // An ask whose own task has already finished is still open, and still newer
+    // than the snapshot: it is the state the reducer already holds.
+    for (const [id, { at, permission }] of this.openAsks.get(sessionID) ?? []) {
+      if (!permission) continue;
+      if (at < promptsStartedAt) continue;
+      if (seen.has(id)) continue;
+      if (this.isAnswered(Reporter.promptKey("permission", id))) continue;
+      seen.add(id);
+      merged.push(id);
     }
     return merged;
   }
@@ -1278,6 +1374,13 @@ class Reporter {
             // which is newer than the event that queued this task. Applying the
             // event would report a run that is over.
             if (admission === "admitted-fresh") return;
+            // Not a resident (a child, an absent row, or a refusal): the event
+            // describes something the town never shows, so nothing is stamped.
+            if (!this.state.sessions.has(sessionID)) {
+              this.execAt.delete(sessionID);
+              this.execKind.delete(sessionID);
+              return;
+            }
             if ((this.observed.get(sessionID) ?? 0) > at) {
               this.recheck(sessionID);
               return;
@@ -1286,7 +1389,11 @@ class Reporter {
               // Only a resident can receive a parked transition. A child or an
               // absent row was refused above, and parking for it would leak an
               // entry nothing will ever apply.
-              if (!this.state.sessions.has(sessionID)) return;
+              if (!this.state.sessions.has(sessionID)) {
+                this.execAt.delete(sessionID);
+                this.execKind.delete(sessionID);
+                return;
+              }
               // Hold the event until a read answers for the session. If every
               // recheck fails, flushPendingExec applies it: a lost transition is
               // worse than a possibly stale one.
@@ -1294,6 +1401,11 @@ class Reporter {
               this.recheck(sessionID);
               return;
             }
+            // A newer execution event has already arrived, even if its own task
+            // is still queued behind unrelated work. Publishing this older
+            // transition would report a run the host has already ended, so the
+            // newer event publishes instead.
+            if ((this.execAt.get(sessionID) ?? 0) > at) return;
             this.observed.set(sessionID, at);
             this.dispatch({ kind: "execution-started", sessionID });
           });
@@ -1312,16 +1424,30 @@ class Reporter {
             // A start that was never admitted must not swallow the end.
             const admission = await this.admit(sessionID);
             if (admission === "admitted-fresh") return;
+            // Not a resident (a child, an absent row, or a refusal): the event
+            // describes something the town never shows, so nothing is stamped.
+            if (!this.state.sessions.has(sessionID)) {
+              this.execAt.delete(sessionID);
+              this.execKind.delete(sessionID);
+              return;
+            }
             if ((this.observed.get(sessionID) ?? 0) > at) {
               this.recheck(sessionID);
               return;
             }
             if (raced) {
-              if (!this.state.sessions.has(sessionID)) return;
+              if (!this.state.sessions.has(sessionID)) {
+                this.execAt.delete(sessionID);
+                this.execKind.delete(sessionID);
+                return;
+              }
               this.pendingExec.set(sessionID, { kind: "ended", at });
               this.recheck(sessionID);
               return;
             }
+            // Same rule for the other direction: a newer start that already
+            // arrived outranks this end.
+            if ((this.execAt.get(sessionID) ?? 0) > at) return;
             this.observed.set(sessionID, at);
             this.dispatch({ kind: "execution-ended", sessionID });
           });
@@ -1335,6 +1461,7 @@ class Reporter {
           const raced = this.readingPrompts.has(sessionID);
           const input: Input = { kind: "permission-asked", sessionID, requestID };
           this.noteInbound(input, at);
+          this.noteAsk(sessionID, requestID, at, true);
           this.enqueue(async () => {
             try {
             // Same reasoning as a form: without admission the newest resident's
@@ -1382,6 +1509,7 @@ class Reporter {
           // Recorded on arrival, so an open event whose admission read is still
           // in flight already knows it was answered and will not park itself.
           this.rememberAnswered(Reporter.promptKey("permission", requestID));
+          this.closeAsk(sessionID, requestID);
           this.enqueue(async () => {
             this.dropHeld(
               sessionID,
@@ -1405,6 +1533,7 @@ class Reporter {
           const at = this.nextObservation();
           const input: Input = { kind: "form-created", sessionID, formID };
           this.noteInbound(input, at);
+          this.noteAsk(sessionID, formID, at, false);
           this.enqueue(async () => {
             try {
             // A form for a session this reporter does not know yet still has to
@@ -1437,6 +1566,7 @@ class Reporter {
           const formID = data.id;
           const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
           this.rememberAnswered(Reporter.promptKey("form", formID));
+          this.closeAsk(sessionID, formID);
           this.enqueue(async () => {
             // Same ordering rule as a permission reply: a form answered before
             // its session was admitted leaves nothing to report, and the drop
@@ -1456,7 +1586,7 @@ class Reporter {
           const at = this.nextObservation();
           // Recorded now, not when this task runs: until then a fallback could
           // still publish a block for the incarnation this event ended.
-          this.goneAt.set(sessionID, Math.max(this.goneAt.get(sessionID) ?? 0, at));
+          this.markGone(sessionID, at);
           // Queued behind any pending admission, so a delete always outranks
           // the birth that admission was about to report.
           this.enqueue(async () => {
@@ -1472,6 +1602,9 @@ class Reporter {
             // Everything parked for this id is dead, including a failed create:
             // otherwise a later list row or revival would carry it forward.
             this.forget(sessionID);
+            // Every task that could still hold a read from before this removal
+            // has already run (the queue is serial), so the mark is done.
+            this.goneAt.delete(sessionID);
             // Remembered even for an id this reporter never admitted: a later
             // stale prompt must not be the event that revives it.
             this.removed.add(sessionID);

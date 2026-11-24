@@ -461,7 +461,10 @@ test("a snapshot cannot clear an ask that arrived after it began", async () => {
         await snapshot.promise;
         return ["per_old"];
       }
-      return [];
+      // A later read sees the world as it is: `per_old` answered, `per_new`
+      // still open. Anything else would be a host that lies about its own
+      // prompts, which no guard can defend against.
+      return ["per_new"];
     },
   });
   await w.emit("session.created");
@@ -486,5 +489,63 @@ test("a snapshot cannot clear an ask that arrived after it began", async () => {
     !statuses.slice(1).includes("idle"),
     `an open ask was cleared: ${statuses.join(",")}`,
   );
+  stopAllReporters();
+});
+
+test("a start consumed before a newer end does not publish", async () => {
+  const w = harness();
+  const promptGate = gate();
+  let prompts = 0;
+  await w.setup({
+    get: async () => row(),
+    permissions: async () => {
+      prompts += 1;
+      if (prompts === 1) await promptGate.promise;
+      return [];
+    },
+  });
+  await w.emit("session.created");
+  await w.idle();
+  w.pass();
+  await until("prompt read in flight", () => prompts === 1);
+  await w.emit("session.execution.started");
+  await w.emit("session.execution.succeeded");
+  promptGate.resolve();
+  await w.idle();
+
+  // The end was consumed before the start's task ran: publishing `working`
+  // would report a run that is already over.
+  assert.deepEqual(w.writes(), [["idle", "original"]]);
+  stopAllReporters();
+});
+
+test("a snapshot settles an ask that was already closed when it began", async () => {
+  const w = harness();
+  const getGate = gate();
+  let gets = 0;
+  let open = false;
+  await w.setup({
+    get: async () => {
+      gets += 1;
+      if (gets === 2) await getGate.promise;
+      return row();
+    },
+    // The list reflects the host: `per_open` is opened, then answered without
+    // its reply event ever being delivered.
+    permissions: async () => (open ? [{ id: "per_open" }] : []),
+  });
+  await w.emit("session.created");
+  await w.idle();
+  w.pass();
+  await until("get in flight", () => gets === 2);
+  open = true;
+  await w.emit("permission.asked", { id: "per_open" });
+  open = false;
+  getGate.resolve();
+  await w.idle();
+
+  // The snapshot began after the answer, so its empty set is the truth: the
+  // ask predates the read and must not be unioned back in.
+  assert.deepEqual(w.writes(), [["idle", "original"]]);
   stopAllReporters();
 });

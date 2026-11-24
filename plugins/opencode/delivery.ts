@@ -447,8 +447,19 @@ async function send(
     return;
   }
   // A rejected write (bad id, wrong token, ingest off) will not be fixed by
-  // retrying, but a transient 5xx might be.
-  if (response.status >= 500) retryOrDrop(lane, owner, key, write, pending);
+  // retrying, but a transient 5xx or a throttled 429 might be.
+  if (response.status >= 500 || response.status === 429) {
+    retryOrDrop(lane, owner, key, write, pending, retryAfterMs(response));
+  }
+}
+
+/** `Retry-After` in seconds, when the bridge sends a sane one. */
+function retryAfterMs(response: Response): number | undefined {
+  const header = response.headers?.get?.("retry-after");
+  if (typeof header !== "string") return undefined;
+  const seconds = Number(header.trim());
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.min(MAX_BACKOFF_MS, Math.round(seconds * 1_000));
 }
 
 function retryOrDrop(
@@ -457,6 +468,7 @@ function retryOrDrop(
   key: string,
   write: Write,
   pending: Pending,
+  hintMs?: number,
 ): void {
   // Unload already dropped this owner's queue and cancelled its request.
   if (owner.stopped) return;
@@ -466,7 +478,12 @@ function retryOrDrop(
   // exhausts a write: otherwise the endpoint reopens the instant a budget
   // runs out and the next resident hammers a bridge that is still down.
   lane.transportFailures += 1;
-  const backoff = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (lane.transportFailures - 1));
+  // A server-supplied hint outranks our own pacing for this write, but the
+  // outage window still advances so other residents do not storm it.
+  const backoff = Math.min(
+    MAX_BACKOFF_MS,
+    hintMs ?? 1_000 * 2 ** (lane.transportFailures - 1),
+  );
   const notBefore = Date.now() + backoff;
   lane.outageUntil = Math.max(lane.outageUntil, notBefore);
   if (exhausted) {
