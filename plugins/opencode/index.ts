@@ -218,27 +218,70 @@ class Reporter {
   private readonly pendingCreate = new Set<string>();
   /** When the last metadata read for a session was applied. */
   /**
-   * Monotonic observation counter. Every applied read — from `get`, a list
-   * admission, a permission read, an authoritative absence — takes the next
-   * number, and every queued event that carries state captures the counter when
-   * it ARRIVES. An event whose captured number is smaller than the session's
-   * last observation was formed before that observation and must not overwrite
-   * it. A counter is used instead of `Date.now()` because two observations in
-   * the same millisecond are otherwise indistinguishable, and an event and a
-   * read that share a millisecond would let the older one win.
+   * Monotonic observation counter, used to order reads against events.
+   *
+   * A read takes its number when it STARTS, not when it finishes. That is the
+   * whole point: a slow read cannot claim to know about an event that arrived
+   * while it was in flight. An event captures the counter when it ARRIVES, and
+   * may not be overwritten by a read whose number is not greater than its own —
+   * the read began before the event did.
+   *
+   * Taking the number at start also makes ties impossible in the useful
+   * direction: the read increments the counter, so an event arriving later
+   * always carries a strictly larger number and always wins.
    */
   private readonly observed = new Map<string, number>();
   /**
    * The same counter for the pending-prompt set. A successful `permission.list`
-   * is an observation of its own: an ask captured before it may not restore a
-   * block it proved gone.
+   * is an observation of its own: an ask captured before it began may not
+   * restore a block it proved gone. It says nothing about forms, which have no
+   * read at all, so `form.created` does not consult it.
    */
   private readonly promptsAt = new Map<string, number>();
+  /**
+   * The counter for titles. A list page is the only metadata source when a
+   * session's `get` is failing, but a title is not execution state: it gets its
+   * own stamp so a title-only read can never suppress a start or an end.
+   */
+  private readonly titleAt = new Map<string, number>();
+  /**
+   * Sessions with a metadata read in flight right now.
+   *
+   * Needed because the host gives no snapshot revision: when an execution event
+   * arrives while a read is running, neither the read nor the event can be
+   * proven newer. The event is applied (a dropped event is unrecoverable) and a
+   * fresh read follows, so the reported state is whatever the host says next
+   * rather than whichever of two snapshots happened to finish last.
+   */
+  private readonly reading = new Set<string>();
+  /** Sessions with a prompt read in flight right now. */
+  private readonly readingPrompts = new Set<string>();
+  /**
+   * Sessions whose execution state is contested: an execution event arrived
+   * while a metadata read was in flight, so the read's snapshot and the event
+   * claim different states and neither can be proven newer. The event does not
+   * publish a guess; a fresh read decides.
+   */
+  private readonly contended = new Set<string>();
   private observation = 0;
 
   private nextObservation(): number {
     this.observation += 1;
     return this.observation;
+  }
+
+  /**
+   * Ask for one fresh read of a session.
+   *
+   * Used when an event loses to a newer observation. Dropping the event is not
+   * enough: that observation may itself be a snapshot of unknown age, and a
+   * dropped event can never be re-derived. Re-reading asks the host which state
+   * is true, so the reporter converges instead of quietly keeping the older of
+   * two answers.
+   */
+  private recheck(sessionID: string): void {
+    if (this.closed || !this.state.sessions.has(sessionID)) return;
+    this.enqueue(() => this.check(sessionID));
   }
 
   private readonly bootSince = Date.now() - uptimeMs();
@@ -508,22 +551,36 @@ class Reporter {
    * Apply one session's current truth. An authoritative absence removes the
    * resident; a row admits it, or corrects it if it changed.
    */
+  /**
+   * Apply a read. `startedAt` is the counter value taken when the read was
+   * issued, and it is what the session is stamped with — never a fresh value,
+   * because the read knows nothing that happened after it began.
+   *
+   * A read that outlived the context that issued it is discarded *and* stamps
+   * nothing: the survivor owns this state now, and its own pass will re-read it.
+   * Letting a discarded read stamp would let it silently suppress a queued
+   * event for a state it never supplied.
+   */
   private applyRead(
     sessionID: string,
     read: Read,
-    permissions?: readonly string[] | null,
-    owner?: Registration,
+    permissions: readonly string[] | null | undefined,
+    owner: Registration | undefined,
+    startedAt: number,
   ): void {
     if (read.kind === "unknown") return;
-    // A read that outlived the context that issued it is discarded: the
-    // survivor owns this state now and its next pass re-reads it.
     if (owner && this.retired(owner)) return;
+    // An event that arrived after this read began has answered for the session
+    // more recently than the read could have seen, so the event wins: a missed
+    // event cannot be re-derived, while a stale row is repaired by the next
+    // pass. Events raise the watermark when they dispatch.
+    if ((this.observed.get(sessionID) ?? 0) > startedAt) return;
     if (read.kind === "absent") {
       this.directories.delete(sessionID);
       this.discardHeld(sessionID);
       this.pendingCreate.delete(sessionID);
       this.removed.add(sessionID);
-      this.observed.set(sessionID, this.nextObservation());
+      this.observed.set(sessionID, startedAt);
       this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
       return;
     }
@@ -535,10 +592,10 @@ class Reporter {
     // that entry is what routes its later prompt reads.
     if (view.parentID) return;
     this.directories.set(sessionID, view.directory ?? null);
-    // The observation was stamped when the row arrived (see `check`); stamping
-    // here would make the read look newer than events that preceded the
-    // permission await.
-    if (!this.observed.has(sessionID)) this.observed.set(sessionID, this.nextObservation());
+    // Replaced, not merely filled in: a revival read is newer than whatever
+    // admitted the session before, and an older queued archive must lose to it.
+    this.observed.set(sessionID, startedAt);
+    this.titleAt.set(sessionID, startedAt);
     this.dispatch({ kind: "reconcile", sessionID, view, permissions });
     this.releaseHeld(sessionID);
   }
@@ -562,7 +619,16 @@ class Reporter {
     if (fromPrompt && this.removed.has(sessionID)) return "refused";
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0] ?? null;
-    const read = await this.readSession(sessionID, directory);
+    // Taken before the read starts: this read cannot know about anything that
+    // happens while it is in flight.
+    const startedAt = this.nextObservation();
+    this.reading.add(sessionID);
+    let read: Read;
+    try {
+      read = await this.readSession(sessionID, directory);
+    } finally {
+      this.reading.delete(sessionID);
+    }
     if (read.kind === "unknown") return "unknown";
     // An absent row is not a resident, so nothing is admitted and nothing is
     // deleted on behalf of an event: only a pass removes a resident, and only
@@ -579,7 +645,7 @@ class Reporter {
     }
     // The owner is passed on so a context that retired between the read and
     // this line cannot publish the row through the survivor.
-    this.applyRead(sessionID, read, undefined, owner ?? undefined);
+    this.applyRead(sessionID, read, undefined, owner ?? undefined, startedAt);
     if (!this.state.sessions.has(sessionID)) return "refused";
     // The caller can tell that this call's own read is the freshest truth: an
     // execution event must not overwrite it with a state captured earlier.
@@ -636,18 +702,22 @@ class Reporter {
         this.pendingCreate.delete(row.id);
         this.discardHeld(row.id);
         this.removed.add(row.id);
-        this.observed.set(row.id, this.nextObservation());
         if (tracked) {
+          this.observed.set(row.id, this.nextObservation());
           this.directories.delete(row.id);
           this.dispatch({ kind: "reconcile", sessionID: row.id, view: null, missing: true });
         }
+        // An untracked archived row stamps nothing: it queues no DELETE, so it
+        // must not be able to suppress the explicit removal event that would.
         continue;
       }
       const view = this.viewOf(row);
       if (tracked) {
         // A live resident's fresh title is taken before the executing filter:
         // the list is the only metadata source when its `get` is failing, and a
-        // title is not a status change.
+        // title is not a status change. It carries its own stamp so an older
+        // queued rename loses, while execution state is left untouched.
+        this.titleAt.set(view.id, this.nextObservation());
         this.dispatch({
           kind: "renamed",
           sessionID: view.id,
@@ -690,35 +760,46 @@ class Reporter {
   private async check(sessionID: string): Promise<void> {
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0];
-    const read = await this.readSession(sessionID, directory);
+    // Both reads are stamped before they start. A read that finished later is
+    // still only as fresh as the moment it asked.
+    const startedAt = this.nextObservation();
+    this.reading.add(sessionID);
+    let read: Read;
+    try {
+      read = await this.readSession(sessionID, directory);
+    } finally {
+      this.reading.delete(sessionID);
+    }
     // Prompt reads are location-scoped: only the setup for this session's own
     // directory can describe its prompts. Without one it stays event-only.
     //
-    // Stamp the metadata observation as soon as the row is in hand. The
-    // permission read that follows may take seconds, and an execution event
-    // arriving during it is newer than this row, not older.
-    const stampedAt = read.kind === "row" ? this.nextObservation() : null;
-    if (stampedAt !== null) this.observed.set(sessionID, stampedAt);
     // A prompt read still runs when the metadata read was inconclusive: the
     // prompt list is what clears a block whose reply event was missed, and a
     // failing `get` says nothing about the prompts. It is skipped only when the
     // read proved the session gone, because then there is nothing to reconcile
     // and a stale answer could belong to a session that no longer exists.
     if (read.kind === "absent") {
-      this.applyRead(sessionID, read, undefined, owner);
+      this.applyRead(sessionID, read, undefined, owner, startedAt);
       return;
     }
     const locationDirectory = read.kind === "row" ? (read.row.location?.directory ?? null) : directory;
     const location = this.registrationFor(locationDirectory);
     if (!location) {
-      this.applyRead(sessionID, read, undefined, owner);
+      this.applyRead(sessionID, read, undefined, owner, startedAt);
       return;
     }
-    const permissions = await this.readPermissions(location, sessionID);
+    const promptsStartedAt = this.nextObservation();
+    this.readingPrompts.add(sessionID);
+    let permissions: readonly string[] | null;
+    try {
+      permissions = await this.readPermissions(location, sessionID);
+    } finally {
+      this.readingPrompts.delete(sessionID);
+    }
     if (permissions) {
-      // A successful prompt read is an observation of the pending set too: an
-      // ask event captured before it may not restore a block it proved gone.
-      this.promptsAt.set(sessionID, this.nextObservation());
+      // An ask event captured before this read began may not restore a block it
+      // proved gone. One captured after it began is newer and stands.
+      this.promptsAt.set(sessionID, promptsStartedAt);
     }
     if (read.kind === "unknown") {
       // The row read failed, but the prompt read did not: apply the set on its
@@ -726,7 +807,7 @@ class Reporter {
       if (permissions) this.dispatch({ kind: "permissions", sessionID, permissions });
       return;
     }
-    this.applyRead(sessionID, read, permissions, owner);
+    this.applyRead(sessionID, read, permissions, owner, startedAt);
   }
 
   private async readPermissions(
@@ -868,14 +949,19 @@ class Reporter {
           const title = typeof data.title === "string" ? data.title : null;
           // A rename carries the new name itself, but a session that was never
           // seen still has to be admitted before the reducer knows it.
-          const at = this.observation;
+          const at = this.nextObservation();
+          if (this.reading.has(sessionID)) this.contended.add(sessionID);
           this.enqueue(async () => {
             const admission = await this.admit(sessionID);
             // The admission read just fetched the current title, which is newer
             // than this event's: replaying the older one would undo it.
             if (admission === "admitted-fresh") return;
-            // Same for a read that landed in the meantime: its title is newer.
-            if ((this.observed.get(sessionID) ?? 0) > at) return;
+            // Same for any read that landed in the meantime: its title is newer.
+            if ((this.observed.get(sessionID) ?? 0) > at) {
+              this.recheck(sessionID);
+              return;
+            }
+            if ((this.titleAt.get(sessionID) ?? 0) > at) return;
             this.dispatch({
               kind: "renamed",
               sessionID,
@@ -891,14 +977,30 @@ class Reporter {
           // The observation counter when this event reached us. Any read applied
           // after that point is newer than the event, whatever order the queue
           // runs in, and two observations in the same millisecond stay distinct.
-          const at = this.observation;
+          const at = this.nextObservation();
+          if (this.reading.has(sessionID)) this.contended.add(sessionID);
           this.enqueue(async () => {
             const admission = await this.admit(sessionID);
             // The admission read may already have seen this session idle again,
             // which is newer than the event that queued this task. Applying the
             // event would report a run that is over.
             if (admission === "admitted-fresh") return;
-            if ((this.observed.get(sessionID) ?? 0) > at) return;
+            // A newer observation outranks this event, but that observation is
+            // itself a snapshot of unknown age, so neither answer is trusted:
+            // ask the host instead of posting either. A dropped event can never
+            // be recovered, a re-read can.
+            // Contested: a read was in flight when this event arrived, so the
+            // two disagree and no revision says which is true. Publishing the
+            // event would be a guess; publishing the read would be another.
+            if (this.contended.delete(sessionID)) {
+              this.recheck(sessionID);
+              return;
+            }
+            if ((this.observed.get(sessionID) ?? 0) > at) {
+              this.recheck(sessionID);
+              return;
+            }
+            this.observed.set(sessionID, at);
             this.dispatch({ kind: "execution-started", sessionID });
           });
         }
@@ -908,12 +1010,20 @@ class Reporter {
       case "session.execution.interrupted":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          const at = this.observation;
+          const at = this.nextObservation();
           this.enqueue(async () => {
             // A start that was never admitted must not swallow the end.
             const admission = await this.admit(sessionID);
             if (admission === "admitted-fresh") return;
-            if ((this.observed.get(sessionID) ?? 0) > at) return;
+            if (this.contended.delete(sessionID)) {
+              this.recheck(sessionID);
+              return;
+            }
+            if ((this.observed.get(sessionID) ?? 0) > at) {
+              this.recheck(sessionID);
+              return;
+            }
+            this.observed.set(sessionID, at);
             this.dispatch({ kind: "execution-ended", sessionID });
           });
         }
@@ -922,7 +1032,8 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.id === "string") {
           const sessionID = data.sessionID;
           const requestID = data.id;
-          const at = this.observation;
+          const at = this.nextObservation();
+          const contended = this.readingPrompts.has(sessionID);
           this.enqueue(async () => {
             // Same reasoning as a form: without admission the newest resident's
             // very first prompt would be dropped. A fresh read decides whether
@@ -931,6 +1042,13 @@ class Reporter {
             // Not consumed here: a duplicate open must leave the marker for the
             // terminal task, which is the only place a parked copy is dropped.
             if (this.isAnswered(Reporter.promptKey("permission", requestID))) return;
+            // A prompt read was in flight when this ask arrived: its snapshot
+            // and this event claim different sets, and no revision says which
+            // is newer, so a fresh read decides instead of a guess.
+            if (contended) {
+              this.recheck(sessionID);
+              return;
+            }
             if ((this.promptsAt.get(sessionID) ?? 0) > at) return;
             const admission = await this.admit(sessionID, true);
             // Answered while the admission read was in flight: the reply was
@@ -941,6 +1059,9 @@ class Reporter {
               return;
             }
             if (admission !== "admitted" && admission !== "admitted-fresh") return;
+            // The ask is the newest prompt observation: a prompt read that began
+            // before it arrived may not clear it.
+            this.promptsAt.set(sessionID, at);
             this.dispatch({ kind: "permission-asked", sessionID, requestID });
           });
         }
@@ -949,6 +1070,7 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
           const sessionID = data.sessionID;
           const requestID = data.requestID;
+          const at = this.nextObservation();
           // Recorded on arrival, so an open event whose admission read is still
           // in flight already knows it was answered and will not park itself.
           this.rememberAnswered(Reporter.promptKey("permission", requestID));
@@ -958,6 +1080,7 @@ class Reporter {
               (input) => input.kind === "permission-asked" && input.requestID === requestID,
             );
             this.settleAnswered(Reporter.promptKey("permission", requestID));
+            this.promptsAt.set(sessionID, at);
             this.dispatch({ kind: "permission-replied", sessionID, requestID });
           });
         }
@@ -966,7 +1089,6 @@ class Reporter {
         const formID = data?.form?.id;
         const sessionID = data?.form?.sessionID;
         if (typeof sessionID === "string" && typeof formID === "string") {
-          const at = this.observation;
           this.enqueue(async () => {
             // A form for a session this reporter does not know yet still has to
             // be recorded, or the resident sits at `working` while a user is
@@ -975,9 +1097,8 @@ class Reporter {
             // archived or absent row as absent, and absent admits nothing.
             const input = { kind: "form-created" as const, sessionID, formID };
             if (this.isAnswered(Reporter.promptKey("form", formID))) return;
-            // A prompt read that already proved this form gone is newer than
-            // this event, so the event must not restore the block.
-            if ((this.promptsAt.get(sessionID) ?? 0) > at) return;
+            // A permission read cannot observe a form, so it must never suppress
+            // one. Only this form's own reply or its session's removal can.
             const admission = await this.admit(sessionID, true);
             if (this.isAnswered(Reporter.promptKey("form", formID))) return;
             if (admission === "unknown") {
@@ -1013,13 +1134,16 @@ class Reporter {
           const sessionID = data.sessionID;
           // A read applied after this event is newer than it: the row it saw
           // says whether the session is really gone, so the event defers.
-          const at = this.observation;
+          const at = this.nextObservation();
           // Queued behind any pending admission, so a delete always outranks
           // the birth that admission was about to report.
           this.enqueue(async () => {
             // A newer read already answered for this session; this event says
             // nothing that read did not.
-            if ((this.observed.get(sessionID) ?? 0) > at) return;
+            if ((this.observed.get(sessionID) ?? 0) > at) {
+              this.recheck(sessionID);
+              return;
+            }
             // The directory entry is what routes later reads; a removed session
             // must not keep one.
             this.directories.delete(sessionID);

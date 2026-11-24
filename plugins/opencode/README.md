@@ -139,6 +139,9 @@ plugin stays silent and the session works exactly as before.
   one is admitted by the next list pass instead, which is why a pass always
   lists. A tracked idle resident returns when a lifecycle event for it arrives,
   and until then it keeps whatever the bridge last held and expires at TTL.
+  A pass reads at most 25 pages of 200 sessions; a session that stays beyond
+  that window while its create read is failing is only picked up by a later
+  lifecycle event, not by paging alone.
 
 ## What the plugin context cannot read
 
