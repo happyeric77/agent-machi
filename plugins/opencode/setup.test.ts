@@ -674,6 +674,42 @@ test("an answer is never evicted while its parked prompt waits for the reply tas
   stop?.();
 });
 
+test("a start that arrives during a slow permission read is not dropped", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  // The metadata read is instant; the prompt read is gated. A real start lands
+  // in that gap and must still be reported.
+  let releasePermit: (() => void) | null = null;
+  const ctx = makeCtx(shared);
+  ctx.ctx.permission.list = async ({ sessionID }: { sessionID: string }) => {
+    if (sessionID === "ses_s") await new Promise<void>((resolve) => (releasePermit = resolve));
+    return [];
+  };
+  const stop = await plugin.setup(ctx.ctx);
+
+  shared.rows.set("ses_s", {
+    id: "ses_s",
+    title: "s",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), idle: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_s" } });
+  await until("reported idle", () => shared.writes.some((w) => w.id === "mini-ses_s"));
+
+  // The server turns working while the prompt read is still held.
+  shared.rows.get("ses_s")!.time.busy = Date.now() + 1000;
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_s" } });
+  await wait(80);
+  releasePermit?.();
+  await until(
+    "the start reaches the bridge",
+    () => shared.writes.some((w) => w.id === "mini-ses_s" && w.status === "working"),
+    6_000,
+  );
+  stop?.();
+});
+
 export { fetchCount };
 
 test("a prompt whose admission read failed is kept, not dropped", async () => {

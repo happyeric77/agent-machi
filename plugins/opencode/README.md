@@ -72,6 +72,11 @@ plugin stays silent and the session works exactly as before.
   rename alone reports nothing (the bridge ignores a name on an unchanged
   status); the cached name lands on the next status change the bridge accepts.
   A later metadata read can also correct it.
+- Ordering is decided by an observation counter, not wall-clock time: each
+  applied read takes the next number, and each queued event captures the number
+  on arrival, so a read that lands after an event always outranks it — even two
+  in the same millisecond. A read that is older than a newer observation (a
+  queued start, a rename, an archive, a prompt event) never overwrites it.
 - Every live resident has its renewal attempted every 5 minutes, on its own
   clock: renewal never waits for a metadata read. A same-status report only
   renews the lease, so a renewal carries whatever state was last known and is
