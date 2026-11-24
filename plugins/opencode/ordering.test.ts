@@ -71,6 +71,8 @@ interface Harness {
     permissions?: () => Promise<any>;
     dir?: string;
   }): Promise<() => void>;
+  /** The live reporter, for observing internal bookkeeping. */
+  reporter(): any;
   /** Wait for a pass and the queue to go idle. */
   idle(): Promise<void>;
   pass(): void;
@@ -87,6 +89,7 @@ function harness(): Harness {
   }) as unknown as typeof globalThis.fetch;
   const reporter = (): any => [...((globalThis as any)[Symbol.for("agent-machi.reporter")] as Map<string, any>).values()][0];
   return {
+    reporter,
     writes: () =>
       written
         .filter((w) => w.body?.id === "probe-s" || new URL(w.url).searchParams.get("id") === "probe-s")
@@ -441,5 +444,47 @@ test("a newer end that has not run yet still outranks a parked start", async () 
   // The recheck cannot answer, so the parked start would otherwise be flushed.
   // A run that already ended must never be announced afterwards.
   assert.deepEqual(w.writes(), [["idle", "original"]]);
+  stopAllReporters();
+});
+
+test("a snapshot cannot clear an ask that arrived after it began", async () => {
+  const w = harness();
+  const snapshot = gate();
+  let prompts = 0;
+  await w.setup({
+    get: async () => row(),
+    permissions: async () => {
+      prompts += 1;
+      // 1: the snapshot the pass reads. It can only ever see `per_old`, because
+      // `per_new` arrives after it began.
+      if (prompts === 1) {
+        await snapshot.promise;
+        return ["per_old"];
+      }
+      return [];
+    },
+  });
+  await w.emit("session.created");
+  await w.idle();
+  await w.emit("permission.asked", { id: "per_old" });
+  await w.idle();
+  w.pass();
+  await until(
+    "snapshot in flight",
+    () => prompts === 1 && (w.reporter()?.readingPrompts.size ?? 0) === 1,
+  );
+  // `per_new` is open and the snapshot cannot see it. `per_old` is answered in
+  // the meantime, so filtering answered ids alone would leave an empty set and
+  // report the resident idle while it is still waiting on `per_new`.
+  await w.emit("permission.asked", { id: "per_new" });
+  await w.emit("permission.replied", { requestID: "per_old" });
+  snapshot.resolve();
+  await w.idle();
+
+  const statuses = w.writes().map((write) => write[0]);
+  assert.ok(
+    !statuses.slice(1).includes("idle"),
+    `an open ask was cleared: ${statuses.join(",")}`,
+  );
   stopAllReporters();
 });
