@@ -231,9 +231,14 @@ function laneFor(url: string): Lane {
       refs: 0,
       pumping: false,
     };
-    // A cooldown earned by the lane this one replaces still applies.
-    const until = cooling().get(url);
-    if (until !== undefined && until > Date.now()) lane.outageUntil = until;
+    // A cooldown earned by the lane this one replaces still applies, and so
+    // does the streak that produced it: restarting the count would shorten the
+    // next window and turn one outage into a burst after every reload.
+    const carried = cooling().get(url);
+    if (carried !== undefined && carried.until > Date.now()) {
+      lane.outageUntil = carried.until;
+      lane.transportFailures = carried.failures;
+    }
     all.set(url, lane);
   }
   return lane;
@@ -257,7 +262,7 @@ function retireLane(url: string, lane: Lane): void {
   // not worth carrying.
   const now = Date.now();
   if (lane.outageUntil > now) {
-    cooling().set(url, lane.outageUntil);
+    cooling().set(url, { until: lane.outageUntil, failures: lane.transportFailures });
     pruneCooling(now);
   }
   lanes().delete(url);
@@ -270,15 +275,22 @@ function retireLane(url: string, lane: Lane): void {
 const COOLING = Symbol.for("agent-machi.delivery.cooldowns");
 const MAX_COOLING = 64;
 
-function cooling(): Map<string, number> {
-  const host = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
+interface Cooldown {
+  /** When the endpoint may be tried again. */
+  until: number;
+  /** Consecutive failures behind that window, so the next one stays as long. */
+  failures: number;
+}
+
+function cooling(): Map<string, Cooldown> {
+  const host = globalThis as unknown as Record<symbol, Map<string, Cooldown> | undefined>;
   return (host[COOLING] ??= new Map());
 }
 
 function pruneCooling(now: number): void {
   const all = cooling();
-  for (const [url, until] of [...all]) {
-    if (until <= now) all.delete(url);
+  for (const [url, entry] of [...all]) {
+    if (entry.until <= now) all.delete(url);
   }
   // Map iteration follows insertion order, so the oldest entry goes first.
   while (all.size > MAX_COOLING) {

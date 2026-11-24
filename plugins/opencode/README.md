@@ -128,10 +128,12 @@ plugin stays silent and the session works exactly as before.
   bridge's default TTL. `DELETE` is sent for a delete event, an archive event,
   or an authoritative absence (a not-found or archived read of a tracked
   session); those are queued like any other write, not sent instantly.
-- A reload only reseeds sessions that are executing. A resident that was
-  tracked and then went idle is not re-added by the replacement reporter; it
-  returns when an event for that session arrives, and until then it keeps
-  whatever the bridge last held and expires at TTL.
+- A reload reseeds sessions that are executing. A resident that was tracked and
+  then went idle is not re-added by the replacement reporter, and neither is a
+  session whose create event arrived while its admission read was failing — that
+  one is admitted by the next list pass instead, which is why a pass always
+  lists. A tracked idle resident returns when a lifecycle event for it arrives,
+  and until then it keeps whatever the bridge last held and expires at TTL.
 
 ## What the plugin context cannot read
 
@@ -152,7 +154,9 @@ Two authoritative sources in the integration plan are out of reach on OpenCode
   `form.cancelled`) leaves that resident `blocked` until the session is
   deleted or archived, or until a reporter that lost the state stops (a
   reload with no other setup). A later form event for the same session clears
-  only that form's id, not an orphaned one. A failed prompt read never counts
+  only that form's id, not an orphaned one. An answer whose own queued handler
+  has not run yet is never evicted by other traffic, so a prompt parked behind
+  a failing read cannot replay as `blocked` after the user answered it. A failed prompt read never counts
   as "no prompts pending", and neither does a response that is not a list.
 - Prompt reads (`permission.list`) are **location-scoped**, while the event
   stream spans every location. Each setup registers the directory it was

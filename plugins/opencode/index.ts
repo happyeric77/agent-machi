@@ -210,6 +210,14 @@ class Reporter {
   private readonly answered = new Set<string>();
   /** Answered keys retained; older ones cannot still be replayed. */
   private static readonly ANSWERED_MAX = 512;
+  /**
+   * Sessions a create event named whose admission read failed. They are still
+   * unknown to the reducer, so no pass enumerates them; a later list row that
+   * proves one live is what admits it, even if it has already gone idle.
+   */
+  private readonly pendingCreate = new Set<string>();
+  /** When the last metadata read for a session was applied. */
+  private readonly readAt = new Map<string, number>();
   private readonly bootSince = Date.now() - uptimeMs();
   /** Work applied in arrival order: the whole point of this class. */
   private readonly queue: Array<() => Promise<unknown>> = [];
@@ -335,14 +343,31 @@ class Reporter {
       const [input] = this.held.splice(i, 1);
       if (!this.state.sessions.has(sessionID)) return;
       const key = Reporter.heldKey(input);
-      if (key !== null && this.answered.has(key)) continue;
+      if (key !== null && this.isAnswered(key)) continue;
       this.dispatch(input);
     }
   }
 
-  /** The `answered` key for a parked prompt event, or null for anything else. */
-  /** Record an answer, keeping the set bounded. */
+  /**
+   * Answers still waiting for their queued terminal task. These are not capped:
+   * dropping one would let a parked copy of the prompt replay as `blocked`
+   * after the user already answered it.
+   */
+  private readonly answering = new Set<string>();
+
+  /** True when this prompt was answered, whether or not its task has run yet. */
+  private isAnswered(key: string): boolean {
+    return this.answering.has(key) || this.answered.has(key);
+  }
+
+  /** Record an answer, keeping the completed-answer cache bounded. */
   private rememberAnswered(key: string): void {
+    this.answering.add(key);
+  }
+
+  /** The terminal task ran: the answer is final and the marker can age out. */
+  private settleAnswered(key: string): void {
+    this.answering.delete(key);
     this.answered.add(key);
     // Insertion order is arrival order, so the first key is the oldest.
     while (this.answered.size > Reporter.ANSWERED_MAX) {
@@ -352,6 +377,7 @@ class Reporter {
     }
   }
 
+  /** The `answered` key for a parked prompt event, or null for anything else. */
   private static heldKey(input: Input): string | null {
     if (input.kind === "permission-asked") return Reporter.promptKey("permission", input.requestID);
     if (input.kind === "form-created") return Reporter.promptKey("form", input.formID);
@@ -464,6 +490,7 @@ class Reporter {
     if (read.kind === "absent") {
       this.directories.delete(sessionID);
       this.discardHeld(sessionID);
+      this.pendingCreate.delete(sessionID);
       this.removed.add(sessionID);
       this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
       return;
@@ -476,6 +503,7 @@ class Reporter {
     // that entry is what routes its later prompt reads.
     if (view.parentID) return;
     this.directories.set(sessionID, view.directory ?? null);
+    this.readAt.set(sessionID, Date.now());
     this.dispatch({ kind: "reconcile", sessionID, view, permissions });
     this.releaseHeld(sessionID);
   }
@@ -510,6 +538,7 @@ class Reporter {
       // not be what brings it back — even though this reporter never admitted
       // it and therefore has no resident to delete.
       this.discardHeld(sessionID);
+      this.pendingCreate.delete(sessionID);
       this.removed.add(sessionID);
       return "absent";
     }
@@ -569,6 +598,7 @@ class Reporter {
       // failing must not keep renewing because the list is the only source
       // left: that is exactly the state a delete would leave behind.
       if (isArchived(row)) {
+        this.pendingCreate.delete(row.id);
         this.discardHeld(row.id);
         this.removed.add(row.id);
         if (tracked) {
@@ -594,9 +624,12 @@ class Reporter {
       // earlier. Otherwise a prompt arriving after a genuine revival would be
       // refused as stale, with no read to correct it.
       this.removed.delete(view.id);
+      // Read before clearing: a create whose admission read failed is admitted
+      // by this row even if the session has already gone idle.
+      const awaitingRead = this.pendingCreate.delete(view.id);
       // An idle row still has to reach admission when a prompt is parked for it:
       // a form has no read of its own, so otherwise it is lost for good.
-      if (!isExecuting(row, this.bootSince) && !this.hasHeld(view.id)) continue;
+      if (!isExecuting(row, this.bootSince) && !this.hasHeld(view.id) && !awaitingRead) continue;
       // The directory is recorded on admission so the very first `get` and
       // prompt read already go through the setup that owns that location.
       if (view.directory !== null && view.directory !== undefined) {
@@ -771,7 +804,13 @@ class Reporter {
       case "session.created":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
-          this.enqueue(() => this.admit(sessionID));
+          this.enqueue(async () => {
+            const admission = await this.admit(sessionID);
+            // A transient read failure leaves nothing to enumerate, so the id
+            // is kept: the next list page is a second chance to admit it.
+            if (admission === "unknown") this.pendingCreate.add(sessionID);
+            else this.pendingCreate.delete(sessionID);
+          });
         }
         return;
       case "session.renamed":
@@ -781,7 +820,10 @@ class Reporter {
           // A rename carries the new name itself, but a session that was never
           // seen still has to be admitted before the reducer knows it.
           this.enqueue(async () => {
-            await this.admit(sessionID);
+            const admission = await this.admit(sessionID);
+            // The admission read just fetched the current title, which is newer
+            // than this event's: replaying the older one would undo it.
+            if (admission === "admitted-fresh") return;
             this.dispatch({
               kind: "renamed",
               sessionID,
@@ -794,12 +836,16 @@ class Reporter {
       case "session.execution.started":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
+          // When this event reached us. A read applied after that moment is
+          // newer than the event, whatever order the queue runs in.
+          const at = Date.now();
           this.enqueue(async () => {
             const admission = await this.admit(sessionID);
             // The admission read may already have seen this session idle again,
             // which is newer than the event that queued this task. Applying the
             // event would report a run that is over.
             if (admission === "admitted-fresh") return;
+            if ((this.readAt.get(sessionID) ?? 0) > at) return;
             this.dispatch({ kind: "execution-started", sessionID });
           });
         }
@@ -809,10 +855,12 @@ class Reporter {
       case "session.execution.interrupted":
         if (typeof data.sessionID === "string") {
           const sessionID = data.sessionID;
+          const at = Date.now();
           this.enqueue(async () => {
             // A start that was never admitted must not swallow the end.
             const admission = await this.admit(sessionID);
             if (admission === "admitted-fresh") return;
+            if ((this.readAt.get(sessionID) ?? 0) > at) return;
             this.dispatch({ kind: "execution-ended", sessionID });
           });
         }
@@ -828,11 +876,11 @@ class Reporter {
             // event for the next pass instead of losing it.
             // Not consumed here: a duplicate open must leave the marker for the
             // terminal task, which is the only place a parked copy is dropped.
-            if (this.answered.has(Reporter.promptKey("permission", requestID))) return;
+            if (this.isAnswered(Reporter.promptKey("permission", requestID))) return;
             const admission = await this.admit(sessionID, true);
             // Answered while the admission read was in flight: the reply was
             // already consumed, so this open event is stale by definition.
-            if (this.answered.has(Reporter.promptKey("permission", requestID))) return;
+            if (this.isAnswered(Reporter.promptKey("permission", requestID))) return;
             if (admission === "unknown") {
               this.holdPrompt({ kind: "permission-asked", sessionID, requestID });
               return;
@@ -854,6 +902,7 @@ class Reporter {
               sessionID,
               (input) => input.kind === "permission-asked" && input.requestID === requestID,
             );
+            this.settleAnswered(Reporter.promptKey("permission", requestID));
             this.dispatch({ kind: "permission-replied", sessionID, requestID });
           });
         }
@@ -869,9 +918,9 @@ class Reporter {
             // never revive a removed resident: `readSession` reports an
             // archived or absent row as absent, and absent admits nothing.
             const input = { kind: "form-created" as const, sessionID, formID };
-            if (this.answered.has(Reporter.promptKey("form", formID))) return;
+            if (this.isAnswered(Reporter.promptKey("form", formID))) return;
             const admission = await this.admit(sessionID, true);
-            if (this.answered.has(Reporter.promptKey("form", formID))) return;
+            if (this.isAnswered(Reporter.promptKey("form", formID))) return;
             if (admission === "unknown") {
               this.holdPrompt(input);
               return;
@@ -894,6 +943,7 @@ class Reporter {
             // its session was admitted leaves nothing to report, and the drop
             // must happen before the parked admission task can resume.
             this.dropHeld(sessionID, (input) => input.kind === "form-created" && input.formID === formID);
+            this.settleAnswered(Reporter.promptKey("form", formID));
             this.dispatch({ kind, sessionID, formID });
           });
         }

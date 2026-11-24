@@ -558,6 +558,122 @@ test("a duplicate open event does not swallow the answer", async () => {
   stop?.();
 });
 
+test("a create whose admission read failed is admitted by a later list row", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  // The create arrives while reads are failing, so its own admission is lost.
+  const ctx = makeCtx(shared, { getFails: (_id, call) => call === 1 });
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_late", {
+    id: "ses_late",
+    title: "late",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now(), idle: Date.now() + 1 }, // already idle
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_late" } });
+  await wait(120);
+
+  // get recovers; the next pass's list row must admit it even though idle.
+  forcePass();
+  await until("the idle row is admitted", () => shared.writes.some((w) => w.id === "mini-ses_late"), 8_000);
+  stop?.();
+});
+
+test("an execution event older than the newest read never overwrites it", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  let release: (() => void) | null = null;
+  let call = 0;
+  const ctx = makeCtx(shared);
+  ctx.ctx.session.get = async ({ sessionID }: { sessionID: string }) => {
+    call += 1;
+    const row = shared.rows.get(sessionID);
+    if (!row) throw Object.assign(new Error("not found"), { _tag: "Session.NotFoundError" });
+    // The second read is held, so the start event queues behind it.
+    if (call === 2) await new Promise<void>((resolve) => (release = resolve));
+    return row;
+  };
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_e", {
+    id: "ses_e",
+    title: "e",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_e" } });
+  await until("admitted", () => shared.writes.some((w) => w.id === "mini-ses_e"));
+
+  // The run ends while the start is still queued behind a held read: the row
+  // the read finally returns says busy < idle, i.e. already finished.
+  shared.rows.get("ses_e")!.time.idle = Date.now() + 5;
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_e" } });
+  forcePass();
+  await wait(60);
+  release?.();
+  await wait(200);
+  const statuses = shared.writes.filter((w) => w.id === "mini-ses_e").map((w) => w.status);
+  assert.equal(statuses.at(-1), "idle", `statuses ${JSON.stringify(statuses)}`);
+  stop?.();
+});
+
+test("a rename does not undo the fresher title its own admission read returned", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  const ctx = makeCtx(shared);
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_t", {
+    id: "ses_t",
+    title: "current title",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.renamed", data: { sessionID: "ses_t", title: "older title" } });
+  await until("admitted", () => shared.writes.some((w) => w.id === "mini-ses_t"));
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_t" } });
+  await until(
+    "the start reports",
+    () => shared.writes.some((w) => w.id === "mini-ses_t" && w.status === "working"),
+  );
+  const names = shared.writes.filter((w) => w.id === "mini-ses_t").map((w) => w.name);
+  assert.ok(names.every((n) => n === "current title"), `names ${JSON.stringify(names)}`);
+  stop?.();
+});
+
+test("an answer is never evicted while its parked prompt waits for the reply task", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  // The form's own read fails, so it parks.
+  const ctx = makeCtx(shared, { getFails: (id, call) => id === "ses_p" && call === 1 });
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_p", {
+    id: "ses_p",
+    title: "p",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "form.created", data: { form: { id: "frm_1", sessionID: "ses_p" } } });
+  await wait(80);
+  // Many unrelated answers arrive, more than any bounded cache would hold.
+  for (let i = 0; i < 700; i += 1) {
+    shared.emit({ type: "form.replied", data: { sessionID: `ses_x${i}`, id: `frm_other${i}` } });
+  }
+  shared.emit({ type: "form.replied", data: { sessionID: "ses_p", id: "frm_1" } });
+  await wait(200);
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_p" } });
+  await wait(300);
+  const statuses = shared.writes.filter((w) => w.id === "mini-ses_p").map((w) => w.status);
+  assert.ok(!statuses.includes("blocked"), `statuses ${JSON.stringify(statuses)}`);
+  stop?.();
+});
+
 export { fetchCount };
 
 test("a prompt whose admission read failed is kept, not dropped", async () => {
@@ -1241,4 +1357,3 @@ test("a prompt read still clears a block when the metadata read fails", async ()
   assert.ok(ctx.permits() > before, "the prompt list was consulted despite the failing get");
   stop?.();
 });
-
