@@ -310,3 +310,35 @@ test("a late start does not revive a confirmed removal", () => {
     { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
   ]);
 });
+
+test("a revival does not inherit the ended incarnation's prompts", () => {
+  const state = createState();
+  created(state);
+  reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_old" });
+  reduce(state, { kind: "form-created", sessionID: "ses_a", formID: "frm_old" });
+  reduce(state, { kind: "deleted", sessionID: "ses_a" });
+  // The session comes back: the row proves a live session, but a permission
+  // read can never clear a form, so the old prompts must not survive it.
+  const actions = reduce(state, {
+    kind: "reconcile",
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+    revived: true,
+  });
+  assert.deepEqual(actions, [
+    { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
+  ]);
+});
+
+test("a row that is not a revival keeps the prompts it already had", () => {
+  const state = createState();
+  created(state);
+  reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_1" });
+  const actions = reduce(state, {
+    kind: "reconcile",
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+  });
+  // Still blocked, so nothing new is posted and the prompt is untouched.
+  assert.deepEqual(actions, []);
+});

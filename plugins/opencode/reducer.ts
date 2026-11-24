@@ -71,6 +71,11 @@ export type Input =
        * read was skipped. Neither clears the event-derived set.
        */
       permissions?: readonly string[] | null;
+      /**
+       * The row proves the session exists after this reporter had recorded its
+       * removal. Prompts from the ended incarnation are dropped, not carried.
+       */
+      revived?: boolean;
     };
 
 export type Action =
@@ -282,6 +287,17 @@ export function reduce(state: State, input: Input): Action[] {
         return out;
       }
       if (!input.view) return out;
+      // A revival is a different incarnation. Prompts belong to the one that
+      // ended, and a permission read can never clear a form, so leaving them
+      // would keep the new resident blocked by a question that was answered —
+      // or abandoned — before it existed.
+      if (input.revived) {
+        const previous = state.sessions.get(input.sessionID);
+        if (previous) {
+          previous.permissions.clear();
+          previous.forms.clear();
+        }
+      }
       applyView(state, input.view, out);
       // A set is replaced only on a successful read; a skipped read leaves the
       // event-derived set alone because prompt reads are location-scoped.

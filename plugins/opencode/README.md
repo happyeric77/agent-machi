@@ -120,8 +120,11 @@ plugin stays silent and the session works exactly as before.
   `time.archived`, so it is excluded wherever rows are read.
 - A session confirmed gone stays gone until a fresh, non-archived read proves
   it is live again; a bare start event does not revive it. Prompt events that
-  arrive while it is gone are dropped, so a later revival cannot inherit a
-  stale form or permission.
+  arrive while it is gone are dropped. A revival still starts with an empty
+  prompt set even if the ended incarnation's prompts were never cleared: the row
+  that revives it is a new incarnation, and a permission read can never clear a
+  form, so carrying those over would leave the new resident blocked by a
+  question that was answered or abandoned before it existed.
 - A delete or archive event for a session this reporter never tracked still
   sends `DELETE`: after a plugin reload the resident from the earlier instance
   must be cleared now, not at TTL. Deleting an absent row is a no-op on the

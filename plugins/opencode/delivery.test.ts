@@ -321,4 +321,8 @@ test("an HTTP-date Retry-After is parsed as a delay, not as seconds", () => {
   assert.equal(retryAfterMs(seconds), 3_000);
   const past = new Response(null, { status: 429, headers: { "retry-after": new Date(Date.now() - 5_000).toUTCString() } });
   assert.equal(retryAfterMs(past), undefined);
+  // The server's hint is not clamped to this client's own backoff ceiling:
+  // shortening it would only earn another 429.
+  const long = new Response(null, { status: 429, headers: { "retry-after": "120" } });
+  assert.equal(retryAfterMs(long), 120_000);
 });

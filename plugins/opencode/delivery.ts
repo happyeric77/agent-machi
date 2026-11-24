@@ -456,6 +456,9 @@ async function send(
 /**
  * `Retry-After` as either delay-seconds or an HTTP-date, per RFC 9110. A date
  * in the past means "retry now", which is no hint at all.
+ *
+ * The server's own hint is not clamped to this client's backoff ceiling: if a
+ * bridge asks for two minutes, waiting one would only earn another 429.
  */
 export function retryAfterMs(response: Response): number | undefined {
   const header = response.headers?.get?.("retry-after");
@@ -467,7 +470,7 @@ export function retryAfterMs(response: Response): number | undefined {
     ? seconds * 1_000
     : Date.parse(value) - Date.now();
   if (!Number.isFinite(delay) || delay <= 0) return undefined;
-  return Math.min(MAX_BACKOFF_MS, Math.round(delay));
+  return Math.round(delay);
 }
 
 function retryOrDrop(
@@ -486,12 +489,10 @@ function retryOrDrop(
   // exhausts a write: otherwise the endpoint reopens the instant a budget
   // runs out and the next resident hammers a bridge that is still down.
   lane.transportFailures += 1;
-  // A server-supplied hint outranks our own pacing for this write, but the
-  // outage window still advances so other residents do not storm it.
-  const backoff = Math.min(
-    MAX_BACKOFF_MS,
-    hintMs ?? 1_000 * 2 ** (lane.transportFailures - 1),
-  );
+  // A server-supplied hint outranks our own pacing for this write, including
+  // its size: shortening what the bridge asked for would only earn another 429.
+  // The outage window still advances so other residents do not storm it.
+  const backoff = hintMs ?? Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (lane.transportFailures - 1));
   const notBefore = Date.now() + backoff;
   lane.outageUntil = Math.max(lane.outageUntil, notBefore);
   if (exhausted) {

@@ -218,11 +218,14 @@ class Reporter {
   private readonly pendingCreate = new Set<string>();
   /**
    * Sessions whose lifecycle event could not be admitted because its read
-   * failed. A create is not the only way a session appears: after a revival the
-   * only events may be a start and a form, and losing both leaves the town with
-   * a session it has been told about and cannot see.
+   * failed, with the transition that event carried. A create is not the only
+   * way a session appears: after a revival the only events may be a start and a
+   * form, and losing both leaves the town with a session it has been told about
+   * and cannot see. The kind is kept because the admission that eventually
+   * happens must report the run the host actually told us about, not whatever
+   * the row happens to say.
    */
-  private readonly pendingLifecycle = new Set<string>();
+  private readonly pendingLifecycle = new Map<string, { kind: "working" | "ended"; at: number }>();
   /** When the last metadata read for a session was applied. */
   /**
    * Monotonic observation counter, used to order reads against events.
@@ -825,11 +828,6 @@ class Reporter {
     // began after the removal: a row captured before it describes the
     // incarnation that ended, and clearing the mark with it would let a parked
     // ask publish a block for a session the host already archived.
-    // A live row proves the session exists again, so the removal mark — which
-    // only exists to block stale prompts — is cleared. But only by a read that
-    // began after the removal: a row captured before it describes the
-    // incarnation that ended, and clearing the mark with it would let a parked
-    // ask publish a block for a session the host already archived.
     const goneBefore = (this.goneAt.get(sessionID) ?? 0) > startedAt;
     if (goneBefore) {
       // The row describes an incarnation the host has already ended. It cannot
@@ -838,6 +836,10 @@ class Reporter {
       // comes next.
       return;
     }
+    // This reporter had already recorded the session as gone: the row that
+    // follows describes a new incarnation, not the one whose prompts are still
+    // held.
+    const revived = this.removed.has(sessionID) || this.goneAt.has(sessionID);
     // A live row proves the session exists again, so the removal mark — which
     // only exists to block stale prompts — is cleared.
     this.removed.delete(sessionID);
@@ -896,7 +898,11 @@ class Reporter {
       sessionID,
       view: { ...view, executing },
       permissions: nextPermissions,
+      ...(revived ? { revived: true } : {}),
     });
+    // A revival may have been admitted before the archive task ran. The queued
+    // removal still owns the old incarnation's prompt state, so dropping it is
+    // that task's job: nothing is left here for it to clear.
     this.releaseHeld(sessionID);
     // The row answered execution; a prompt read that failed leaves the parked
     // asks as the only evidence, so they are applied rather than lost.
@@ -1037,12 +1043,28 @@ class Reporter {
       // earlier. Otherwise a prompt arriving after a genuine revival would be
       // refused as stale, with no read to correct it.
       this.removed.delete(view.id);
-      // Read before clearing: a create whose admission read failed is admitted
-      // by this row even if the session has already gone idle.
-      const awaitingRead = this.pendingCreate.delete(view.id) || this.pendingLifecycle.delete(view.id);
-      // An idle row still has to reach admission when a prompt is parked for it:
-      // a form has no read of its own, so otherwise it is lost for good.
-      if (!isExecuting(row, this.bootSince) && !this.hasHeld(view.id) && !awaitingRead) continue;
+      // A create or lifecycle event whose admission read failed is admitted by
+      // this row. The lifecycle entry carries what the host said the session was
+      // doing, which is newer evidence than the page's own snapshot.
+      const lifecycle = this.pendingLifecycle.get(view.id);
+      const awaitingCreate = this.pendingCreate.has(view.id);
+      const awaitingRead = awaitingCreate || lifecycle !== undefined;
+      // The page is a snapshot from before it was requested. An execution event
+      // received since then knows better whether the session is running, so its
+      // state is taken instead of the row's — otherwise a resident admitted from
+      // an old page reports a run that already ended, or misses a run that has
+      // started and cannot be seen yet because its own read failed.
+      const newerExec = (this.execAt.get(view.id) ?? 0) > pageAt;
+      const carried = lifecycle !== undefined && lifecycle.at > pageAt ? lifecycle : null;
+      const executing = carried !== null
+        ? carried.kind === "working"
+        : newerExec
+          ? this.execKind.get(view.id) === "working"
+          : view.executing;
+      // An idle row still has to reach admission when a prompt is parked for it,
+      // or when an event named this session: a form has no read of its own, so
+      // otherwise it is lost for good.
+      if (!executing && !this.hasHeld(view.id) && !awaitingRead) continue;
       // The directory is recorded on admission so the very first `get` and
       // prompt read already go through the setup that owns that location.
       if (view.directory !== null && view.directory !== undefined) {
@@ -1058,12 +1080,10 @@ class Reporter {
       if ((this.goneAt.get(view.id) ?? 0) > pageAt) continue;
       this.observed.set(view.id, pageAt);
       this.titleAt.set(view.id, pageAt);
-      // The page is a snapshot from before it was requested. An execution event
-      // received since then knows better whether the session is running, so its
-      // state is taken instead of the row's — otherwise a resident admitted from
-      // an old page reports a run that already ended.
-      const newerExec = (this.execAt.get(view.id) ?? 0) > pageAt;
-      const executing = newerExec ? this.execKind.get(view.id) === "working" : view.executing;
+      // The markers have done their work: this row is the admission they asked
+      // for, and the transition it carried is in `executing`.
+      this.pendingCreate.delete(view.id);
+      this.pendingLifecycle.delete(view.id);
       // A removed resident is not in the map at all, so this readmits it: the
       // list row is a fresh, non-archived observation of a live session.
       views.push({ ...view, executing });
@@ -1410,7 +1430,9 @@ class Reporter {
             // and only the read failed. The id is kept so a later live list row
             // admits it, and the transition is parked so that admission reports
             // it rather than the session appearing with no state at all.
-            if (admission === "unknown") this.pendingLifecycle.add(sessionID);
+            if (admission === "unknown") {
+              this.pendingLifecycle.set(sessionID, { kind: "working", at });
+            }
             // The admission read may already have seen this session idle again,
             // which is newer than the event that queued this task. Applying the
             // event would report a run that is over.
@@ -1467,7 +1489,9 @@ class Reporter {
           this.enqueue(async () => {
             // A start that was never admitted must not swallow the end.
             const admission = await this.admit(sessionID);
-            if (admission === "unknown") this.pendingLifecycle.add(sessionID);
+            if (admission === "unknown") {
+              this.pendingLifecycle.set(sessionID, { kind: "ended", at });
+            }
             if (admission === "admitted-fresh") return;
             // Not a resident (a child, an absent row, or a refusal): the event
             // describes something the town never shows, so nothing is stamped.
@@ -1536,10 +1560,19 @@ class Reporter {
               this.holdPrompt(input);
               return;
             }
-            if (admission !== "admitted" && admission !== "admitted-fresh") return;
+            // Refused or absent: the ask belongs to no resident. Its durable
+            // record would outlive every chance to clear it, so it goes with the
+            // refusal rather than accumulating for a session that never exists.
+            if (admission !== "admitted" && admission !== "admitted-fresh") {
+              this.closeAsk(sessionID, requestID);
+              return;
+            }
             // A removal already received ends this incarnation: its ask must not
             // be reported as a block for whoever comes next.
-            if ((this.goneAt.get(sessionID) ?? 0) > at) return;
+            if ((this.goneAt.get(sessionID) ?? 0) > at) {
+              this.closeAsk(sessionID, requestID);
+              return;
+            }
             // The ask is the newest prompt observation: a prompt read that began
             // before it arrived may not clear it.
             this.promptsAt.set(sessionID, at);
@@ -1569,6 +1602,12 @@ class Reporter {
             // of the set: lowering the watermark with it would let an ask that
             // was captured before a later, successful list restore a block that
             // list had already proved gone.
+            // A removal already received ends this incarnation. Its status
+            // bookkeeping still runs above, but publishing an unblock for a
+            // resident the host has archived would be a status for a session the
+            // user already closed.
+            if ((this.goneAt.get(sessionID) ?? 0) > at) return;
+            if (!this.state.sessions.has(sessionID)) return;
             this.dispatch({ kind: "permission-replied", sessionID, requestID });
           });
         }
@@ -1590,17 +1629,31 @@ class Reporter {
             // being asked a question. Admission here is a fresh read, so it can
             // never revive a removed resident: `readSession` reports an
             // archived or absent row as absent, and absent admits nothing.
-            if (this.isAnswered(Reporter.promptKey("form", formID))) return;
+            if (this.isAnswered(Reporter.promptKey("form", formID))) {
+              this.closeAsk(sessionID, formID);
+              return;
+            }
             // A permission read cannot observe a form, so it must never suppress
             // one. Only this form's own reply or its session's removal can.
             const admission = await this.admit(sessionID, true);
-            if (this.isAnswered(Reporter.promptKey("form", formID))) return;
+            if (this.isAnswered(Reporter.promptKey("form", formID))) {
+              this.closeAsk(sessionID, formID);
+              return;
+            }
             if (admission === "unknown") {
               this.holdPrompt(input);
               return;
             }
-            if (admission !== "admitted" && admission !== "admitted-fresh") return;
-            if ((this.goneAt.get(sessionID) ?? 0) > at) return;
+            // Refused or absent: the form belongs to no resident, so its durable
+            // record would outlive every chance to clear it.
+            if (admission !== "admitted" && admission !== "admitted-fresh") {
+              this.closeAsk(sessionID, formID);
+              return;
+            }
+            if ((this.goneAt.get(sessionID) ?? 0) > at) {
+              this.closeAsk(sessionID, formID);
+              return;
+            }
             this.dispatch(input);
           } finally {
             this.clearInbound(input);
@@ -1615,6 +1668,7 @@ class Reporter {
           const sessionID = data.sessionID;
           const formID = data.id;
           const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
+          const at = this.nextObservation();
           this.rememberAnswered(Reporter.promptKey("form", formID));
           this.closeAsk(sessionID, formID);
           this.enqueue(async () => {
@@ -1623,6 +1677,10 @@ class Reporter {
             // must happen before the parked admission task can resume.
             this.dropHeld(sessionID, (input) => input.kind === "form-created" && input.formID === formID);
             this.settleAnswered(Reporter.promptKey("form", formID));
+            // A removal already received ends this incarnation; publishing for
+            // it would report a status for a session the user already closed.
+            if ((this.goneAt.get(sessionID) ?? 0) > at) return;
+            if (!this.state.sessions.has(sessionID)) return;
             this.dispatch({ kind, sessionID, formID });
           });
         }
