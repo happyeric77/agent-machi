@@ -137,9 +137,14 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     stopped: false,
   };
 
-  /** The resident this write is about; the queue key. */
+  /**
+   * The resident this write is about; the queue key. The source is part of it
+   * because the bridge keys a resident by `source` + `id`: two sources sharing
+   * an id are two residents, and coalescing them would drop one silently.
+   */
   function keyOf(write: Write): string | null {
-    return residentID(owner.machineId, write.sessionID);
+    const id = residentID(owner.machineId, write.sessionID);
+    return id === null ? null : `${owner.source}\u0000${id}`;
   }
 
   function enqueue(write: Write): void {
@@ -226,6 +231,9 @@ function laneFor(url: string): Lane {
       refs: 0,
       pumping: false,
     };
+    // A cooldown earned by the lane this one replaces still applies.
+    const until = cooling().get(url);
+    if (until !== undefined && until > Date.now()) lane.outageUntil = until;
     all.set(url, lane);
   }
   return lane;
@@ -243,7 +251,41 @@ function retireLane(url: string, lane: Lane): void {
   const waiters = lane.idle;
   lane.idle = [];
   for (const resolve of waiters) resolve();
+  // The destination has not changed and it was failing a moment ago, so the
+  // cooldown outlives the reporter that learned it: a reload must not turn one
+  // outage into a burst of requests. A cooldown that already expired is simply
+  // not worth carrying.
+  const now = Date.now();
+  if (lane.outageUntil > now) {
+    cooling().set(url, lane.outageUntil);
+    pruneCooling(now);
+  }
   lanes().delete(url);
+}
+
+/**
+ * Endpoint cooldowns that outlived their lane. Bounded so a process that churns
+ * through endpoints cannot accumulate entries forever.
+ */
+const COOLING = Symbol.for("agent-machi.delivery.cooldowns");
+const MAX_COOLING = 64;
+
+function cooling(): Map<string, number> {
+  const host = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
+  return (host[COOLING] ??= new Map());
+}
+
+function pruneCooling(now: number): void {
+  const all = cooling();
+  for (const [url, until] of [...all]) {
+    if (until <= now) all.delete(url);
+  }
+  // Map iteration follows insertion order, so the oldest entry goes first.
+  while (all.size > MAX_COOLING) {
+    const oldest = all.keys().next();
+    if (oldest.done) break;
+    all.delete(oldest.value);
+  }
 }
 
 function settleIfIdle(lane: Lane): void {
@@ -350,6 +392,16 @@ async function send(
       resolve(null);
     }, owner.timeoutMs);
     (deadline as unknown as { unref?: () => void }).unref?.();
+    // A close() aborts the controller; the race must end there too, because a
+    // fetch is free to ignore the signal. The deadline is the slow fallback.
+    controller.signal.addEventListener(
+      "abort",
+      () => {
+        if (deadline !== null) clearTimeout(deadline);
+        resolve(null);
+      },
+      { once: true },
+    );
   });
   let response: Response | null;
   try {

@@ -88,9 +88,15 @@ plugin stays silent and the session works exactly as before.
   the queue is short, but delivery is best-effort: a write can be dropped after
   its retry budget, and outage backoff is shared by the whole endpoint — every
   machine slug aimed at the same bridge shares one request lane and one outage
-  window, and each queued write keeps its own reporter's token and id.
+  window, and each queued write keeps its own reporter's token and id. A queue
+  and in-flight slot are keyed by source as well as resident id, because the
+  bridge keys a resident by both. An outage window outlives the reporter that
+  earned it: unloading the last one and reloading it does not reset the
+  cooldown, so a restart cannot turn one outage into a burst.
 - Write ordering is not guaranteed across a proxy. An unload aborts anything
-  still on the wire, but a proxy that already buffered an earlier POST can
+  still on the wire — including a request whose fetch ignores the abort signal,
+  which releases the lane instead of waiting for the deadline — but a proxy
+  that already buffered an earlier POST can
   still forward it after a newer DELETE reaches the bridge, and the bridge has
   no sequence check. If a stale write must never win, that needs a write
   generation enforced at the bridge; aborting the client is not enough.

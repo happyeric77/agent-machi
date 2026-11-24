@@ -472,6 +472,92 @@ test("a failed seed on reconnect is retried after a successful startup", async (
   stop?.();
 });
 
+test("an admission read that finds the row gone blocks a later stale prompt", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  const ctx = makeCtx(shared);
+  const stop = await plugin.setup(ctx.ctx);
+
+  // The session is never admitted: its first read proves it no longer exists,
+  // because there is no row for it at all (`Session.NotFoundError`).
+  shared.emit({ type: "session.created", data: { sessionID: "ses_g" } });
+  await wait(100);
+  shared.rows.set("ses_g", {
+    id: "ses_g",
+    title: "G",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  // A form that outlived the session must not be what brings it back blocked.
+  shared.emit({ type: "form.created", data: { form: { id: "frm_g", sessionID: "ses_g" } } });
+  await wait(150);
+  assert.equal(
+    shared.writes.filter((w) => w.id === "mini-ses_g").length,
+    0,
+    "a stale form did not revive a session whose absence was proven",
+  );
+  stop?.();
+});
+
+test("a live idle list row clears an earlier removal so a new prompt is kept", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  const ctx = makeCtx(shared);
+  const stop = await plugin.setup(ctx.ctx);
+
+  shared.emit({ type: "session.archived", data: { sessionID: "ses_h" } });
+  await wait(80);
+  shared.rows.set("ses_h", {
+    id: "ses_h",
+    title: "H",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  forcePass();
+  await wait(200);
+  // Reads now work: the live idle row revives the session, and the form that
+  // follows it is genuinely pending, so it must be reported.
+  shared.emit({ type: "form.created", data: { form: { id: "frm_h", sessionID: "ses_h" } } });
+  await until("the new form is reported", () => shared.writes.some((w) => w.status === "blocked"), 4000);
+  stop?.();
+});
+
+test("a duplicate open event does not swallow the answer", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+  let failFirst = true;
+  const ctx = makeCtx(shared, { getFails: () => failFirst });
+  const stop = await plugin.setup(ctx.ctx);
+
+  shared.rows.set("ses_i", {
+    id: "ses_i",
+    title: "I",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  shared.emit({ type: "form.created", data: { form: { id: "frm_i", sessionID: "ses_i" } } });
+  await wait(100);
+  // The same open arrives twice; the second must leave the answer marker alone
+  // so the queued reply can still drop the parked copy.
+  shared.emit({ type: "form.created", data: { form: { id: "frm_i", sessionID: "ses_i" } } });
+  shared.emit({ type: "form.replied", data: { sessionID: "ses_i", id: "frm_i" } });
+  failFirst = false;
+  // Admit through the normal event queue (never `forcePass()`, which bypasses
+  // it): once reads work again the session is admitted, and the parked copies
+  // of an already-answered form must not come with it.
+  shared.emit({ type: "session.created", data: { sessionID: "ses_i" } });
+  await until("ses_i admitted", () => shared.writes.some((w) => w.id === "mini-ses_i"), 4000);
+  await wait(150);
+  assert.ok(
+    !shared.writes.some((w) => w.status === "blocked"),
+    "an answered form was never reported as a block",
+  );
+  stop?.();
+});
+
 export { fetchCount };
 
 test("a prompt whose admission read failed is kept, not dropped", async () => {
