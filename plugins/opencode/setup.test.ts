@@ -322,4 +322,104 @@ test("a prompt read that cannot answer never clears a pending prompt", async () 
   stop?.();
 });
 
+test("a child session never becomes a resident, even via its own event", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  const ctx = makeCtx(shared);
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_child", {
+    id: "ses_child",
+    title: "subagent",
+    parentID: "ses_parent",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  } as any);
+  // The event path goes through reconcile, not the list, so this is the case
+  // that used to slip past the parent check.
+  shared.emit({ type: "session.created", data: { sessionID: "ses_child" } });
+  await wait(400);
+  assert.equal(
+    shared.writes.filter((w) => w.id.includes("ses_child")).length,
+    0,
+    "a child session was never reported",
+  );
+  stop?.();
+});
+
+test("an archived resident returns only when a fresh read proves it live", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  const ctx = makeCtx(shared);
+  const stop = await plugin.setup(ctx.ctx);
+  shared.rows.set("ses_r", {
+    id: "ses_r",
+    title: "r",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now() },
+  });
+  shared.emit({ type: "session.created", data: { sessionID: "ses_r" } });
+  await until("reported", () => shared.writes.some((w) => w.id === "mini-ses_r"));
+
+  shared.rows.get("ses_r")!.time.archived = Date.now();
+  shared.emit({ type: "session.archived", data: { sessionID: "ses_r" } });
+  await until("deleted", () => shared.writes.some((w) => w.method === "DELETE"));
+  const afterDelete = shared.writes.length;
+
+  // Unarchived and running again: the next lifecycle event reads the row, and
+  // that fresh read is what admits it. No tombstone is consulted.
+  delete shared.rows.get("ses_r")!.time.archived;
+  shared.rows.get("ses_r")!.time.busy = Date.now();
+  shared.emit({ type: "session.execution.started", data: { sessionID: "ses_r" } });
+  await until(
+    "a fresh read revives it",
+    () => shared.writes.slice(afterDelete).some((w) => w.method === "POST" && w.status === "working"),
+    8_000,
+  );
+  stop?.();
+});
+
+test("a failed seed on reconnect is retried after a successful startup", async () => {
+  const plugin = await loadPlugin();
+  const shared = world();
+  installFetch(shared);
+
+  // Startup succeeds with one resident.
+  const ctx = makeCtx(shared);
+  // Bootstrap only seeds sessions that are executing: an idle one is not
+  // re-added by a reload, by design.
+  shared.rows.set("ses_seen", {
+    id: "ses_seen",
+    title: "seen",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  const stop = await plugin.setup(ctx.ctx);
+  await until("startup seed reported", () => shared.writes.some((w) => w.id === "mini-ses_seen"));
+
+  // A session that starts while the list is failing must still be found once
+  // the list recovers: retry is owed for the failed read, not for "first ever".
+  shared.rows.set("ses_late", {
+    id: "ses_late",
+    title: "late",
+    location: { directory: "/tmp/project" },
+    time: { created: Date.now(), busy: Date.now() },
+  });
+  // A separate reporter (its own machine id): the point is that ITS failed seed
+  // is retried even though another reporter started successfully long before.
+  const failing = makeCtx(shared, { listFails: 1, machineId: "mini2" });
+  // A second location re-seeds; its first list read fails.
+  const stop2 = await plugin.setup(failing.ctx);
+  await until(
+    "the retried seed finds the late session",
+    () => shared.writes.some((w) => w.id === "mini2-ses_late"),
+    12_000,
+  );
+  stop2?.();
+  stop?.();
+});
+
 export { fetchCount };

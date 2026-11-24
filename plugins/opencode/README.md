@@ -30,7 +30,8 @@ step. Tested against OpenCode 2.2.6.
    ```
 
    `bridgeUrl` is the bridge root. `machineId` is any short, stable, unique
-   slug for this machine (letters, digits, punctuation; no spaces or colons).
+   slug for this machine: printable ASCII, at most 100 bytes, no colons or
+   spaces.
    It is part of every resident id, so do not copy it to a second machine.
 
 3. The token must be in the environment of the **process that owns the
@@ -62,13 +63,15 @@ plugin stays silent and the session works exactly as before.
 | Session idle | `idle` |
 | `session.deleted` or `session.archived` | removed with `DELETE /report` |
 
-- One resident per top-level session. Child (subagent) sessions never get one.
+- One resident per top-level session. Child (subagent) sessions never get one,
+  on any path: a create event, a metadata read, or a list read.
 - `source` is `opencode`, `agent` is `opencode`, and the resident id is
   `<machineId>-<sessionID>`. A session whose id would break the bridge's limits
   is skipped and logged instead of being altered.
 - The display name is the session title, falling back to the directory name. A
   rename alone reports nothing (the bridge ignores a name on an unchanged
-  status); the new name lands with the session's next transition.
+  status); the cached name lands on the next status change the bridge accepts.
+  A later metadata read can also correct it.
 - Every live resident is renewed every 5 minutes, on its own clock: renewal
   never waits for a metadata read. A same-status report only renews the lease,
   so a renewal carries whatever state was last known and is not a correction.
@@ -126,9 +129,10 @@ Two authoritative sources in the integration plan are out of reach on OpenCode
   event, not a timer: a `form.created` that is answered entirely while the
   stream is down is never seen, and a missed terminal (`form.replied` /
   `form.cancelled`) leaves that resident `blocked` until the session is
-  deleted or the process restarts. A later form event for the same session
-  clears only that form's id. A failed prompt read never counts as "no prompts
-  pending", and neither does a response that is not a list.
+  deleted or archived, or until a reporter that lost the state stops (a
+  reload with no other setup). A later form event for the same session clears
+  only that form's id, not an orphaned one. A failed prompt read never counts
+  as "no prompts pending", and neither does a response that is not a list.
 - Prompt reads (`permission.list`) are **location-scoped**, while the event
   stream spans every location. Each setup registers the directory it was
   loaded for, and a session's prompts are read through the setup for its own
@@ -137,17 +141,20 @@ Two authoritative sources in the integration plan are out of reach on OpenCode
   elsewhere, because that read would describe different prompts.
 - Plugin setup runs once per location, so reporter state cannot belong to a
   setup. Setups for the same report endpoint share one reporter keyed by the
-  canonical `/report` URL and resident namespace — not by how `bridgeUrl` was
-  spelled. That keeps another location's residents renewing, and the remaining
-  setup takes over the event stream when the one that owned it unloads. The
+  canonical `/report` URL, the machine id and the source — not by how
+  `bridgeUrl` was spelled and not by the token. That keeps another location's
+  residents renewing, and the remaining setup takes over the event stream when
+  the one that owned it unloads. A new setup does not preempt the owner. The
   reporter stops only when the last setup unloads; the process itself may
   still be running.
 
 ## Uninstall
 
 Remove the entry from `opencode.json`. Residents already reported expire by
-TTL; no `DELETE` is sent on plugin unload, and a plugin reload never removes
-anything.
+TTL; no `DELETE` is sent on plugin unload. A reload keeps the reporter alive
+while another setup remains, so it removes nothing by itself — but a
+replacement reporter can still send `DELETE` for a row it observes as archived
+or absent, exactly as a first one would.
 
 ## Troubleshooting
 

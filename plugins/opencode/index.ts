@@ -170,7 +170,10 @@ class Reporter {
   private stream: { controller: AbortController; owner: Registration } | null = null;
   private streamOwner: Registration | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
-  private seeded = false;
+  /** True while a pass is retiring, so a second request does not stack. */
+  private passRunning = false;
+  /** Bumped to retire a pass whose work is now obsolete. */
+  private passToken = 0;
   private seedRetry: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
 
@@ -273,6 +276,11 @@ class Reporter {
   }
 
   /** The context loaded for a directory, for location-scoped reads. */
+  /** A context that unloaded while a call was in flight. */
+  private retired(owner: Registration): boolean {
+    return this.closed || !this.setups.includes(owner);
+  }
+
   private registrationFor(directory: string | null): Registration | null {
     if (directory === null) return null;
     return this.setups.find((setup) => setup.directory === directory) ?? null;
@@ -327,16 +335,23 @@ class Reporter {
   }
 
   /**
-   * Make sure a session is known before an event that needs it is applied.
+   * Admit a session a lifecycle event mentions but this reporter has not seen.
    *
-   * A removed session is re-read, so a genuine revival (a fresh, non-archived
-   * row) is admitted and an archived one is not. Nothing else needs a read.
+   * Only lifecycle events may do this. A prompt event applied to an admitted
+   * session would let a stale form bring a removed resident back already
+   * blocked, and a prompt read on the next pass recovers that case anyway.
+   * An archived or absent row is never admitted, because `readSession` reports
+   * it as absent rather than as a row.
    */
   private async admit(sessionID: string): Promise<void> {
-    const tracked = this.state.sessions.get(sessionID);
-    const known = tracked !== undefined && !tracked.removed;
-    if (known) return;
-    this.applyRead(sessionID, await this.readSession(sessionID, this.directories.get(sessionID) ?? null));
+    if (this.state.sessions.has(sessionID)) return;
+    const read = await this.readSession(sessionID, this.directories.get(sessionID) ?? null);
+    if (read.kind === "unknown") return;
+    // An absent row is not a resident, so nothing is admitted and nothing is
+    // deleted on behalf of an event: only a pass removes a resident, and only
+    // after a read proved it gone.
+    if (read.kind === "absent") return;
+    this.applyRead(sessionID, read);
   }
 
   /** Page the whole session list: the API returns 50 newest by default. */
@@ -374,10 +389,18 @@ class Reporter {
     if (rows === null) return false;
     const views: SessionView[] = [];
     for (const row of rows) {
-      if (!row.id || row.parentID || isArchived(row) || !isExecuting(row, this.bootSince)) continue;
-      // A known resident keeps whatever its events and checks established; the
-      // list is here to find the ones nothing has mentioned yet.
-      if (this.state.sessions.has(row.id)) continue;
+      if (!row.id || row.parentID || isArchived(row)) continue;
+      if (!isExecuting(row, this.bootSince)) continue;
+      // A known resident is corrected by its own checks. The list only carries
+      // a name for one that arrived through an event, so a fresh title is not
+      // thrown away while its next `get` is unavailable.
+      if (this.state.sessions.has(row.id)) {
+        const view = this.viewOf(row);
+        this.dispatch({ kind: "renamed", sessionID: view.id, title: view.title ?? null });
+        continue;
+      }
+      // A removed resident is not in the map at all, so this readmits it: the
+      // list row is a fresh, non-archived observation of a live session.
       views.push(this.viewOf(row));
     }
     if (views.length > 0) this.dispatch({ kind: "discovered", sessions: views });
@@ -411,7 +434,7 @@ class Reporter {
     }
     // Only an actual list is authoritative. A stall, a missing method or an
     // unexpected payload is an unknown answer, not "nothing pending".
-    if (pending === TIMEOUT || pending === null) return null;
+    if (pending === TIMEOUT || pending === null || this.retired(owner)) return null;
     const rows = Array.isArray(pending) ? pending : pending?.data;
     if (!Array.isArray(rows)) return null;
     return rows.map((row: any) => String(row?.id ?? "")).filter((id) => id !== "");
@@ -424,28 +447,57 @@ class Reporter {
    * read — that is what makes the last applied observation the true one.
    */
   private runPass(seedNow: boolean): void {
-    this.enqueue(async () => {
-      if (this.closed) return;
-      if (seedNow || !this.seeded) {
-        const ok = await this.seed();
-        if (ok) {
-          this.seeded = true;
-          this.clearSeedRetry();
-        } else {
-          this.scheduleSeedRetry();
+    // A pass is a chain of one-session steps, each queued separately. That is
+    // what keeps a throttled pass from starving events: a delete or a prompt
+    // reply arriving mid-pass is queued ahead of the remaining steps instead of
+    // waiting behind the whole sweep.
+    void seedNow;
+    if (this.passRunning) {
+      // A pass is already retiring; it will pick the seed need up.
+      return;
+    }
+    const pass = ++this.passToken;
+    let steps: string[] | null = null;
+    const step = (): void => {
+      this.enqueue(async () => {
+        if (this.closed || pass !== this.passToken) return;
+        if (steps === null) {
+          // Every pass lists. Discovery cannot depend on an event arriving: a
+          // session that starts during an outage, or one that comes back after
+          // being removed, would otherwise never be seen again. One list call
+          // per pass is cheap, and the pages are bounded.
+          const ok = await this.seed();
+          if (!this.alive(pass)) return;
+          if (ok) this.clearSeedRetry();
+          else this.scheduleSeedRetry();
+          // Snapshot after seeding: a resident removed by it is already gone,
+          // and one admitted by it belongs in this pass.
+          steps = liveSessions(this.state);
         }
-      }
-      // Snapshot the ids: a session admitted by the seed above is checked on
-      // the next pass, and a resident removed mid-pass is skipped.
-      for (const sessionID of liveSessions(this.state)) {
-        if (this.closed) return;
-        await this.check(sessionID);
-      }
-    });
+        const sessionID = steps.shift();
+        if (sessionID !== undefined && this.state.sessions.has(sessionID)) {
+          await this.check(sessionID);
+          if (!this.alive(pass)) return;
+        }
+        if (steps.length > 0) {
+          step();
+          return;
+        }
+        this.passRunning = false;
+      });
+    };
+    this.passRunning = true;
+    step();
+  }
+
+  private alive(pass: number): boolean {
+    return !this.closed && pass === this.passToken;
   }
 
   private scheduleSeedRetry(): void {
-    if (this.closed || this.seeded || this.seedRetry !== null) return;
+    // Retry is owed for the failed list read itself, so a disconnect whose seed
+    // failed is still retried after a startup that succeeded.
+    if (this.closed || this.seedRetry !== null) return;
     this.seedRetry = setTimeout(() => {
       this.seedRetry = null;
       this.runPass(true);
@@ -506,7 +558,7 @@ class Reporter {
           const sessionID = data.sessionID;
           const requestID = data.id;
           this.enqueue(async () => {
-            await this.admit(sessionID);
+            // No admission: see admit()'s note. The next pass reads prompts.
             this.dispatch({ kind: "permission-asked", sessionID, requestID });
           });
         }
@@ -525,7 +577,6 @@ class Reporter {
         const sessionID = data?.form?.sessionID;
         if (typeof sessionID === "string" && typeof formID === "string") {
           this.enqueue(async () => {
-            await this.admit(sessionID);
             this.dispatch({ kind: "form-created", sessionID, formID });
           });
         }
