@@ -15,8 +15,8 @@ step. Tested against OpenCode 2.2.6.
    agent-machi
    ```
 
-2. Add one entry to your global OpenCode config (`~/.config/opencode/opencode.json`
-   or a project `opencode.json`), pointing at this directory:
+2. Add one entry to your global OpenCode config
+   (`~/.config/opencode/opencode.json`), pointing at this directory:
 
    ```json
    {
@@ -45,7 +45,8 @@ step. Tested against OpenCode 2.2.6.
    variable in that launcher's environment. The plugin never reads the token
    from config.
 
-4. Load the plugin. A config edit reloads it, or restart OpenCode.
+4. Load the plugin. A config edit reloads it, or restart OpenCode. On 2.2.6
+   `OPENCODE_CONFIG_CONTENT` does not load plugins, so this must be a real file.
 
 Without a token, or with a missing/invalid `bridgeUrl` or `machineId`, the
 plugin stays silent and the session works exactly as before.

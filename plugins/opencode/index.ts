@@ -98,7 +98,11 @@ export const AgentMachiReporter = {
           : { type: "post", sessionID: action.sessionID, status: action.status, name: action.name };
       delivery.enqueue(write);
     };
-    const dispatch = (input: Input): void => {
+    // Every event bumps this. A reconcile read takes time, so a value that
+    // changed underneath it is stale and must not overwrite the newer event.
+    let mutations = 0;
+    const dispatch = (input: Input, fromRead = false): void => {
+      if (!fromRead) mutations += 1;
       try {
         const actions = reduce(state, input);
         for (const action of actions) send(action);
@@ -131,6 +135,7 @@ export const AgentMachiReporter = {
     };
 
     const reconcile = async (seed: boolean): Promise<void> => {
+      let at = mutations;
       let rows: SessionRow[];
       try {
         rows = await listRows();
@@ -150,6 +155,8 @@ export const AgentMachiReporter = {
             executing: true,
           }));
         dispatch({ kind: "discovered", sessions: views });
+        // Seeding is our own write; only events during the prompt reads count.
+        at = mutations;
       }
       // Pending prompts outlive a turn, so read them for every live resident,
       // not just the ones executing right now. Permission requests have a read
@@ -157,7 +164,9 @@ export const AgentMachiReporter = {
       // event-only and a form that opens and clears between two checks can be
       // missed (see README).
       const permissions = await readPermissions(liveSessions(state));
-      dispatch({ kind: "reconcile", active, permissions });
+      // An event landed while reading; its state is newer than this snapshot.
+      if (mutations !== at) return;
+      dispatch({ kind: "reconcile", active, permissions }, true);
     };
 
     /** Resolve a session's metadata before reporting anything for it. */
