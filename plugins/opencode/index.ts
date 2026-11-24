@@ -87,12 +87,22 @@ function isExecuting(row: SessionRow, since: number): boolean {
   return busy >= since;
 }
 
+/**
+ * The event stream spans every location, but plugin setup runs once per
+ * location. Only the first setup reports, so a session never gets two owners
+ * and two writers.
+ */
+let owner: symbol | null = null;
+
 export const AgentMachiReporter = {
   id: "agent-machi-reporter",
   async setup(ctx: any) {
     const config = parseOptions(ctx?.options, serverEnv("AGENT_MACHI_INGEST_TOKEN"));
     // Missing or invalid config disables reporting without touching the host.
     if (!config) return;
+    if (owner) return;
+    const mine = Symbol("agent-machi-reporter");
+    owner = mine;
 
     const state = createState();
     const delivery = createDelivery(config);
@@ -182,24 +192,10 @@ export const AgentMachiReporter = {
       // endpoint on the plugin context; forms do not on 2.2.6, so form state is
       // event-only and a form that opens and clears between two checks can be
       // missed (see README).
-      // A delete or archive event that never arrived would let a dead resident
-      // renew forever. One authoritative read per tracked session settles it;
-      // a failed read changes nothing.
-      const gone: string[] = [];
-      for (const sessionID of liveSessions(state)) {
-        try {
-          const got: any = await ctx?.session?.get?.({ sessionID });
-          const info = got?.data ?? got;
-          if (!info?.id) gone.push(sessionID);
-        } catch {
-          // Unknown outcome: keep the resident.
-        }
-      }
       const permissions = await readPermissions(liveSessions(state));
       // An event landed while reading; its state is newer than this snapshot.
       if (mutations !== at) return;
       dispatch({ kind: "reconcile", active, permissions }, true);
-      for (const sessionID of gone) dispatch({ kind: "deleted", sessionID });
     };
 
     /** Resolve a session's metadata before reporting anything for it. */
@@ -369,6 +365,7 @@ export const AgentMachiReporter = {
       // Unload: stop producing events and drop queued writes. Late lookups are
       // fenced by `unloaded` so they cannot enqueue after cleanup returns.
       unloaded = true;
+      if (owner === mine) owner = null;
       controller.abort();
       clearInterval(heartbeat);
       delivery.close();
