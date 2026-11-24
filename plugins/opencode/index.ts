@@ -311,9 +311,32 @@ class Reporter {
    * incarnation the host has already ended.
    */
   private readonly goneAt = new Map<string, number>();
+  /**
+   * Idle sessions already probed once for an outstanding prompt. Bounded by
+   * sessions seen, and only ever grows by a list row: this is a reload-recovery
+   * path, not a per-pass cost.
+   */
+  private readonly promptProbed = new Set<string>();
   private markGone(sessionID: string, at: number): void {
     this.goneAt.delete(sessionID);
     this.goneAt.set(sessionID, Math.max(this.goneAt.get(sessionID) ?? 0, at));
+  }
+  /**
+   * True when a prompt was noted before the session's last removal.
+   *
+   * `goneAt` outlives a revival on purpose: a form or permission from the
+   * incarnation that ended must not block the one that replaced it, and the
+   * removal task cannot clean the cutoff up while such work is still queued.
+   */
+  private staleWork(sessionID: string, before: number): boolean {
+    const older = (entry: { at: number }): boolean => entry.at < before;
+    return (
+      (this.inbound.get(sessionID) ?? []).some(older) ||
+      (this.pendingPrompts.get(sessionID) ?? []).some(older) ||
+      this.held.some((entry) => heldSession(entry.input) === sessionID && entry.at < before) ||
+      (this.pendingExec.get(sessionID)?.at ?? before) < before ||
+      (this.pendingLifecycle.get(sessionID)?.at ?? before) < before
+    );
   }
   /**
    * Forget work parked for a session that is gone. A parked event describes a
@@ -336,6 +359,7 @@ class Reporter {
     this.promptsAt.delete(sessionID);
     this.titleAt.delete(sessionID);
     this.openAsks.delete(sessionID);
+    this.promptProbed.delete(sessionID);
   }
   private observation = 0;
 
@@ -444,11 +468,6 @@ class Reporter {
     if (entry.size === 0) this.openAsks.delete(sessionID);
   }
 
-  /** True when the reducer itself is holding a form for this session. */
-  private hasOpenForm(sessionID: string): boolean {
-    return (this.state.sessions.get(sessionID)?.forms.size ?? 0) > 0;
-  }
-
   /**
    * Materialize every form this reporter already knows is open for a session.
    *
@@ -460,7 +479,10 @@ class Reporter {
    * "which kind of prompt wins".
    */
   private materializeForms(sessionID: string): void {
-    if (this.hasOpenForm(sessionID)) return;
+    // No early return when a form is already in the reducer: a *different*
+    // form may have replaced it, and skipping the pass would drop the newer
+    // one. Re-dispatching a form the reducer already holds is idempotent (it
+    // is a set), so every known candidate is materialized.
     const candidates: { input: Input; at: number }[] = [
       ...(this.inbound.get(sessionID) ?? []),
       ...(this.pendingPrompts.get(sessionID) ?? []),
@@ -882,17 +904,17 @@ class Reporter {
     }
     // This reporter had already recorded the session as gone: the row that
     // follows describes a new incarnation, not the one whose prompts are still
-    // held.
-    const revived = this.removed.has(sessionID) || this.goneAt.has(sessionID);
-    // The stamp is kept for the prompt decisions below: clearing the mark first
-    // would make every held prompt look like it arrived after the removal, and a
-    // form opened by the incarnation that ended would block the one that
-    // replaced it.
+    // held. Only `removed` may say that — `goneAt` is a cutoff that outlives a
+    // revival, and reading it here would make every later row look like yet
+    // another revival and wipe the prompts of a perfectly live session.
+    const revived = this.removed.has(sessionID);
+    // The cutoff stays for the prompt decisions below: a form opened by the
+    // incarnation that ended must never block the one that replaced it, and a
+    // queued handler may still ask this question after the revival read.
     const goneStamp = this.goneAt.get(sessionID) ?? 0;
-    // A live row proves the session exists again, so the removal mark — which
-    // only exists to block stale prompts — is cleared.
+    // A live row proves the session exists again, so the removal flag — which
+    // is what makes a stray prompt revive a dead resident — is cleared.
     this.removed.delete(sessionID);
-    this.goneAt.delete(sessionID);
     const view = this.viewOf(read.row);
     // A child is never a resident, so it never gets a directory entry either:
     // that entry is what routes its later prompt reads.
@@ -962,6 +984,12 @@ class Reporter {
     // The row answered execution; a prompt read that failed leaves the parked
     // asks as the only evidence, so they are applied rather than lost.
     if (permissions === null) this.flushPendingPrompts(sessionID, goneStamp);
+    // The cutoff has done its work once nothing from the ended incarnation is
+    // still queued. Cleaning it here — not at the removal task, which may run
+    // before this read — is what keeps it from outliving the prompts it gates.
+    if (goneStamp > 0 && !this.staleWork(sessionID, goneStamp) && this.goneAt.get(sessionID) === goneStamp) {
+      this.goneAt.delete(sessionID);
+    }
   }
 
   /**
@@ -1070,6 +1098,10 @@ class Reporter {
    */
   private applyListRows(rows: readonly SessionRow[], pageAt: number): void {
     const views: SessionView[] = [];
+    // Idle sessions this reporter has never seen are not admitted, but one of
+    // them may be holding a prompt that outlived its turn. They are probed
+    // after the admission pass, once each.
+    const unseenIdle: SessionView[] = [];
     for (const row of rows) {
       if (!row.id || row.parentID) continue;
       const tracked = this.state.sessions.has(row.id);
@@ -1129,7 +1161,13 @@ class Reporter {
       // An idle row still has to reach admission when a prompt is parked for it,
       // or when an event named this session: a form has no read of its own, so
       // otherwise it is lost for good.
-      if (!executing && !this.hasHeld(view.id) && !awaitingRead) continue;
+      if (!executing && !this.hasHeld(view.id) && !awaitingRead) {
+        if (!tracked && !this.promptProbed.has(view.id)) {
+          this.promptProbed.add(view.id);
+          unseenIdle.push(view);
+        }
+        continue;
+      }
       // The directory is recorded on admission so the very first `get` and
       // prompt read already go through the setup that owns that location.
       if (view.directory !== null && view.directory !== undefined) {
@@ -1153,6 +1191,9 @@ class Reporter {
       // list row is a fresh, non-archived observation of a live session.
       views.push({ ...view, executing });
     }
+    // Probed even when no row was admitted: an idle session holding a prompt is
+    // exactly the case that admits nothing by itself.
+    for (const view of unseenIdle) this.enqueue(() => this.probeIdlePrompts(view));
     if (views.length === 0) return;
     this.dispatch({ kind: "discovered", sessions: views });
     // A prompt parked behind a failing `get` is released here: the list just
@@ -1241,6 +1282,33 @@ class Reporter {
     // applyRead publishes the stamp only if it actually accepts the row: a read
     // discarded because its owner retired never answered for the prompts.
     this.applyRead(sessionID, read, permissions, owner, startedAt, promptsStartedAt);
+  }
+
+  /**
+   * A permission that outlives its turn is the one prompt state a list cannot
+   * show, and after a reload nothing else would ever report it: the ask event
+   * has already passed and an idle session is never admitted. Without this the
+   * town would keep whatever the previous reporter last said until the lease
+   * expired.
+   *
+   * Runs once per never-seen idle session, in that session's own location, and
+   * admits it only when a prompt really is open: ordinary idle history must
+   * stay out of the town.
+   */
+  private async probeIdlePrompts(view: SessionView): Promise<void> {
+    const owner = this.registrationFor(view.directory ?? null);
+    if (!owner || this.closed) return;
+    const permissions = await this.readPermissions(owner, view.id);
+    if (permissions === null || permissions.length === 0) return;
+    if (this.closed || this.retired(owner)) return;
+    // An event admitted it while the read was in flight; its own state is
+    // fresher than this probe's row.
+    if (this.state.sessions.has(view.id)) return;
+    this.directories.set(view.id, view.directory ?? null);
+    const open = this.answeredOnly(permissions);
+    if (open.length === 0) return;
+    this.dispatch({ kind: "discovered", sessions: [view] });
+    this.dispatch({ kind: "permissions", sessionID: view.id, permissions: open });
   }
 
   /**
@@ -1789,7 +1857,9 @@ class Reporter {
             // has already run (the queue is serial), so the mark is done — but
             // only this removal's mark. A removal that arrived later owns its
             // own stamp, and deleting that would let a stale read through it.
-            if (this.goneAt.get(sessionID) === at) this.goneAt.delete(sessionID);
+            if (this.goneAt.get(sessionID) === at && !this.staleWork(sessionID, at)) {
+              this.goneAt.delete(sessionID);
+            }
             // Remembered even for an id this reporter never admitted: a later
             // stale prompt must not be the event that revives it.
             this.removed.add(sessionID);

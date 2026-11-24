@@ -624,3 +624,33 @@ test("answering a form does not discard a permission from the same snapshot", as
   const statuses = w.writes().map(([status]) => status);
   assert.equal(statuses[statuses.length - 1], "blocked", `writes were ${JSON.stringify(statuses)}`);
 });
+
+test("a reload reports an idle session whose permission outlived its turn", async () => {
+  const w = harness();
+  const first = await w.setup({
+    get: async () => row("original", "working"),
+    permissions: async () => [],
+    list: async () => [],
+  });
+  await w.emit("session.execution.started");
+  await w.idle();
+  first?.();
+  await pause(30);
+  // Reload: the session is idle now, but a permission never got its reply.
+  await w.setup({
+    get: async () => row("original", "idle"),
+    permissions: async () => [{ id: "still-open" }],
+    list: async () => [
+      row("original", "idle"),
+      { ...row("control", "working", "ctl"), location: { directory: DIRECTORY } },
+    ],
+  });
+  await w.idle();
+  await pause(60);
+  await w.idle();
+  const writes = w.writes().map((write) => write[0]);
+  assert.ok(
+    writes.includes("blocked"),
+    `the outstanding permission was never reported: ${JSON.stringify(writes)}`,
+  );
+});
