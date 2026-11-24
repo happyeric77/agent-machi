@@ -83,16 +83,21 @@ let failures = 0;
 for (const [scenario, duration] of Object.entries(scenarios)) {
   fs.rmSync(NODE_LOG, { force: true });
   fs.rmSync(GO_LOG, { force: true });
+  // A token in the caller's environment would put the Go bridge in external
+  // mode, where FAKE never runs. The Node bridge has no ingest mode, but both
+  // get the empty value so the two runs see the same environment.
   const node = start(process.execPath, [NODE_COPY], {
     PORT: String(NODE_PORT),
     FAKE: "1",
     FAKE_SCENARIO: scenario,
+    AGENT_MACHI_INGEST_TOKEN: "",
   });
   const go = start(path.join(ROOT, "agent-machi"), ["--no-open"], {
     PORT: String(GO_PORT),
     FAKE: "1",
     FAKE_SCENARIO: scenario,
     AGENT_MACHI_EVENTS_LOG: GO_LOG,
+    AGENT_MACHI_INGEST_TOKEN: "",
   });
 
   try {

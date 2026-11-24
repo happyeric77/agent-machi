@@ -32,6 +32,12 @@ func main() {
 	if *noOpen {
 		cfg.NoOpen = true
 	}
+	// External ingest and the local demo/Herdr producers are mutually
+	// exclusive: one town, one feeding model.
+	mode := cfg.Mode()
+	if mode == bridge.ModeExternal {
+		cfg.Fake = false
+	}
 
 	static, err := web.FS()
 	if err != nil {
@@ -47,11 +53,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	mode := fmt.Sprintf("socket %s", cfg.SocketPath)
-	if cfg.Fake {
-		mode = "(FAKE)"
+	label := fmt.Sprintf("socket %s", cfg.SocketPath)
+	switch mode {
+	case bridge.ModeExternal:
+		label = "mode: external (ingest enabled, Herdr disabled)"
+	case bridge.ModeFake:
+		label = "(FAKE)"
 	}
-	fmt.Printf("[bridge] http://%s:%d %s\n", cfg.Host, cfg.Port, mode)
+	fmt.Printf("[bridge] http://%s:%d %s\n", cfg.Host, cfg.Port, label)
 
 	server := &http.Server{Handler: b.Handler(static)}
 	serve := func() {
@@ -61,10 +70,14 @@ func main() {
 	}
 	// FAKE seeds the story before the first page load, as it always has. Herdr
 	// starts after HTTP so a missing socket cannot delay readiness.
-	if cfg.Fake {
+	switch mode {
+	case bridge.ModeExternal:
+		// External mode: neither producer starts, so nothing can dial Herdr.
+		go serve()
+	case bridge.ModeFake:
 		b.StartFake()
 		go serve()
-	} else {
+	default:
 		go serve()
 		go b.StartHerdr()
 	}

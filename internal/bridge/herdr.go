@@ -416,6 +416,11 @@ func (b *Bridge) scheduleReconcile(delay time.Duration) {
 }
 
 func (b *Bridge) reconcileAll() {
+	// External mode owns the town through /report; the Herdr socket must never
+	// be dialed, including by a direct StartHerdr call.
+	if b.cfg.IngestToken != "" {
+		return
+	}
 	b.mu.Lock()
 	if b.stopping {
 		b.mu.Unlock()

@@ -98,6 +98,23 @@ Everything has a default; configuration is only for non-standard setups.
 | `AGENT_MACHI_INGEST_TOKEN` | unset | Enables `POST`/`DELETE /report` when non-empty; unset or empty means the endpoint answers `404` |
 | `AGENT_MACHI_INGEST_TTL_SECONDS` | `900` | How long a reported resident may stay silent before it is removed |
 
+### Modes
+
+A bridge process has exactly one feeding source, chosen in this order:
+
+| Mode | Selected when | What runs |
+| --- | --- | --- |
+| External | `AGENT_MACHI_INGEST_TOKEN` is non-empty | `POST`/`DELETE /report`; no Herdr watcher, no FAKE |
+| FAKE | no token and `FAKE=1` | the scripted demo scenario |
+| Local Herdr | no token and no FAKE | the Herdr watcher |
+
+The token test is on the raw value: unset and explicitly empty both mean
+disabled, while a whitespace-only value is non-empty and therefore selects
+external mode. External mode wins over `FAKE=1`, so a report-only process
+never advertises itself as a demo, and `HERDR_SOCKET_PATH`,
+`HERDR_SESSION`, and `AGENT_MACHI_INGEST_TTL_SECONDS` cannot override it.
+Startup says which mode took effect.
+
 ## Report API
 
 An agent that does not live in a Herdr pane can still appear in the town.
@@ -110,6 +127,10 @@ export AGENT_MACHI_INGEST_TOKEN=choose-a-long-random-value
 
 With no token (or an empty one) the endpoint does not exist, and the town
 behaves exactly as before: any method on `/report` answers `404`.
+
+Enabling ingest also switches the town to external mode: the Herdr integration
+and the FAKE demo do not start, so reported residents are the only ones in the
+town.
 
 **Exposure:** the bridge listens on `0.0.0.0` by default, so enabling reports
 makes the endpoint reachable from any network that can reach the host, subject

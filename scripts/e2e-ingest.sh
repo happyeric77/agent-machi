@@ -4,7 +4,6 @@
 # /snapshot, /events, /log and /health, plus the CLI's error exits.
 #
 # E2E_SCREENSHOT=1  capture the two residents and their office signs
-# E2E_MIXED=1       run beside the real Herdr session and survive a reconcile
 # E2E_REAL_TTL=1    wait out the default 15-minute expiry in real time
 set -euo pipefail
 
@@ -15,7 +14,7 @@ TTL="${E2E_TTL_SECONDS:-30}"
 BIN="${E2E_BIN:-./agent-machi}"
 tmp="$(mktemp -d)"
 server_pid=""
-proxy_pid=""
+fixture_pid=""
 sse_pid=""
 dom_pid=""
 
@@ -24,6 +23,14 @@ if command -v lsof >/dev/null && lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>
   echo "FAIL: something already listens on $PORT; pick a free port with E2E_PORT" >&2
   exit 1
 fi
+
+stop_server() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+  fi
+}
 
 cleanup() {
   if [[ -n "$sse_pid" ]]; then
@@ -36,15 +43,11 @@ cleanup() {
     wait "$dom_pid" 2>/dev/null || true
     dom_pid=""
   fi
-  if [[ -n "$proxy_pid" ]]; then
-    kill "$proxy_pid" 2>/dev/null || true
-    wait "$proxy_pid" 2>/dev/null || true
-    proxy_pid=""
-  fi
-  if [[ -n "$server_pid" ]]; then
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
-    server_pid=""
+  stop_server
+  if [[ -n "$fixture_pid" ]]; then
+    kill "$fixture_pid" 2>/dev/null || true
+    wait "$fixture_pid" 2>/dev/null || true
+    fixture_pid=""
   fi
 }
 trap cleanup EXIT
@@ -323,173 +326,219 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
 [[ "$(snapshot_status ci demo)" == "absent" ]] || fail "a rejected report created a resident"
 cleanup
 
-if [[ "${E2E_MIXED:-0}" == "1" ]]; then
-  echo "== phase 5: mixed mode with the real Herdr session"
-  real_socket="${E2E_HERDR_SOCKET:-$HOME/.config/herdr/herdr.sock}"
-  [[ -S "$real_socket" ]] || fail "no Herdr socket at $real_socket"
-  proxy_sock="$tmp/herdr.sock"
-  trace="$tmp/proxy.trace"
+echo "== phase 5: external mode never dials the Herdr socket"
+fixture_sock="$tmp/herdr-fixture.sock"
+accepts="$tmp/fixture-accepts.txt"
 
-  # A forwarding socket lets the harness drop the bridge's subscription and
-  # watch the reconcile that follows. Herdr itself is only read.
-  cat >"$tmp/herdr-proxy.py" <<'PY'
-import os, socket, sys, threading
-listen_path, target_path, trace_path = sys.argv[1], sys.argv[2], sys.argv[3]
+# A deterministic stand-in for Herdr: one agent in the snapshot, a
+# subscription ack, and one status transition on the per-pane stream. Every
+# accepted connection is counted, so a run can prove it never dialed at all.
+cat >"$tmp/herdr-fixture.py" <<'PY'
+import json, os, socket, sys, threading, time
+
+listen_path, count_path = sys.argv[1], sys.argv[2]
 try:
     os.unlink(listen_path)
 except FileNotFoundError:
     pass
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(listen_path)
-server.listen(64)
-trace_lock = threading.Lock()
+PANE = "fixture:p1"
 
-def record(marker, line):
-    with trace_lock:
-        with open(trace_path, "ab") as trace:
-            trace.write(marker + line + b"\n")
+def count_accept():
+    with open(count_path, "r+") as fh:
+        total = int(fh.read() or 0) + 1
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(total))
 
-def pipe(src, dst, marker):
-    buffer = b""
+def snapshot_result():
+    return {
+        "type": "session_snapshot",
+        "snapshot": {
+            "version": 0, "protocol": 22, "workspaces": [], "tabs": [],
+            "panes": [{"pane_id": PANE}], "layouts": [],
+            "agents": [{
+                "pane_id": PANE, "agent": "scratch", "agent_status": "idle",
+                "name": None, "terminal_title": "fixture",
+            }],
+        },
+    }
+
+def handle(conn):
     try:
-        while True:
-            chunk = src.recv(65536)
+        buffer = b""
+        while b"\n" not in buffer:
+            chunk = conn.recv(4096)
             if not chunk:
-                break
+                return
             buffer += chunk
-            # Record before forwarding, so a reader of the trace never sees the
-            # response before the request that caused it.
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                record(marker, line)
-            dst.sendall(chunk)
-    except OSError:
+        request = json.loads(buffer.split(b"\n", 1)[0])
+        method, rid = request.get("method"), request.get("id")
+        if method == "session.snapshot":
+            conn.sendall((json.dumps({"id": rid, "result": snapshot_result()}) + "\n").encode())
+            return
+        if method == "events.subscribe":
+            conn.sendall((json.dumps({"id": rid, "result": {"type": "subscription_started"}}) + "\n").encode())
+            subs = request.get("params", {}).get("subscriptions", [])
+            if any(sub.get("type") == "pane.agent_status_changed" for sub in subs):
+                time.sleep(0.6)
+                event = {"event": "pane.agent_status_changed",
+                         "data": {"pane_id": PANE, "agent": "scratch", "agent_status": "working"}}
+                try:
+                    conn.sendall((json.dumps(event) + "\n").encode())
+                except OSError:
+                    return
+            # A real subscription stays open, so keep the connection alive.
+            while conn.recv(4096):
+                pass
+            return
+        conn.sendall((json.dumps({"id": rid, "error": {"code": "unhandled", "message": method}}) + "\n").encode())
+    except (OSError, ValueError):
         pass
     finally:
-        for sock in (src, dst):
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        conn.close()
 
-def handle(client):
-    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    upstream.connect(target_path)
-    threading.Thread(target=pipe, args=(client, upstream, b"> "), daemon=True).start()
-    threading.Thread(target=pipe, args=(upstream, client, b"< "), daemon=True).start()
-
+open(count_path, "w").write("0")
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(listen_path)
+server.listen(16)
 while True:
-    conn, _ = server.accept()
-    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    connection, _ = server.accept()
+    count_accept()
+    threading.Thread(target=handle, args=(connection,), daemon=True).start()
 PY
 
-  cat >"$tmp/trace-wait.py" <<'PY'
-import sys
-path, offset = sys.argv[1], int(sys.argv[2])
-lines = open(path, errors="replace").read().splitlines()[offset:]
-stage = 0
-for line in lines:
-    if stage == 0 and line.startswith("> ") and '"method":"session.snapshot"' in line:
-        stage = 1
-    elif stage == 1 and line.startswith("< ") and '"snapshot"' in line:
-        stage = 2
-    elif stage == 2 and line.startswith("> ") and 'pane.agent_detected' in line:
-        sys.exit(0)
-sys.exit(1)
-PY
+python3 "$tmp/herdr-fixture.py" "$fixture_sock" "$accepts" &
+fixture_pid=$!
+for _ in $(seq 1 50); do [[ -S "$fixture_sock" ]] && break; sleep 0.1; done
+[[ -S "$fixture_sock" ]] || fail "Herdr fixture did not listen"
 
-  python3 "$tmp/herdr-proxy.py" "$proxy_sock" "$real_socket" "$trace" &
-  proxy_pid=$!
-  for _ in $(seq 1 50); do [[ -S "$proxy_sock" ]] && break; sleep 0.1; done
-  [[ -S "$proxy_sock" ]] || fail "Herdr proxy did not listen"
+fixture_probe() { # socket -> 0 only after the fixture has counted and replied
+  # A connect() alone proves nothing: the count is safe to read only once the
+  # fixture has accepted and answered, so use a real request as the barrier.
+  python3 -c '
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"id": "probe", "method": "session.snapshot"}) + "\n").encode())
+buffer = b""
+while b"\n" not in buffer:
+    chunk = s.recv(4096)
+    if not chunk:
+        sys.exit(1)
+    buffer += chunk
+reply = json.loads(buffer.split(b"\n", 1)[0])
+assert reply.get("id") == "probe", reply
+s.close()
+' "$1"
+}
 
-  rm -f "$tmp/mixed.jsonl"
-  HOST=127.0.0.1 PORT="$PORT" \
-    AGENT_MACHI_INGEST_TOKEN="$TOKEN" \
-    AGENT_MACHI_INGEST_TTL_SECONDS= \
-    FAKE= \
-    FAKE_SCENARIO= \
-    HERDR_SOCKET_PATH="$proxy_sock" \
-    AGENT_MACHI_EVENTS_LOG="$tmp/mixed.jsonl" \
-    AGENT_MACHI_NO_OPEN=1 \
-    "$BIN" >"$tmp/mixed.log" 2>&1 &
-  server_pid=$!
-  wait_healthy "$tmp/mixed.log"
-
-  ack=0
-  for _ in $(seq 1 200); do
-    if grep -q '^< .*"subscription_started"' "$trace"; then ack=1; break; fi
-    sleep 0.1
-  done
-  [[ "$ack" == "1" ]] || fail "no initial Herdr subscription acknowledgment"
-
-  herdr_rows=""
-  for _ in $(seq 1 100); do
-    herdr_rows="$(curl -s "$BASE/snapshot" | python3 -c '
+fixture_status() { # pane id -> status or absent
+  curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
-print(sum(1 for r in json.load(sys.stdin) if not r["pane_id"].startswith("ext:")))')"
-    [[ "$herdr_rows" -ge 1 ]] && break
-    sleep 0.2
-  done
-  [[ "$herdr_rows" -ge 1 ]] || fail "real Herdr rows never appeared"
+want=sys.argv[1]
+for row in json.load(sys.stdin):
+    if row["pane_id"]==want:
+        print(row["agent_status"]); break
+else:
+    print("absent")
+' "$1"
+}
 
-  must_report POST mixed radio working
-  [[ "$(snapshot_status mixed radio)" == "working" ]] || fail "external agent missing in mixed mode"
-  since_before="$(curl -s "$BASE/snapshot" | python3 -c '
+echo "-- control run: no token, local mode, fixture socket"
+rm -f "$tmp/events.jsonl"
+HOST=127.0.0.1 PORT="$PORT" \
+  AGENT_MACHI_INGEST_TOKEN= \
+  FAKE= \
+  FAKE_SCENARIO= \
+  HERDR_SOCKET_PATH="$fixture_sock" \
+  AGENT_MACHI_EVENTS_LOG="$tmp/events.jsonl" \
+  AGENT_MACHI_NO_OPEN=1 \
+  "$BIN" >"$tmp/control.log" 2>&1 &
+server_pid=$!
+wait_healthy "$tmp/control.log"
+grep -q "^\[bridge\] http://127.0.0.1:$PORT socket $fixture_sock$" "$tmp/control.log" \
+  || fail "control run did not log the socket path: $(head -1 "$tmp/control.log")"
+
+saw_pane=0
+saw_transition=0
+for _ in $(seq 1 150); do
+  status="$(fixture_status fixture:p1)"
+  [[ "$status" != "absent" ]] && saw_pane=1
+  [[ "$status" == "working" ]] && { saw_transition=1; break; }
+  sleep 0.1
+done
+[[ "$saw_pane" == "1" ]] || fail "control run never showed the fixture pane"
+[[ "$saw_transition" == "1" ]] || fail "control run never saw the fixture transition"
+control_accepts="$(cat "$accepts")"
+[[ "$control_accepts" -ge 2 ]] || fail "control run accepted only $control_accepts connections"
+echo "control: pane seen and moved to working; $control_accepts fixture connections accepted"
+# Stop only the bridge: the fixture must stay listening, otherwise the token
+# run's zero accepts would prove nothing.
+stop_server
+# Prove the fixture still accepts right now, and take the count only after it
+# has answered: otherwise a connect() racing the counter read could look dead.
+count_before_probe="$(cat "$accepts")"
+fixture_probe "$fixture_sock" || fail "the fixture stopped answering before the token run"
+baseline_accepts="$(cat "$accepts")"
+[[ "$baseline_accepts" -gt "$count_before_probe" ]] \
+  || fail "the fixture accepted nothing during the probe ($count_before_probe -> $baseline_accepts)"
+
+echo "-- token run: same socket path, external mode"
+rm -f "$tmp/events.jsonl"
+HOST=127.0.0.1 PORT="$PORT" \
+  AGENT_MACHI_INGEST_TOKEN="$TOKEN" \
+  AGENT_MACHI_INGEST_TTL_SECONDS="$TTL" \
+  FAKE=1 FAKE_SCENARIO=demo \
+  HERDR_SOCKET_PATH="$fixture_sock" \
+  AGENT_MACHI_EVENTS_LOG="$tmp/events.jsonl" \
+  AGENT_MACHI_NO_OPEN=1 \
+  "$BIN" >"$tmp/external.log" 2>&1 &
+server_pid=$!
+wait_healthy "$tmp/external.log"
+grep -q "mode: external (ingest enabled, Herdr disabled)" "$tmp/external.log" \
+  || fail "external mode line missing: $(cat "$tmp/external.log")"
+grep -q "$fixture_sock" "$tmp/external.log" \
+  && fail "external mode printed the ignored socket path: $(cat "$tmp/external.log")"
+grep -q "$TOKEN" "$tmp/external.log" && fail "external mode printed the token"
+
+[[ "$(curl -s "$BASE/health" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fake"])')" == "False" ]] \
+  || fail "a token run still advertises itself as FAKE"
+
+# FAKE residents must not leak in either: the town starts empty, then holds
+# exactly the reported resident.
+curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
-print(next(r["status_since"] for r in json.load(sys.stdin) if r["pane_id"]=="ext:mixed:radio"))')"
-  ext_log_before="$(curl -s "$BASE/log?limit=200" | python3 -c '
+rows=json.load(sys.stdin)
+assert rows==[], rows
+' || fail "external mode started with rows"
+
+must_report POST ci ext-only working
+[[ "$(snapshot_status ci ext-only)" == "working" ]] || fail "reported resident missing"
+curl -s "$BASE/snapshot" | python3 -c '
 import json,sys
-print(sum(1 for r in json.load(sys.stdin) if r["pane_id"]=="ext:mixed:radio"))')"
+rows=json.load(sys.stdin)
+assert len(rows)==1, rows
+assert rows[0]["pane_id"]=="ext:ci:ext-only", rows
+' || fail "external mode holds rows it does not own"
 
-  echo "-- dropping the Herdr subscription to force a reconcile"
-  fail_before="$(grep -c 'reconcile failed' "$tmp/mixed.log" || true)"
-  kill "$proxy_pid" 2>/dev/null || true
-  wait "$proxy_pid" 2>/dev/null || true
-  proxy_pid=""
-  failed="$fail_before"
-  for _ in $(seq 1 100); do
-    failed="$(grep -c 'reconcile failed' "$tmp/mixed.log" || true)"
-    [[ "$failed" -gt "$fail_before" ]] && break
-    sleep 0.1
-  done
-  [[ "$failed" -gt "$fail_before" ]] || fail "no new reconcile attempt while the socket was down"
-
-  echo "-- restoring the socket; the retried reconcile must complete and keep the row"
-  offset="$(wc -l < "$trace" | tr -d ' ')"
-  python3 "$tmp/herdr-proxy.py" "$proxy_sock" "$real_socket" "$trace" &
-  proxy_pid=$!
-  for _ in $(seq 1 50); do [[ -S "$proxy_sock" ]] && break; sleep 0.1; done
-  [[ -S "$proxy_sock" ]] || fail "Herdr proxy did not come back"
-  after_restore="$(grep -c 'reconcile failed' "$tmp/mixed.log" || true)"
-  reconciled=0
-  for _ in $(seq 1 900); do
-    if python3 "$tmp/trace-wait.py" "$trace" "$offset"; then reconciled=1; break; fi
-    sleep 0.2
-  done
-  [[ "$reconciled" == "1" ]] || fail "no completed reconcile (snapshot response + global subscription) after reconnect"
-  sleep 3
-  still_failed="$(grep -c 'reconcile failed' "$tmp/mixed.log" || true)"
-  [[ "$still_failed" == "$after_restore" ]] || fail "reconcile kept failing after the socket returned"
-
-  python3 - "$BASE" "$since_before" "$ext_log_before" <<'PY' || fail "the completed reconcile changed the external resident"
-import json,sys,urllib.request
-base, since_before, log_before = sys.argv[1], sys.argv[2], int(sys.argv[3])
-rows=json.load(urllib.request.urlopen(base+"/snapshot"))
-herdr=[r for r in rows if not r["pane_id"].startswith("ext:")]
-ext=[r for r in rows if r["pane_id"]=="ext:mixed:radio"]
-assert herdr, rows
-assert len(ext)==1, rows
-assert ext[0]["agent_status"]=="working", ext
-assert ext[0]["status_since"]==since_before, ext
-log=json.load(urllib.request.urlopen(base+"/log?limit=200"))
-rows_for_ext=[e for e in log if e["pane_id"]=="ext:mixed:radio"]
-assert len(rows_for_ext)==log_before, rows_for_ext
-print("mixed: reconcile completed with %d Herdr rows and the external row intact" % len(herdr))
-PY
-
-  cleanup
-fi
+# Herdr startup is async, so watch for a bounded window rather than one glance.
+for _ in $(seq 1 60); do
+  [[ "$(cat "$accepts")" != "$baseline_accepts" ]] && break
+  sleep 0.1
+done
+# Stop the bridge, then probe again. The fixture counts an accept before it
+# replies, so a dial at shutdown cannot hide in the accept queue: the final
+# probe is the only connection allowed, so the count must be exactly +1.
+stop_server
+[[ -S "$fixture_sock" ]] || fail "the fixture socket vanished, so its accept count proved nothing"
+kill -0 "$fixture_pid" 2>/dev/null || fail "the fixture process died, so its accept count proved nothing"
+fixture_probe "$fixture_sock" || fail "the fixture stopped answering after shutdown"
+final_accepts="$(cat "$accepts")"
+[[ "$final_accepts" -eq $((baseline_accepts + 1)) ]] \
+  || fail "external mode dialed the Herdr socket $((final_accepts - baseline_accepts - 1)) time(s)"
+echo "external: no FAKE rows, only ext:ci:ext-only, 0 fixture connections accepted"
+cleanup
 
 if [[ "${E2E_REAL_TTL:-0}" == "1" ]]; then
   echo "== phase 6: expiry at the default 15-minute TTL"
