@@ -65,11 +65,15 @@ interface Harness {
   writes(): Array<string[]>;
   /** Emit an event and wait until the queue has processed it. */
   emit(type: string, data?: Record<string, unknown>): Promise<void>;
+  /** Fire an event without waiting; use to build a burst. */
+  fire(type: string, data?: Record<string, unknown>): void;
   setup(options?: {
     get?: (sessionID: string) => Promise<any>;
     list?: () => Promise<any>;
     permissions?: () => Promise<any>;
     dir?: string;
+    url?: string;
+    fetch?: (body: any, attempt: number) => Response;
   }): Promise<() => void>;
   /** The live reporter, for observing internal bookkeeping. */
   reporter(): any;
@@ -94,7 +98,11 @@ function harness(): Harness {
       written
         .filter((w) => w.body?.id === "probe-s" || new URL(w.url).searchParams.get("id") === "probe-s")
         .map((w) => (w.body ? [w.body.status, w.body.name ?? ""] : ["DELETE"])),
-    emit: async (type, data = {}) => {
+    /** Fire an event without waiting for the stream to pass it. */
+  fire: (type: string, data: Record<string, unknown> = {}) => {
+    for (const listener of listeners) listener({ type, data: { sessionID: "s", ...data } });
+  },
+  emit: async (type, data = {}) => {
       const done = gate();
       for (const listener of listeners) listener({ type, data: { sessionID: "s", ...data } });
       // The barrier is a real event, so it is pulled from the stream only after
@@ -103,9 +111,24 @@ function harness(): Harness {
       for (const listener of listeners) listener({ type: "probe.barrier", data: { done: done.resolve } });
       await done.promise;
     },
-    setup: async ({ get = async () => row(), list = async () => [], permissions = async () => [], dir = DIRECTORY } = {}) =>
-      plugin.setup({
-        options: { bridgeUrl: "http://127.0.0.1:9/town", machineId: "probe" },
+    setup: async ({
+      get = async () => row(),
+      list = async () => [],
+      permissions = async () => [],
+      dir = DIRECTORY,
+      fetch: respond,
+      url = "http://127.0.0.1:9/town",
+    } = {}) => {
+    if (respond) {
+      written.length = 0;
+      globalThis.fetch = (async (url: any, init: any = {}) => {
+        const body = init.body ? JSON.parse(init.body) : null;
+        written.push({ method: init.method, url: String(url), body });
+        return respond(body, written.length);
+      }) as unknown as typeof globalThis.fetch;
+    }
+    return plugin.setup({
+        options: { bridgeUrl: url, machineId: "probe" },
         location: { directory: dir },
         session: { get: ({ sessionID }: { sessionID: string }) => get(sessionID), list },
         permission: { list: ({ sessionID }: { sessionID: string }) => permissions(sessionID) },
@@ -139,7 +162,8 @@ function harness(): Harness {
             }
           },
         },
-      } as any),
+      } as any);
+    },
     idle: async () => {
       await until("reporter idle", () => !reporter().draining && !reporter().passRunning);
       await pause();

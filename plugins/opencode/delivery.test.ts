@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createDelivery, residentID, type DeliveryConfig } from "./delivery.ts";
+import { createDelivery, residentID, retryAfterMs, type DeliveryConfig } from "./delivery.ts";
 
 // Pacing is per report endpoint and lanes are shared process-wide, so each test
 // gets its own endpoint: otherwise one test's outage window opens on the next.
@@ -305,4 +305,20 @@ test("closing one machine id never aborts a longer machine id's write", async ()
   await long.drain();
   assert.deepEqual(aborted, [], "mini-lab's request was not aborted by mini's unload");
   long.close();
+});
+
+test("an HTTP-date Retry-After is parsed as a delay, not as seconds", () => {
+  // Parsed directly rather than through a timed retry: the point is which form
+  // `Retry-After` can take, and a wall-clock assertion here would be flaky under
+  // a parallel test run.
+  // An HTTP-date is only precise to the second, so the target is well clear of
+  // the default one-second backoff rather than just above it.
+  const inFiveSeconds = new Date(Date.now() + 5_000).toUTCString();
+  const response = new Response(null, { status: 429, headers: { "retry-after": inFiveSeconds } });
+  const delay = retryAfterMs(response);
+  assert.ok(delay !== undefined && delay > 3_000, `delay was ${delay}`);
+  const seconds = new Response(null, { status: 429, headers: { "retry-after": "3" } });
+  assert.equal(retryAfterMs(seconds), 3_000);
+  const past = new Response(null, { status: 429, headers: { "retry-after": new Date(Date.now() - 5_000).toUTCString() } });
+  assert.equal(retryAfterMs(past), undefined);
 });

@@ -453,13 +453,21 @@ async function send(
   }
 }
 
-/** `Retry-After` in seconds, when the bridge sends a sane one. */
-function retryAfterMs(response: Response): number | undefined {
+/**
+ * `Retry-After` as either delay-seconds or an HTTP-date, per RFC 9110. A date
+ * in the past means "retry now", which is no hint at all.
+ */
+export function retryAfterMs(response: Response): number | undefined {
   const header = response.headers?.get?.("retry-after");
   if (typeof header !== "string") return undefined;
-  const seconds = Number(header.trim());
-  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
-  return Math.min(MAX_BACKOFF_MS, Math.round(seconds * 1_000));
+  const value = header.trim();
+  if (value === "") return undefined;
+  const seconds = Number(value);
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1_000
+    : Date.parse(value) - Date.now();
+  if (!Number.isFinite(delay) || delay <= 0) return undefined;
+  return Math.min(MAX_BACKOFF_MS, Math.round(delay));
 }
 
 function retryOrDrop(
