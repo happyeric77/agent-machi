@@ -66,19 +66,57 @@ plugin stays silent and the session works exactly as before.
 - `source` is `opencode`, `agent` is `opencode`, and the resident id is
   `<machineId>-<sessionID>`. A session whose id would break the bridge's limits
   is skipped and logged instead of being altered.
-- The display name is the session title, falling back to the directory name.
+- The display name is the session title, falling back to the directory name. A
+  rename alone reports nothing (the bridge ignores a name on an unchanged
+  status); the new name lands with the session's next transition.
 - Every live resident is renewed every 5 minutes. A same-status report is a
-  silent heartbeat on the bridge. Each heartbeat also re-reads who is executing
-  and the pending permission requests for every live resident, so a missed event
-  is corrected within five minutes.
-- OpenCode 2.2.6 exposes no read endpoint for pending answer forms on the plugin
-  context, so form state is event-only: a form that opens and is answered
-  entirely between two heartbeats can be missed. A failed read never counts as
-  "no prompts pending".
+  silent heartbeat on the bridge. Each heartbeat also re-reads, per session,
+  whether it is executing and which permission requests are pending, so a
+  missed event is corrected within five minutes. Reads for one session never
+  discard another session's: one session's activity cannot starve the rest.
+- A write in flight is never replaced, and a session's latest state always
+  wins: a session that comes back after a delete is reported again, and an
+  unload aborts anything still on the wire so a late write cannot land after
+  the replacement reporter's.
+- A session the server answers `Session.NotFoundError` for is deleted at once
+  instead of waiting out the bridge's TTL. A failed or timed-out read never
+  counts as "gone". An archived session is treated the same way: it still
+  answers reads and still appears in the list, and the only trace is
+  `time.archived`, so it is excluded wherever rows are read.
+- A delete for a session this reporter never tracked still sends `DELETE`:
+  after a plugin reload the resident from the earlier instance must be cleared
+  now, not at TTL. Deleting an absent row is a no-op on the bridge.
 - Closing a tab or quitting the TUI reports nothing, and it does not stop
   renewals while the server that owns that session is still running. The
   resident expires only after renewals stop: 15 minutes of silence at the
   bridge's default TTL. Only deleting or archiving a session sends `DELETE`.
+
+## What the plugin context cannot read
+
+Two authoritative sources in the integration plan are out of reach on OpenCode
+2.2.6, and this plugin does not pretend otherwise:
+
+- `GET /api/session/active` has no counterpart on `ctx.session` (there is no
+  `active()` call), and `ctx.rpc` is a typed in-process client, not an HTTP
+  client. Execution membership is therefore read from each session's own
+  `time.busy` / `time.idle` stamps, which is why it is checked per session
+  rather than against a set. A session is treated as executing when `busy` is
+  newer than `idle`, and `idle` is absent until the first turn ends; a session
+  is ignored after a restart if its `busy` predates the server's boot.
+- `GET /api/session/{id}/form` has no counterpart either. Form state is
+  event-only, with two known failure modes: a form that opens and is answered
+  entirely between two heartbeats is never seen, and a `form.replied` event
+  missed across a reconnect leaves the resident `blocked` until the next form
+  event or session deletion. A failed read never counts as "no prompts pending".
+- Prompt reads (`permission.list`) are **location-scoped**, while the event
+  stream spans every location. A session in another location is therefore
+  reconciled from events only; its pending-permission set is never replaced by
+  a read from this location, because that read would describe different
+  prompts.
+- Plugin setup runs once per location. Exactly one live setup reports: a new
+  setup stops the previous one and takes over immediately, because the event
+  stream already spans every location and a plugin reload may leave the old
+  instance's cleanup unreachable.
 
 ## Uninstall
 

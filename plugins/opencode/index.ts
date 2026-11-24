@@ -17,6 +17,12 @@ import {
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const RECONNECT_MS = 2_000;
+/** Bound for one metadata read, so a stall can never hold a session's chain. */
+const READ_TIMEOUT_MS = 5_000;
+/** Sessions per listing page while seeding; the API returns 50 by default. */
+const SEED_PAGE = 200;
+/** Hard stop for bootstrap paging, so a huge history cannot delay seeding. */
+const SEED_MAX_PAGES = 25;
 
 export interface ReporterOptions {
   readonly bridgeUrl?: unknown;
@@ -28,7 +34,7 @@ interface SessionRow {
   parentID?: string | null;
   title?: string | null;
   location?: { directory?: string | null } | null;
-  time?: { busy?: number; idle?: number } | null;
+  time?: { busy?: number; idle?: number; archived?: number } | null;
 }
 
 /** The plugin runs inside the OpenCode server, which has a process env. */
@@ -67,32 +73,75 @@ function parseOptions(options: unknown, token: string | undefined) {
   };
 }
 
-/** How long this server process has been up, in milliseconds. */
-function uptimeMs(): number {
-  const proc = (globalThis as { process?: { uptime?: () => number } }).process;
-  const seconds = typeof proc?.uptime === "function" ? proc.uptime() : Number.NaN;
-  return Number.isFinite(seconds) ? seconds * 1000 : 0;
-}
-
 /**
  * A session is executing while its busy stamp is newer than its idle stamp and
- * it started inside this server process. The second condition matters after a
- * crash: a server killed mid-run leaves busy > idle forever, and without it
- * bootstrap would resurrect that session as working.
+ * it started inside this server process. `time.idle` is absent until the first
+ * turn completes, so a session in its first-ever turn counts as executing.
+ * The process guard matters after a crash: a server killed mid-run leaves
+ * busy > idle forever, and without it bootstrap would resurrect that session.
  */
 function isExecuting(row: SessionRow, since: number): boolean {
   const busy = row.time?.busy;
+  if (typeof busy !== "number" || busy < since) return false;
   const idle = row.time?.idle;
-  if (typeof busy !== "number" || typeof idle !== "number" || busy <= idle) return false;
-  return busy >= since;
+  return typeof idle !== "number" || busy > idle;
+}
+
+/** Returned when a read takes longer than the deadline. */
+const TIMEOUT = Symbol("timeout");
+
+/** Resolves to TIMEOUT on a stall; rejects exactly as the work rejects. */
+async function within<T>(work: Promise<T>, ms = READ_TIMEOUT_MS): Promise<T | typeof TIMEOUT> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const late = new Promise<typeof TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMEOUT), ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([work, late]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Archived sessions still answer `get` and still appear in `list`; the only
+ * trace is a stamp inside `time.archived` (verified on 2.2.6). An archived
+ * session is not a resident, so it is excluded wherever rows are read, not
+ * just where `session.archived` arrives — otherwise bootstrap and every
+ * heartbeat would re-add a session the user archived.
+ */
+function isArchived(row: SessionRow): boolean {
+  return typeof row.time?.archived === "number";
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as { _tag?: unknown })?._tag === "Session.NotFoundError";
 }
 
 /**
  * The event stream spans every location, but plugin setup runs once per
- * location. Only the first setup reports, so a session never gets two owners
- * and two writers.
+ * location and prompt reads are location-scoped. Exactly one live setup
+ * reports.
+ *
+ * Ownership is claimed, not shared: a newer setup stops the previous one and
+ * takes over. The registry lives on `globalThis` because a config reload may
+ * re-evaluate this module, and a module-level variable would then forget the
+ * reporter that is still running. Preemption is deliberate — if the previous
+ * setup's cleanup never runs, waiting for it would leave the town silent, and
+ * a stale reporter is the worse failure of the two.
  */
-let owner: symbol | null = null;
+const REGISTRY = Symbol.for("agent-machi.reporter");
+
+interface Slot {
+  start: () => (() => void) | null;
+  stop: (() => void) | null;
+}
+
+function registry(): { active: Slot | null } {
+  const host = globalThis as unknown as Record<symbol, { active: Slot | null } | undefined>;
+  return (host[REGISTRY] ??= { active: null });
+}
 
 export const AgentMachiReporter = {
   id: "agent-machi-reporter",
@@ -100,279 +149,371 @@ export const AgentMachiReporter = {
     const config = parseOptions(ctx?.options, serverEnv("AGENT_MACHI_INGEST_TOKEN"));
     // Missing or invalid config disables reporting without touching the host.
     if (!config) return;
-    if (owner) return;
-    const mine = Symbol("agent-machi-reporter");
-    owner = mine;
 
-    const state = createState();
-    const delivery = createDelivery(config);
-    const send = (action: Action): void => {
-      const write: Write =
-        action.type === "delete"
-          ? { type: "delete", sessionID: action.sessionID }
-          : { type: "post", sessionID: action.sessionID, status: action.status, name: action.name };
-      delivery.enqueue(write);
-    };
-    // Every event bumps this. A reconcile read takes time, so a value that
-    // changed underneath it is stale and must not overwrite the newer event.
-    let mutations = 0;
-    let unloaded = false;
-    const dispatch = (input: Input, fromRead = false): void => {
-      if (unloaded) return;
-      if (!fromRead) mutations += 1;
-      try {
-        const actions = reduce(state, input);
-        for (const action of actions) send(action);
-      } catch {
-        // A reducer fault must never surface in the host's event loop.
-      }
-    };
+    const ownDirectory = typeof ctx?.location?.directory === "string" ? ctx.location.directory : null;
+    const slot: Slot = {
+      stop: null,
+      start: () => {
+        const state = createState();
+        const delivery = createDelivery(config);
+        const send = (action: Action): void => {
+          const write: Write =
+            action.type === "delete"
+              ? { type: "delete", sessionID: action.sessionID }
+              : { type: "post", sessionID: action.sessionID, status: action.status, name: action.name };
+          delivery.enqueue(write);
+        };
+        // Events and metadata lookups for one session run in arrival order, so
+        // a deferred lookup can never land after the terminal event it follows.
+        const chains = new Map<string, Promise<void>>();
+        let unloaded = false;
+        // Every arrival for a session bumps its version. A read that started
+        // earlier is then discarded for that session only, so one session's
+        // activity can never starve another's reconciliation.
+        const versions = new Map<string, number>();
+        const bump = (sessionID: string): void => {
+          versions.set(sessionID, (versions.get(sessionID) ?? 0) + 1);
+        };
+        const dispatch = (input: Input): void => {
+          if (unloaded) return;
+          try {
+            for (const action of reduce(state, input)) send(action);
+          } catch {
+            // A reducer fault must never surface in the host's event loop.
+          }
+        };
+        const enqueueFor = (sessionID: string, work: () => Promise<void> | void): void => {
+          const previous = chains.get(sessionID) ?? Promise.resolve();
+          const next = previous.then(work).catch(() => undefined);
+          chains.set(sessionID, next);
+          void next.then(() => {
+            if (chains.get(sessionID) === next) chains.delete(sessionID);
+          });
+        };
 
-    // Events and metadata lookups for one session run in arrival order, so a
-    // deferred lookup can never land after the terminal event it precedes.
-    const chains = new Map<string, Promise<void>>();
-    const enqueueFor = (sessionID: string, work: () => Promise<void> | void): void => {
-      const previous = chains.get(sessionID) ?? Promise.resolve();
-      const next = previous.then(work).catch(() => undefined);
-      chains.set(sessionID, next);
-      void next.then(() => {
-        if (chains.get(sessionID) === next) chains.delete(sessionID);
-      });
-    };
+        const bootSince = Date.now() - uptimeMs();
 
-    const bootSince = Date.now() - uptimeMs();
-
-    const listRows = async (): Promise<SessionRow[]> => {
-      const listed: any = await ctx?.session?.list?.({});
-      const rows = listed?.data ?? listed;
-      return Array.isArray(rows) ? rows : [];
-    };
-
-    /** Read each live session's pending permissions; failures stay null. */
-    const readPermissions = async (ids: readonly string[]) => {
-      const reads: Record<string, readonly string[] | null> = {};
-      for (const sessionID of ids) {
-        try {
-          const pending: any = await ctx?.permission?.list?.({ sessionID });
-          const rows: any[] = Array.isArray(pending) ? pending : (pending?.data ?? []);
-          reads[sessionID] = rows.map((row: any) => String(row?.id ?? "")).filter((id) => id !== "");
-        } catch {
-          reads[sessionID] = null; // a failed read is never an empty set
-        }
-      }
-      return reads;
-    };
-
-    const reconcile = async (seed: boolean): Promise<void> => {
-      const at = mutations;
-      let rows: SessionRow[];
-      try {
-        rows = await listRows();
-      } catch {
-        return; // a failed membership read changes nothing
-      }
-      const active = rows.filter((row) => row.id && isExecuting(row, bootSince)).map((row) => row.id as string);
-      if (seed) {
-        // Bootstrap only seeds what is executing now, never saved history.
-        const views: SessionView[] = rows
-          .filter((row) => row.id && isExecuting(row, bootSince))
-          .map((row) => ({
-            id: row.id as string,
-            parentID: row.parentID ?? null,
-            title: row.title ?? null,
-            directory: row.location?.directory ?? null,
-            executing: true,
-          }));
-        // Our own seeding is not a newer event, so it must not invalidate the
-        // membership snapshot taken just above it.
-        dispatch({ kind: "discovered", sessions: views }, true);
-      }
-      // Pending prompts outlive a turn, so read them for every live resident,
-      // not just the ones executing right now. Permission requests have a read
-      // endpoint on the plugin context; forms do not on 2.2.6, so form state is
-      // event-only and a form that opens and clears between two checks can be
-      // missed (see README).
-      const permissions = await readPermissions(liveSessions(state));
-      // An event landed while reading; its state is newer than this snapshot.
-      if (mutations !== at) return;
-      dispatch({ kind: "reconcile", active, permissions }, true);
-    };
-
-    /** Resolve a session's metadata before reporting anything for it. */
-    const discover = async (sessionID: string): Promise<void> => {
-      try {
-        const got: any = await ctx?.session?.get?.({ sessionID });
-        const info = got?.data ?? got;
-        if (!info?.id) return;
-        dispatch({
-          kind: "discovered",
-          sessions: [
-            {
-              id: info.id,
-              parentID: info.parentID ?? null,
-              title: info.title ?? null,
-              directory: info.location?.directory ?? null,
-              executing: isExecuting(info, bootSince),
-            },
-          ],
+        const viewOf = (info: any): SessionView => ({
+          id: String(info.id),
+          parentID: info.parentID ?? null,
+          title: info.title ?? null,
+          directory: info.location?.directory ?? null,
+          executing: isExecuting(info, bootSince),
         });
-      } catch {
-        // Unknown or vanished session: nothing to report.
-      }
-    };
 
-    /** Resolve an unknown session before the event it carries is applied. */
-    const ensure = async (sessionID: string): Promise<void> => {
-      if (state.sessions.has(sessionID)) return;
-      await discover(sessionID);
-    };
-
-    const onEvent = (event: any): void => {
-      const data = event?.data;
-      if (!data) return;
-      switch (event?.type) {
-        case "session.created":
-          if (typeof data.sessionID === "string") {
-            enqueueFor(data.sessionID, () => discover(data.sessionID));
+        /** Resolve one session's metadata unless a later arrival superseded it. */
+        const discover = async (sessionID: string): Promise<void> => {
+          const v = versions.get(sessionID) ?? 0;
+          let info: any;
+          try {
+            info = await within(Promise.resolve(ctx?.session?.get?.({ sessionID })));
+          } catch {
+            return; // unknown or vanished: nothing to report
           }
-          return;
-        case "session.execution.started":
-          if (typeof data.sessionID === "string") {
-            const { sessionID } = data;
-            enqueueFor(sessionID, async () => {
-              await ensure(sessionID);
-              dispatch({ kind: "execution-started", sessionID });
+          if (info === TIMEOUT || unloaded) return;
+          const row = info?.data ?? info;
+          if (!row?.id || !unchangedRow(versions, sessionID, v)) return;
+          dispatch({ kind: "discovered", sessions: [viewOf(row)] });
+        };
+
+        const ensure = async (sessionID: string): Promise<void> => {
+          if (state.sessions.has(sessionID)) return;
+          await discover(sessionID);
+        };
+
+        /** Page the whole session list: the API returns 50 newest by default. */
+        const allRows = async (): Promise<SessionRow[] | null> => {
+          const rows: SessionRow[] = [];
+          let cursor: string | null = null;
+          for (let page = 0; page < SEED_MAX_PAGES; page += 1) {
+            let listed: any;
+            try {
+              listed = await within(
+                Promise.resolve(ctx?.session?.list?.({ limit: SEED_PAGE, ...(cursor ? { cursor } : {}) })),
+              );
+            } catch {
+              return null;
+            }
+            if (listed === TIMEOUT) return null;
+            const batch = listed?.data ?? listed;
+            if (!Array.isArray(batch)) return null;
+            rows.push(...batch);
+            cursor = typeof listed?.cursor?.next === "string" ? listed.cursor.next : null;
+            if (cursor === null || batch.length === 0) return rows;
+          }
+          return rows;
+        };
+
+        /** Seed sessions executing at load, and never one deleted meanwhile. */
+        const seed = async (): Promise<void> => {
+          const marks = new Map(versions);
+          const rows = await allRows();
+          if (rows === null || unloaded) return;
+          const views: SessionView[] = [];
+          for (const row of rows) {
+            if (!row.id || row.parentID || isArchived(row) || !isExecuting(row, bootSince)) continue;
+            // A newer event for this session already reported it: a seeded view
+            // may be older than that event, so it must not overwrite it.
+            if (!unchangedRow(versions, row.id, marks.get(row.id) ?? 0)) continue;
+            views.push(viewOf(row));
+          }
+          if (views.length > 0) dispatch({ kind: "discovered", sessions: views });
+        };
+
+        /** One session's ground truth: gone, executing, name, pending prompts. */
+        const check = async (sessionID: string): Promise<void> => {
+          const v = versions.get(sessionID) ?? 0;
+          let info: any;
+          try {
+            info = await within(ctx.session.get({ sessionID }));
+          } catch (error) {
+            // A specific not-found is authoritative; a failed or timed-out read
+            // is not, so the resident stays until the next pass.
+            if (isMissing(error) && unchangedRow(versions, sessionID, v)) {
+              dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
+            }
+            return;
+          }
+          if (info === TIMEOUT || unloaded || !unchangedRow(versions, sessionID, v)) return;
+          const row = info?.data ?? info;
+          if (!row?.id) return;
+          // An archived session still answers reads. It is not a resident, and
+          // archiving is only visible as a stamp inside `time`.
+          if (isArchived(row)) {
+            dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
+            return;
+          }
+          const view = viewOf(row);
+          // Prompt reads are location-scoped: for a session in another
+          // location the read would return that location's prompts, not this
+          // session's. Without a known own location, guessing is worse than
+          // staying event-only.
+          let permissions: readonly string[] | null | undefined;
+          if (ownDirectory !== null && view.directory === ownDirectory) {
+            permissions = await readPermissions(ctx, sessionID);
+            if (!unchangedRow(versions, sessionID, v)) return;
+          }
+          dispatch({ kind: "reconcile", sessionID, view, permissions });
+        };
+
+        /** A reconcile pass over everything this reporter owns. */
+        const reconcile = async (first: boolean): Promise<void> => {
+          if (unloaded) return;
+          if (first) await seed();
+          // Snapshot the ids before the loop: a session seeded above joins the
+          // next pass rather than being skipped by a mutation here.
+          for (const sessionID of liveSessions(state)) {
+            if (unloaded) return;
+            await check(sessionID);
+          }
+        };
+
+        const onEvent = (event: any): void => {
+          const data = event?.data;
+          if (!data) return;
+          switch (event?.type) {
+            case "session.created":
+              if (typeof data.sessionID === "string") {
+                bump(data.sessionID);
+                enqueueFor(data.sessionID, () => discover(data.sessionID));
+              }
+              return;
+            case "session.renamed":
+              if (typeof data.sessionID === "string" && "title" in data) {
+                const sessionID = data.sessionID;
+                const title = typeof data.title === "string" ? data.title : null;
+                bump(sessionID);
+                enqueueFor(sessionID, async () => {
+                  await ensure(sessionID);
+                  dispatch({ kind: "renamed", sessionID, title });
+                });
+              }
+              return;
+            case "session.execution.started":
+              if (typeof data.sessionID === "string") {
+                const sessionID = data.sessionID;
+                bump(sessionID);
+                enqueueFor(sessionID, async () => {
+                  await ensure(sessionID);
+                  dispatch({ kind: "execution-started", sessionID });
+                });
+              }
+              return;
+            case "session.execution.succeeded":
+            case "session.execution.failed":
+            case "session.execution.interrupted":
+              if (typeof data.sessionID === "string") {
+                const sessionID = data.sessionID;
+                bump(sessionID);
+                enqueueFor(sessionID, async () => {
+                  // A start that never resolved must not swallow the end.
+                  await ensure(sessionID);
+                  dispatch({ kind: "execution-ended", sessionID });
+                });
+              }
+              return;
+            case "permission.asked":
+              if (typeof data.sessionID === "string" && typeof data.id === "string") {
+                const sessionID = data.sessionID;
+                const requestID = data.id;
+                bump(sessionID);
+                enqueueFor(sessionID, async () => {
+                  await ensure(sessionID);
+                  dispatch({ kind: "permission-asked", sessionID, requestID });
+                });
+              }
+              return;
+            case "permission.replied":
+              if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
+                const sessionID = data.sessionID;
+                const requestID = data.requestID;
+                bump(sessionID);
+                enqueueFor(sessionID, () => dispatch({ kind: "permission-replied", sessionID, requestID }));
+              }
+              return;
+            case "form.created": {
+              const formID = data?.form?.id;
+              const sessionID = data?.form?.sessionID;
+              if (typeof sessionID === "string" && typeof formID === "string") {
+                bump(sessionID);
+                enqueueFor(sessionID, async () => {
+                  await ensure(sessionID);
+                  dispatch({ kind: "form-created", sessionID, formID });
+                });
+              }
+              return;
+            }
+            case "form.replied":
+            case "form.cancelled":
+              if (typeof data.sessionID === "string" && typeof data.id === "string") {
+                const sessionID = data.sessionID;
+                const formID = data.id;
+                const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
+                bump(sessionID);
+                enqueueFor(sessionID, () => dispatch({ kind, sessionID, formID }));
+              }
+              return;
+            case "session.deleted":
+            case "session.archived":
+              if (typeof data.sessionID === "string") {
+                const sessionID = data.sessionID;
+                bump(sessionID);
+                // Behind any pending lookup, so a delete always outranks the
+                // birth that lookup was about to report.
+                enqueueFor(sessionID, () => dispatch({ kind: "deleted", sessionID }));
+              }
+              return;
+            default:
+              return;
+          }
+        };
+
+        const controller = new AbortController();
+        let seeded = false;
+        const stream = (async () => {
+          // A dropped stream is retried, because events are the only live
+          // signal: an ended stream must not leave the town frozen on stale
+          // state.
+          while (!unloaded && !controller.signal.aborted) {
+            try {
+              const events = ctx?.event?.subscribe?.({ signal: controller.signal });
+              // Start consuming before reconciling. An async generator is
+              // pull-based: while seed() is awaiting, nothing is reading it and
+              // every event in that window is lost.
+              const reader = (async () => {
+                for await (const event of events ?? []) onEvent(event);
+              })();
+              const first = !seeded;
+              seeded = true;
+              void reconcile(first);
+              await reader;
+            } catch {
+              // Fall through to the backoff below.
+            }
+            if (unloaded || controller.signal.aborted) return;
+            await new Promise((resolve) => {
+              const retry = setTimeout(resolve, RECONNECT_MS);
+              (retry as unknown as { unref?: () => void }).unref?.();
             });
           }
-          return;
-        case "session.execution.succeeded":
-        case "session.execution.failed":
-        case "session.execution.interrupted":
-          if (typeof data.sessionID === "string") {
-            const { sessionID } = data;
-            enqueueFor(sessionID, async () => {
-              // A start that never resolved must not swallow the end.
-              await ensure(sessionID);
-              dispatch({ kind: "execution-ended", sessionID });
-            });
+        })();
+
+        // One reconcile at a time: a stalled read must not stack up behind the
+        // heartbeat. It also catches up immediately after a suspend/resume
+        // where the interval was overdue, so a renewal never waits a period.
+        let lastBeat = Date.now();
+        let beating = false;
+        const beat = async (): Promise<void> => {
+          if (beating || unloaded) return;
+          beating = true;
+          lastBeat = Date.now();
+          try {
+            await reconcile(false);
+          } catch {
+            // A heartbeat fault must never surface; the next one retries.
+          } finally {
+            beating = false;
           }
-          return;
-        case "permission.asked":
-          if (typeof data.sessionID === "string" && typeof data.id === "string") {
-            const sessionID = data.sessionID;
-            const requestID = data.id;
-            enqueueFor(sessionID, async () => {
-              await ensure(sessionID);
-              dispatch({ kind: "permission-asked", sessionID, requestID });
-            });
-          }
-          return;
-        case "permission.replied":
-          if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
-            const sessionID = data.sessionID;
-            const requestID = data.requestID;
-            enqueueFor(sessionID, () =>
-              dispatch({ kind: "permission-replied", sessionID, requestID }),
-            );
-          }
-          return;
-        case "form.created": {
-          const formID = data?.form?.id;
-          const sessionID = data?.form?.sessionID;
-          if (typeof sessionID === "string" && typeof formID === "string") {
-            enqueueFor(sessionID, async () => {
-              await ensure(sessionID);
-              dispatch({ kind: "form-created", sessionID, formID });
-            });
-          }
-          return;
-        }
-        case "form.replied":
-        case "form.cancelled":
-          if (typeof data.sessionID === "string" && typeof data.id === "string") {
-            const sessionID = data.sessionID;
-            const formID = data.id;
-            const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
-            enqueueFor(sessionID, () => dispatch({ kind, sessionID, formID }));
-          }
-          return;
-        case "session.deleted":
-        case "session.archived":
-          if (typeof data.sessionID === "string") {
-            const { sessionID } = data;
-            // Behind any pending lookup, so a delete always outranks the birth
-            // that lookup was about to report.
-            enqueueFor(sessionID, () => dispatch({ kind: "deleted", sessionID }));
-          }
-          return;
-        default:
-          return;
-      }
+          // Renewal happens even when a read failed: the lease is the point.
+          dispatch({ kind: "tick" });
+        };
+        const heartbeat = setInterval(() => {
+          if (Date.now() - lastBeat >= HEARTBEAT_MS) void beat();
+        }, Math.min(60_000, HEARTBEAT_MS));
+        (heartbeat as unknown as { unref?: () => void }).unref?.();
+
+        return () => {
+          // Unload: stop producing events and drop queued writes. Late lookups
+          // are fenced by `unloaded` so they cannot enqueue after cleanup.
+          unloaded = true;
+          controller.abort();
+          clearInterval(heartbeat);
+          delivery.close();
+          chains.clear();
+          void stream;
+        };
+      },
     };
 
-    const controller = new AbortController();
-    let seeded = false;
-    const stream = (async () => {
-      // A dropped stream is retried, because events are the only live signal:
-      // an ended stream must not leave the town frozen on stale state.
-      while (!unloaded && !controller.signal.aborted) {
-        try {
-          const events = ctx?.event?.subscribe?.({ signal: controller.signal });
-          if (!seeded) {
-            // Subscribe before reconciling so no event lands between the two.
-            seeded = true;
-            void reconcile(true);
-          } else {
-            // Reconnect: events were missed, so re-read ground truth once.
-            void reconcile(false);
-          }
-          for await (const event of events ?? []) onEvent(event);
-        } catch {
-          // Fall through to the backoff below.
-        }
-        if (unloaded || controller.signal.aborted) return;
-        await new Promise((resolve) => {
-          const retry = setTimeout(resolve, RECONNECT_MS);
-          (retry as unknown as { unref?: () => void }).unref?.();
-        });
-      }
-    })();
-
-    // One reconcile at a time: a stalled read must not stack up behind the
-    // heartbeat. It also catches up immediately after a suspend/resume where
-    // the interval was overdue, so a renewal never waits a full period.
-    let lastBeat = Date.now();
-    let beating = false;
-    const beat = async (): Promise<void> => {
-      if (beating || unloaded) return;
-      beating = true;
-      lastBeat = Date.now();
-      try {
-        await reconcile(false);
-        dispatch({ kind: "tick" });
-      } catch {
-        // A heartbeat fault must never surface; the next one retries.
-      } finally {
-        beating = false;
-      }
-    };
-    const heartbeat = setInterval(() => {
-      if (Date.now() - lastBeat >= HEARTBEAT_MS) void beat();
-    }, Math.min(60_000, HEARTBEAT_MS));
-    (heartbeat as unknown as { unref?: () => void }).unref?.();
+    const host = registry();
+    // Take over from any earlier live setup: a reload re-evaluates this module,
+    // so the previous instance is not reachable any other way.
+    host.active?.stop?.();
+    slot.stop = slot.start();
+    host.active = slot;
 
     return () => {
-      // Unload: stop producing events and drop queued writes. Late lookups are
-      // fenced by `unloaded` so they cannot enqueue after cleanup returns.
-      unloaded = true;
-      if (owner === mine) owner = null;
-      controller.abort();
-      clearInterval(heartbeat);
-      delivery.close();
-      chains.clear();
-      void stream;
+      // A superseded setup's cleanup must not stop its replacement.
+      if (host.active !== slot) return;
+      host.active = null;
+      slot.stop?.();
+      slot.stop = null;
     };
   },
 };
 
+function unchangedRow(versions: Map<string, number>, sessionID: string, mark: number): boolean {
+  return (versions.get(sessionID) ?? 0) === mark;
+}
+
+/** Reads a session's pending permission ids; a failed read is `null`. */
+async function readPermissions(ctx: any, sessionID: string): Promise<readonly string[] | null> {
+  let pending: any;
+  try {
+    pending = await within(Promise.resolve(ctx?.permission?.list?.({ sessionID })));
+  } catch {
+    return null;
+  }
+  if (pending === TIMEOUT) return null; // a failed read is never an empty set
+  const rows: any[] = Array.isArray(pending) ? pending : (pending?.data ?? []);
+  return rows.map((row: any) => String(row?.id ?? "")).filter((id) => id !== "");
+}
+
 export default AgentMachiReporter;
+
+/** How long this server process has been up, in milliseconds. */
+function uptimeMs(): number {
+  const proc = (globalThis as { process?: { uptime?: () => number } }).process;
+  const seconds = typeof proc?.uptime === "function" ? proc.uptime() : Number.NaN;
+  return Number.isFinite(seconds) ? seconds * 1000 : 0;
+}

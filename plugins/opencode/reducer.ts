@@ -23,6 +23,8 @@ export interface Tracked {
   readonly permissions: Set<string>;
   readonly forms: Set<string>;
   name: string;
+  /** The location this session lives in; prompt reads are location-scoped. */
+  directory: string | null;
   reported: Status | null;
   /** Deleted or archived: no resident until the session runs again. */
   removed: boolean;
@@ -32,11 +34,9 @@ export interface State {
   readonly sessions: Map<string, Tracked>;
 }
 
-/** Pending-prompt reads keyed by session id. A null value is a failed read. */
-export type PromptReads = Readonly<Record<string, readonly string[] | null>>;
-
 export type Input =
   | { kind: "discovered"; sessions: readonly SessionView[] }
+  | { kind: "renamed"; sessionID: string; title: string | null }
   | { kind: "execution-started"; sessionID: string }
   | { kind: "execution-ended"; sessionID: string }
   | { kind: "permission-asked"; sessionID: string; requestID: string }
@@ -48,10 +48,16 @@ export type Input =
   | { kind: "tick" }
   | {
       kind: "reconcile";
-      /** Executing session ids, or null when the read failed. */
-      active: readonly string[] | null;
-      permissions?: PromptReads;
-      forms?: PromptReads;
+      sessionID: string;
+      /** Fresh metadata, or null when the session is gone. */
+      view: SessionView | null;
+      /** The server answered "no such session" (never a failed read). */
+      missing?: boolean;
+      /**
+       * Pending permission ids, null for a failed read, or absent when the
+       * read was skipped. A skipped or failed read never clears the set.
+       */
+      permissions?: readonly string[] | null;
     };
 
 export type Action =
@@ -129,11 +135,22 @@ export function reduce(state: State, input: Input): Action[] {
           permissions: new Set(),
           forms: new Set(),
           name: displayName(view),
+          directory: view.directory ?? null,
           reported: null,
           removed: false,
         });
         sync(state, view.id, out);
       }
+      return out;
+    }
+
+    case "renamed": {
+      const tracked = state.sessions.get(input.sessionID);
+      if (!tracked) return out;
+      const name = displayName({ id: input.sessionID, title: input.title, directory: tracked.directory });
+      // The bridge refreshes metadata only when the status changes, so this
+      // only caches the name: the next real transition carries it.
+      if (name !== "" && name !== tracked.name) tracked.name = name;
       return out;
     }
 
@@ -191,7 +208,15 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "deleted": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked || tracked.removed) return out;
+      if (!tracked) {
+        // Not tracked here (a reload dropped it, or it predates this reporter).
+        // Its resident may still exist from an earlier instance, and a DELETE
+        // for an absent row is a no-op, so it is always sent: that is what
+        // makes a delete after a reload take effect now instead of at TTL.
+        out.push({ type: "delete", sessionID: input.sessionID });
+        return out;
+      }
+      if (tracked.removed) return out;
       tracked.removed = true;
       tracked.reported = null;
       tracked.permissions.clear();
@@ -217,30 +242,31 @@ export function reduce(state: State, input: Input): Action[] {
     }
 
     case "reconcile": {
-      // Ground truth for execution membership. A failed read changes nothing.
-      if (input.active) {
-        const active = new Set(input.active);
-        for (const [sessionID, tracked] of state.sessions) {
-          if (tracked.removed) continue;
-          tracked.underlying = active.has(sessionID) ? "working" : "idle";
-        }
-      }
-      // Pending sets are replaced only per successful read.
-      for (const [sessionID, ids] of Object.entries(input.permissions ?? {})) {
-        if (ids === null) continue;
-        const tracked = state.sessions.get(sessionID);
-        if (!tracked) continue;
+      const tracked = state.sessions.get(input.sessionID);
+      if (!tracked) return out;
+      // An authoritative "no such session" removes the resident now instead of
+      // waiting for the bridge's TTL. A failed read never gets here.
+      if (input.missing) {
+        if (tracked.removed) return out;
+        tracked.removed = true;
+        tracked.reported = null;
         tracked.permissions.clear();
-        for (const id of ids) tracked.permissions.add(id);
-      }
-      for (const [sessionID, ids] of Object.entries(input.forms ?? {})) {
-        if (ids === null) continue;
-        const tracked = state.sessions.get(sessionID);
-        if (!tracked) continue;
         tracked.forms.clear();
-        for (const id of ids) tracked.forms.add(id);
+        out.push({ type: "delete", sessionID: input.sessionID });
+        return out;
       }
-      for (const sessionID of state.sessions.keys()) sync(state, sessionID, out);
+      if (!input.view || tracked.removed) return out;
+      tracked.underlying = input.view.executing ? "working" : "idle";
+      const name = displayName(input.view);
+      if (name !== "" && name !== tracked.name) tracked.name = name;
+      tracked.directory = input.view.directory ?? tracked.directory;
+      // A set is replaced only on a successful read; a skipped read leaves the
+      // event-derived set alone because prompt reads are location-scoped.
+      if (input.permissions) {
+        tracked.permissions.clear();
+        for (const id of input.permissions) tracked.permissions.add(id);
+      }
+      sync(state, input.sessionID, out);
       return out;
     }
   }

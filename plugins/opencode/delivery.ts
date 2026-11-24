@@ -2,10 +2,12 @@
  * Delivery layer: turns reducer actions into `/report` calls without ever
  * blocking the OpenCode event hook.
  *
- * The queue is per session and holds at most one pending write: a newer state
- * replaces an older one that has not been sent yet, and a delete cancels any
- * queued post for the same session. Bridge failures back off and never throw
- * into the hook that produced them.
+ * The queue is per session and holds at most one desired write: the latest
+ * state always wins, whatever came before it, because the reducer only emits a
+ * post for a session it still tracks. A write that is already in flight is
+ * never replaced; the newer state is sent after it, so the bridge always sees
+ * the reducer's order. Bridge failures back off and never throw into the hook
+ * that produced them.
  */
 
 export interface DeliveryConfig {
@@ -27,7 +29,7 @@ export interface Delivery {
   enqueue(write: Write): void;
   /** Resolves once nothing is queued or in flight. Used by tests. */
   drain(): Promise<void>;
-  /** Drop everything and stop: used on unload, never holds the process open. */
+  /** Drop everything, abort in-flight requests and stop: used on unload. */
   close(): void;
 }
 
@@ -42,6 +44,7 @@ export function residentID(machineId: string, sessionID: string): string | null 
 }
 
 const MAX_BACKOFF_MS = 60_000;
+const MAX_ATTEMPTS = 8;
 
 interface Pending {
   write: Write;
@@ -52,13 +55,26 @@ interface Pending {
 export function createDelivery(cfg: DeliveryConfig): Delivery {
   const timeoutMs = cfg.timeoutMs ?? 5_000;
   const doFetch = cfg.fetch ?? globalThis.fetch;
+  /** The next write for each session; at most one per session. */
   const queue = new Map<string, Pending>();
-  const inflight = new Set<string>();
+  /** Requests on the wire, keyed by session, so one is never sent twice. */
+  const inflight = new Map<string, AbortController>();
   let idle: Array<() => void> = [];
   let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  /** When the armed timer fires; 0 when none is armed. */
+  let timerDue = 0;
+  /** Keeps the loop alive only while somebody awaits drain(). */
+  let keepAlive: ReturnType<typeof setInterval> | null = null;
 
   function settleIfIdle(): void {
     if (queue.size === 0 && inflight.size === 0) {
+      // Nothing is outstanding: a drain() waiter has nothing left to wait for,
+      // so the keep-alive interval must not outlive it.
+      if (keepAlive !== null) {
+        clearInterval(keepAlive);
+        keepAlive = null;
+      }
       const waiters = idle;
       idle = [];
       for (const resolve of waiters) resolve();
@@ -72,34 +88,34 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
       console.warn("[agent-machi] skipping a resident whose id breaks the bridge's limits");
       return;
     }
+    // Latest state wins. A session coming back after a delete therefore
+    // survives, and a delete still supersedes a post queued before it: the
+    // reducer's order is the only order that matters here.
     const existing = queue.get(write.sessionID);
-    if (write.type === "delete") {
-      // A delete always supersedes a queued post for the same resident.
-      queue.set(write.sessionID, { write, attempts: 0, notBefore: 0 });
-    } else if (existing && existing.write.type === "delete" && !inflight.has(write.sessionID)) {
-      // A resident already removed must not be recreated by a stale post;
-      // only its own later events may do that, and those arrive as new writes
-      // after the delete has been taken off the queue.
-      return;
-    } else {
-      // Carrying the attempt count keeps a superseding state behind the same
-      // backoff the failed attempt earned, instead of retrying immediately.
-      queue.set(write.sessionID, { write, attempts: existing?.attempts ?? 0, notBefore: existing?.notBefore ?? 0 });
-    }
+    queue.set(write.sessionID, {
+      write,
+      attempts: existing?.attempts ?? 0,
+      notBefore: existing?.notBefore ?? 0,
+    });
     schedule();
   }
 
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
   function schedule(): void {
-    if (timer !== null || stopped) return;
+    if (stopped) return;
     const next = nextDue();
     if (next === null) return;
-    const delay = Math.max(0, next - Date.now());
+    // An existing timer may be waiting out a long backoff while another
+    // session is already due: re-arm instead of letting it wait.
+    if (timer !== null) {
+      if (timerDue <= next) return;
+      clearTimeout(timer);
+      timer = null;
+    }
+    timerDue = next;
     timer = setTimeout(() => {
       timer = null;
       void pump();
-    }, delay);
+    }, Math.max(0, next - Date.now()));
     // A pending retry must never hold the process open on its own.
     (timer as unknown as { unref?: () => void }).unref?.();
   }
@@ -121,9 +137,10 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
       if (pending.notBefore > now) continue;
       if (inflight.has(sessionID)) continue;
       queue.delete(sessionID);
-      inflight.add(sessionID);
-      void send(sessionID, pending).finally(() => {
-        inflight.delete(sessionID);
+      const abort = new AbortController();
+      inflight.set(sessionID, abort);
+      void send(sessionID, pending, abort.signal).finally(() => {
+        if (inflight.get(sessionID) === abort) inflight.delete(sessionID);
         schedule();
         settleIfIdle();
       });
@@ -132,8 +149,11 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     settleIfIdle();
   }
 
-  async function send(sessionID: string, pending: Pending): Promise<void> {
+  async function send(sessionID: string, pending: Pending, abort: AbortSignal): Promise<void> {
     const write = pending.write;
+    // A request must never outlive its own bound, and close() must be able to
+    // cancel it: one signal that fires on either.
+    const deadline = setTimeout(() => abort.abort(), timeoutMs);
     let response: Response;
     try {
       response = await doFetch(requestURL(write), {
@@ -144,33 +164,37 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
         },
         ...(write.type === "post" ? { body: JSON.stringify(body(write)) } : {}),
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: abort,
       });
     } catch {
-      retryOrDrop(write, pending);
+      retryOrDrop(sessionID, write, pending);
       return;
+    } finally {
+      clearTimeout(deadline);
     }
     if (response.ok) return;
     // A rejected write (bad id, wrong token, ingest off) will not be fixed by
     // retrying, but a transient 5xx or a stalled bridge might be.
-    if (response.status >= 500) {
-      retryOrDrop(write, pending);
-      return;
-    }
+    if (response.status >= 500) retryOrDrop(sessionID, write, pending);
   }
 
-  function retryOrDrop(write: Write, pending: Pending): void {
+  function retryOrDrop(sessionID: string, write: Write, pending: Pending): void {
+    // Unload already dropped the queue and cancelled this request.
+    if (stopped) return;
     const attempts = pending.attempts + 1;
-    if (attempts > 8) return;
+    if (attempts > MAX_ATTEMPTS) return;
     const backoff = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** (attempts - 1));
-    const existing = queue.get(write.sessionID);
-    // Latest state wins: only re-queue when nothing newer replaced it.
-    if (existing && existing.write !== write) return;
-    queue.set(write.sessionID, {
-      write,
-      attempts,
-      notBefore: Date.now() + backoff,
-    });
+    const notBefore = Date.now() + backoff;
+    const queued = queue.get(sessionID);
+    if (queued) {
+      // A newer state arrived while this one was failing. It is still the same
+      // resident and the same outage, so it inherits the backoff just earned
+      // instead of retrying immediately.
+      queued.attempts = Math.max(queued.attempts, attempts);
+      queued.notBefore = Math.max(queued.notBefore, notBefore);
+    } else {
+      queue.set(sessionID, { write, attempts, notBefore });
+    }
     schedule();
   }
 
@@ -201,7 +225,14 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
       stopped = true;
       if (timer !== null) clearTimeout(timer);
       timer = null;
+      // An in-flight POST could otherwise land after the replacement reporter
+      // has already reported the same resident.
+      for (const abort of inflight.values()) abort.abort();
       queue.clear();
+      if (keepAlive !== null) {
+        clearInterval(keepAlive);
+        keepAlive = null;
+      }
       const waiters = idle;
       idle = [];
       for (const resolve of waiters) resolve();
@@ -212,13 +243,10 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
           resolve();
           return;
         }
-        // The retry timer is unref'd, so keep the loop alive explicitly while
-        // somebody is waiting. Unload uses close(), which never does this.
-        const keepAlive = setInterval(() => undefined, 250);
-        idle.push(() => {
-          clearInterval(keepAlive);
-          resolve();
-        });
+        // The retry timer is unref'd, so keep the loop alive while somebody is
+        // waiting. Unload uses close(), which never does this.
+        if (keepAlive === null) keepAlive = setInterval(() => undefined, 250);
+        idle.push(() => resolve());
         schedule();
       });
     },

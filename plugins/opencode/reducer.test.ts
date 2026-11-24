@@ -87,26 +87,28 @@ test("a prompt that clears while work continues falls back to working", () => {
   ]);
 });
 
-test("reconciliation rebuilds execution membership from /active", () => {
+test("reconciliation corrects a missed start per session", () => {
   const state = createState();
   created(state, [session("ses_a"), session("ses_b")]);
   reduce(state, { kind: "execution-started", sessionID: "ses_a" });
   // The start was missed for ses_b, so only a successful read can correct it.
-  const actions = reduce(state, { kind: "reconcile", active: ["ses_b"] });
+  const actions = [
+    ...reduce(state, { kind: "reconcile", sessionID: "ses_a", view: { ...session("ses_a"), executing: false } }),
+    ...reduce(state, { kind: "reconcile", sessionID: "ses_b", view: { ...session("ses_b"), executing: true } }),
+  ];
   assert.deepEqual(actions, [
     { type: "post", sessionID: "ses_a", status: "idle", name: "ses_a" },
     { type: "post", sessionID: "ses_b", status: "working", name: "ses_b" },
   ]);
 });
 
-test("a failed membership read changes nothing", () => {
+test("a failed or skipped read changes nothing", () => {
   const state = createState();
   created(state);
   reduce(state, { kind: "execution-started", sessionID: "ses_a" });
-  assert.deepEqual(reduce(state, { kind: "reconcile", active: null }), []);
-  assert.deepEqual(reduce(state, { kind: "reconcile", active: [] }), [
-    { type: "post", sessionID: "ses_a", status: "idle", name: "ses_a" },
-  ]);
+  // A failed read never reaches the reducer; a skipped prompt read omits the
+  // field, and neither may touch the resident's state.
+  assert.deepEqual(reduce(state, { kind: "reconcile", sessionID: "ses_a", view: null }), []);
 });
 
 test("a failed prompt read never empties the pending set", () => {
@@ -115,16 +117,17 @@ test("a failed prompt read never empties the pending set", () => {
   reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_1" });
   const failed = reduce(state, {
     kind: "reconcile",
-    active: [],
-    permissions: { ses_a: null },
-    forms: { ses_a: null },
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: false },
+    permissions: null,
   });
+  // Status is unchanged (still blocked), so a renew-only post is all it is.
   assert.deepEqual(failed, []);
   const ok = reduce(state, {
     kind: "reconcile",
-    active: [],
-    permissions: { ses_a: [] },
-    forms: { ses_a: [] },
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: false },
+    permissions: [],
   });
   assert.deepEqual(ok, [
     { type: "post", sessionID: "ses_a", status: "idle", name: "ses_a" },
@@ -136,12 +139,33 @@ test("reconciliation picks up a prompt whose events were missed", () => {
   created(state);
   const actions = reduce(state, {
     kind: "reconcile",
-    active: ["ses_a"],
-    permissions: { ses_a: ["per_9"] },
-    forms: { ses_a: [] },
+    sessionID: "ses_a",
+    view: { ...session("ses_a"), executing: true },
+    permissions: ["per_9"],
   });
   assert.deepEqual(actions, [
     { type: "post", sessionID: "ses_a", status: "blocked", name: "ses_a" },
+  ]);
+});
+
+test("an authoritative not-found removes the resident at once", () => {
+  const state = createState();
+  created(state);
+  const actions = reduce(state, { kind: "reconcile", sessionID: "ses_a", view: null, missing: true });
+  assert.deepEqual(actions, [{ type: "delete", sessionID: "ses_a" }]);
+  // And it stays gone: a later read cannot resurrect it.
+  assert.deepEqual(reduce(state, { kind: "reconcile", sessionID: "ses_a", view: { ...session("ses_a"), executing: true } }), []);
+});
+
+test("a rename is cached so the next transition carries it", () => {
+  const state = createState();
+  created(state);
+  // A rename alone posts nothing: the bridge ignores a name on an unchanged
+  // status, so it lands with the next real transition.
+  assert.deepEqual(reduce(state, { kind: "renamed", sessionID: "ses_a", title: "new name" }), []);
+  const actions = reduce(state, { kind: "execution-started", sessionID: "ses_a" });
+  assert.deepEqual(actions, [
+    { type: "post", sessionID: "ses_a", status: "working", name: "new name" },
   ]);
 });
 
@@ -232,5 +256,14 @@ test("a later metadata read refreshes the name on the next transition", () => {
   });
   assert.deepEqual(reduce(state, { kind: "execution-started", sessionID: "ses_a" }), [
     { type: "post", sessionID: "ses_a", status: "working", name: "renamed" },
+  ]);
+});
+
+test("a delete for an untracked session still sends DELETE", () => {
+  // After a reload this reporter never saw the session, but the resident it
+  // left behind still exists: a DELETE is the only way to clear it now.
+  const state = createState();
+  assert.deepEqual(reduce(state, { kind: "deleted", sessionID: "ses_unknown" }), [
+    { type: "delete", sessionID: "ses_unknown" },
   ]);
 });

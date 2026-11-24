@@ -95,15 +95,17 @@ test("a delete supersedes a queued post for the same session", async () => {
   );
 });
 
-test("a post queued behind a delete is dropped", async () => {
+test("a session that comes back while its delete is backing off is reported again", async () => {
   const { calls, fetch } = recorder((_url, attempt) => (attempt === 1 ? 503 : 200));
   const delivery = createDelivery({ ...base, fetch, timeoutMs: 10 });
   delivery.enqueue({ type: "delete", sessionID: "ses_a" });
+  // The reducer only posts again after a real start, so this supersedes the
+  // delete that has not been accepted yet.
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await delivery.drain();
   assert.deepEqual(
     calls.map((call) => call.method),
-    ["DELETE", "DELETE"],
+    ["POST", "POST"],
   );
 });
 
@@ -175,4 +177,47 @@ test("close stops the writer without keeping the process alive", async () => {
   const before = calls.length;
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(calls.length, before, "no write is attempted after close");
+});
+
+test("close aborts an in-flight request and nothing lands afterwards", async () => {
+  let aborted = false;
+  let settled = false;
+  const fetch = ((_input: any, init: any = {}) => {
+    const signal: AbortSignal | undefined = init.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => {
+        aborted = true;
+        reject(new Error("aborted"));
+      });
+      // Never resolves on its own: only the abort ends it.
+      void settled;
+    });
+  }) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 60_000 });
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  delivery.close();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  settled = true;
+  assert.equal(aborted, true, "the in-flight request was cancelled");
+});
+
+test("a ready write for another session is not delayed by a retry timer", async () => {
+  const seen: string[] = [];
+  const fetch = (async (input: any, init: any = {}) => {
+    const url = new URL(String(input));
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    const id = body.id ?? url.searchParams.get("id") ?? "";
+    seen.push(id);
+    // ses_a fails once so a retry timer exists; ses_b must not wait for it.
+    if (id === "mini-ses_a") return new Response("nope", { status: 503 });
+    return new Response('{"ok":true}', { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 50 });
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  delivery.enqueue({ type: "post", sessionID: "ses_b", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(seen.includes("mini-ses_b"), "ses_b was sent without waiting for ses_a's backoff");
+  delivery.close();
 });
