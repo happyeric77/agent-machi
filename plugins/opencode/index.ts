@@ -275,12 +275,20 @@ class Reporter {
    */
   private readonly pendingPrompts = new Map<string, Input[]>();
   /**
+   * The observation number of the newest execution event already received for a
+   * session, applied or still queued. A parked event older than this must not be
+   * published: the newer event is a fact even before its own task runs, and
+   * publishing the older one would report a run that has already ended.
+   */
+  private readonly execAt = new Map<string, number>();
+  /**
    * Forget work parked for a session that is gone. A parked event describes a
    * resident; once the resident is removed, replaying it would attach an old
    * transition or an old prompt to whatever incarnation comes next.
    */
   private forget(sessionID: string): void {
     this.pendingExec.delete(sessionID);
+    this.execAt.delete(sessionID);
     this.pendingPrompts.delete(sessionID);
     this.pendingCreate.delete(sessionID);
     this.discardHeld(sessionID);
@@ -315,6 +323,10 @@ class Reporter {
     // A newer observation has already spoken for this session's execution
     // state, so the parked event is older than the truth: keep the truth.
     if ((this.observed.get(sessionID) ?? 0) > parked.at) return;
+    // A newer execution event was received after this one, even if its own task
+    // has not run yet. Publishing this one first would briefly report a run that
+    // the newer event already knows is over.
+    if ((this.execAt.get(sessionID) ?? 0) > parked.at) return;
     // A resident that no longer exists has nothing to receive this event.
     if (!this.state.sessions.has(sessionID)) return;
     // The fallback is itself an observation: recording it keeps an older queued
@@ -337,6 +349,10 @@ class Reporter {
   private parkPrompt(input: Input): void {
     const sessionID = heldSession(input);
     if (sessionID === null) return;
+    // Only a resident can receive a parked ask. An archive may have removed it
+    // between the event's arrival and this task running, and parking for a gone
+    // session would attach the old ask to its next incarnation.
+    if (!this.state.sessions.has(sessionID)) return;
     const waiting = this.pendingPrompts.get(sessionID);
     if (waiting) waiting.push(input);
     else this.pendingPrompts.set(sessionID, [input]);
@@ -714,7 +730,12 @@ class Reporter {
       promptsStartedAt !== undefined &&
       promptsStartedAt > (this.promptsAt.get(sessionID) ?? 0);
     if (promptsFresh) this.promptsAt.set(sessionID, promptsStartedAt as number);
-    this.dispatch({ kind: "reconcile", sessionID, view, permissions: promptsFresh ? permissions : undefined });
+    this.dispatch({
+      kind: "reconcile",
+      sessionID,
+      view,
+      permissions: promptsFresh ? this.answeredOnly(permissions as readonly string[]) : undefined,
+    });
     this.releaseHeld(sessionID);
     // The row answered execution; a prompt read that failed leaves the parked
     // asks as the only evidence, so they are applied rather than lost.
@@ -918,8 +939,11 @@ class Reporter {
       // No live setup serves this session's location: this reporter cannot read
       // its prompts at all. Waiting for a reader that may never come back would
       // strand a parked ask forever, so it is treated as an inconclusive prompt
-      // read and the ask is applied.
+      // read and the ask is applied. That must not depend on the metadata read
+      // succeeding: an ask cannot be re-derived, and the resident is already
+      // known here.
       this.applyRead(sessionID, read, null, owner, startedAt);
+      if (read.kind === "unknown") this.flushPendingPrompts(sessionID);
       return;
     }
     const promptsStartedAt = this.nextObservation();
@@ -937,7 +961,11 @@ class Reporter {
       if (permissions && promptsStartedAt > (this.promptsAt.get(sessionID) ?? 0)) {
         this.promptsAt.set(sessionID, promptsStartedAt);
         this.dropPendingPrompts(sessionID);
-        this.dispatch({ kind: "permissions", sessionID, permissions });
+        this.dispatch({
+          kind: "permissions",
+          sessionID,
+          permissions: this.answeredOnly(permissions),
+        });
       } else if (permissions === null) {
         // The read failed: the parked ask is the only evidence left.
         this.flushPendingPrompts(sessionID);
@@ -947,6 +975,20 @@ class Reporter {
     // applyRead publishes the stamp only if it actually accepts the row: a read
     // discarded because its owner retired never answered for the prompts.
     this.applyRead(sessionID, read, permissions, owner, startedAt, promptsStartedAt);
+  }
+
+  /**
+   * Drop ids whose answer already arrived. The reply's own queued task may not
+   * have run yet, but the answer is a fact: applying the snapshot's copy would
+   * report a block the user already dismissed.
+   */
+  private answeredOnly(permissions: readonly string[]): string[] {
+    const live: string[] = [];
+    for (const id of permissions) {
+      if (this.isAnswered(Reporter.promptKey("permission", id))) continue;
+      live.push(id);
+    }
+    return live;
   }
 
   private async readPermissions(
@@ -1135,6 +1177,7 @@ class Reporter {
           // still answer after it. That is a property of THIS event, so it is
           // captured here rather than left as a flag for a later event to eat.
           const raced = this.reading.has(sessionID);
+          this.execAt.set(sessionID, Math.max(this.execAt.get(sessionID) ?? 0, at));
           this.enqueue(async () => {
             const admission = await this.admit(sessionID);
             // The admission read may already have seen this session idle again,
@@ -1169,6 +1212,7 @@ class Reporter {
           const sessionID = data.sessionID;
           const at = this.nextObservation();
           const raced = this.reading.has(sessionID);
+          this.execAt.set(sessionID, Math.max(this.execAt.get(sessionID) ?? 0, at));
           this.enqueue(async () => {
             // A start that was never admitted must not swallow the end.
             const admission = await this.admit(sessionID);
