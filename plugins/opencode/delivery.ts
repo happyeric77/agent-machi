@@ -139,7 +139,7 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
       queue.delete(sessionID);
       const abort = new AbortController();
       inflight.set(sessionID, abort);
-      void send(sessionID, pending, abort.signal).finally(() => {
+      void send(sessionID, pending, abort).finally(() => {
         if (inflight.get(sessionID) === abort) inflight.delete(sessionID);
         schedule();
         settleIfIdle();
@@ -149,11 +149,15 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     settleIfIdle();
   }
 
-  async function send(sessionID: string, pending: Pending, abort: AbortSignal): Promise<void> {
+  async function send(
+    sessionID: string,
+    pending: Pending,
+    controller: AbortController,
+  ): Promise<void> {
     const write = pending.write;
     // A request must never outlive its own bound, and close() must be able to
-    // cancel it: one signal that fires on either.
-    const deadline = setTimeout(() => abort.abort(), timeoutMs);
+    // cancel it: one controller that fires on either.
+    const deadline = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
     try {
       response = await doFetch(requestURL(write), {
@@ -164,7 +168,7 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
         },
         ...(write.type === "post" ? { body: JSON.stringify(body(write)) } : {}),
         redirect: "manual",
-        signal: abort,
+        signal: controller.signal,
       });
     } catch {
       retryOrDrop(sessionID, write, pending);
@@ -239,7 +243,9 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     },
     drain(): Promise<void> {
       return new Promise((resolve) => {
-        if (queue.size === 0 && inflight.size === 0) {
+        // Nothing will ever be sent again: a waiter would wait forever, and the
+        // keep-alive interval would outlive the writer.
+        if (stopped || (queue.size === 0 && inflight.size === 0)) {
           resolve();
           return;
         }

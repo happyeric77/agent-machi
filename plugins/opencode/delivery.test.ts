@@ -152,11 +152,11 @@ test("a resident id the bridge would reject is never sent", async () => {
 });
 
 test("a state that arrives while a delete is in flight survives", async () => {
-  let release: (() => void) | null = null;
+  const gate: { release: (() => void) | null } = { release: null };
   const calls: string[] = [];
   const fetch = async (_input: any, init: any = {}) => {
     calls.push(init.method ?? "GET");
-    if (init.method === "DELETE") await new Promise<void>((resolve) => (release = resolve));
+    if (init.method === "DELETE") await new Promise<void>((resolve) => (gate.release = resolve));
     return new Response("{}", { status: 200 });
   };
   const delivery = createDelivery({ ...base, fetch: fetch as unknown as typeof globalThis.fetch });
@@ -164,7 +164,7 @@ test("a state that arrives while a delete is in flight survives", async () => {
   // Let the DELETE start, then reactivate the resident while it is in flight.
   await new Promise((resolve) => setTimeout(resolve, 20));
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
-  release?.();
+  gate.release?.();
   await delivery.drain();
   assert.deepEqual(calls, ["DELETE", "POST"]);
 });
@@ -220,4 +220,38 @@ test("a ready write for another session is not delayed by a retry timer", async 
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.ok(seen.includes("mini-ses_b"), "ses_b was sent without waiting for ses_a's backoff");
   delivery.close();
+});
+
+test("a stalled bridge is cancelled at the deadline, not left hanging", async () => {
+  let aborted = false;
+  const fetch = ((_input: any, init: any = {}) => {
+    const signal: AbortSignal | undefined = init.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => {
+        aborted = true;
+        reject(new Error("aborted"));
+      });
+      // Headers never arrive: only the deadline can end this.
+    });
+  }) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 25 });
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(aborted, true, "the deadline aborted the stalled request");
+  delivery.close();
+});
+
+test("drain after close resolves instead of starting a keep-alive", async () => {
+  // An aborted fetch that rejects promptly: the point is that drain() returns
+  // even though close() already ran, not that a hung promise can be collected.
+  const fetch = ((_input: any, init: any = {}) =>
+    new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof globalThis.fetch;
+  const delivery = createDelivery({ ...base, fetch, timeoutMs: 60_000 });
+  delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  delivery.close();
+  await delivery.drain();
+  assert.ok(true);
 });

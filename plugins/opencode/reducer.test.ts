@@ -210,7 +210,11 @@ test("a session that runs again after deletion is reported again", () => {
   const state = createState();
   created(state);
   reduce(state, { kind: "deleted", sessionID: "ses_a" });
-  const again = reduce(state, { kind: "execution-started", sessionID: "ses_a" });
+  // Revival requires a fresh non-archived metadata read, not a bare event.
+  const again = reduce(state, {
+    kind: "discovered",
+    sessions: [{ id: "ses_a", title: "ses_a", directory: "/tmp/project", executing: true }],
+  });
   assert.deepEqual(again, [
     { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
   ]);
@@ -244,7 +248,8 @@ test("a prompt outliving its turn keeps the resident blocked", () => {
   reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_1" });
   const actions = reduce(state, { kind: "execution-ended", sessionID: "ses_a" });
   assert.deepEqual(actions, []);
-  assert.equal(reduce(state, { kind: "tick" })[0].status, "blocked");
+  const renewal = reduce(state, { kind: "tick" })[0];
+  assert.equal(renewal.type === "post" ? renewal.status : "delete", "blocked");
 });
 
 test("a later metadata read refreshes the name on the next transition", () => {
@@ -265,5 +270,21 @@ test("a delete for an untracked session still sends DELETE", () => {
   const state = createState();
   assert.deepEqual(reduce(state, { kind: "deleted", sessionID: "ses_unknown" }), [
     { type: "delete", sessionID: "ses_unknown" },
+  ]);
+});
+
+test("a late start does not revive a confirmed removal", () => {
+  const state = createState();
+  created(state);
+  reduce(state, { kind: "deleted", sessionID: "ses_a" });
+  // The event may belong to a row that is still archived: only a fresh view
+  // may bring the resident back.
+  assert.deepEqual(reduce(state, { kind: "execution-started", sessionID: "ses_a" }), []);
+  const revived = reduce(state, {
+    kind: "discovered",
+    sessions: [{ id: "ses_a", title: "ses_a", directory: "/tmp/project", executing: true }],
+  });
+  assert.deepEqual(revived, [
+    { type: "post", sessionID: "ses_a", status: "working", name: "ses_a" },
   ]);
 });

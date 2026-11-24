@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit && npm run typecheck:plugin",
+    "typecheck:plugin": "tsc --noEmit --ignoreConfig --strict --target es2022 --module nodenext --moduleResolution nodenext --allowImportingTsExtensions --skipLibCheck plugins/opencode/index.ts plugins/opencode/delivery.ts plugins/opencode/reducer.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts plugins/opencode/*.test.ts",
     "bridge": "node tools/herdr-bridge/index.mjs",
     "bridge:fake": "FAKE=1 node tools/herdr-bridge/index.mjs"

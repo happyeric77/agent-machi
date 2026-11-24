@@ -75,9 +75,12 @@ plugin stays silent and the session works exactly as before.
   missed event is corrected within five minutes. Reads for one session never
   discard another session's: one session's activity cannot starve the rest.
 - A write in flight is never replaced, and a session's latest state always
-  wins: a session that comes back after a delete is reported again, and an
-  unload aborts anything still on the wire so a late write cannot land after
-  the replacement reporter's.
+  wins: a session that comes back after a delete is reported again.
+- Write ordering is not guaranteed across a proxy. An unload aborts anything
+  still on the wire, but a proxy that already buffered an earlier POST can
+  still forward it after a newer DELETE reaches the bridge, and the bridge has
+  no sequence check. If a stale write must never win, that needs a write
+  generation enforced at the bridge; aborting the client is not enough.
 - A session the server answers `Session.NotFoundError` for is deleted at once
   instead of waiting out the bridge's TTL. A failed or timed-out read never
   counts as "gone". An archived session is treated the same way: it still

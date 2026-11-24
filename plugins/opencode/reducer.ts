@@ -121,6 +121,15 @@ export function reduce(state: State, input: Input): Action[] {
         if (view.parentID) continue;
         const known = state.sessions.get(view.id);
         if (known) {
+          // A confirmed-gone session comes back only with a fresh view, which
+          // is what a metadata read just proved. A start event alone must not
+          // revive it: the row may still be archived.
+          const revived = known.removed;
+          if (revived) {
+            known.removed = false;
+            known.reported = null;
+            known.underlying = view.executing ? "working" : "idle";
+          }
           // Already tracked: a later metadata read may only refresh the name.
           const name = displayName(view);
           if (name !== "" && name !== known.name) {
@@ -128,6 +137,7 @@ export function reduce(state: State, input: Input): Action[] {
             // The bridge keeps metadata from the last status report, so the
             // new name lands with the next transition or heartbeat.
           }
+          if (revived) sync(state, view.id, out);
           continue;
         }
         state.sessions.set(view.id, {
@@ -156,8 +166,9 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "execution-started": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
-      tracked.removed = false;
+      // A start alone never undoes a confirmed removal: the row may still be
+      // archived. Revival goes through `discovered` with a fresh view.
+      if (!tracked || tracked.removed) return out;
       tracked.underlying = "working";
       sync(state, input.sessionID, out);
       return out;
