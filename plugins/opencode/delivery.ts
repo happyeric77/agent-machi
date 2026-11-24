@@ -33,6 +33,19 @@ export interface Delivery {
   close(): void;
 }
 
+/**
+ * The canonical report endpoint. Two configurations that differ only in
+ * spelling (`/town` vs `/town/`) write to the same resident namespace, so
+ * anything keyed by "where writes go" must use this, not the raw option.
+ */
+export function reportURL(bridgeUrl: URL): URL {
+  const url = new URL(bridgeUrl);
+  url.pathname = url.pathname.replace(/\/?$/, "/report");
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
 /** `<machineId>-<sessionID>`, or null when the result cannot be a valid id. */
 export function residentID(machineId: string, sessionID: string): string | null {
   if (!/^[!-~]+$/.test(machineId) || machineId.includes(":")) return null;
@@ -41,6 +54,13 @@ export function residentID(machineId: string, sessionID: string): string | null 
   const bytes = new TextEncoder().encode(id).length;
   if (bytes < 1 || bytes > 128) return null;
   return id;
+}
+
+/** True when the two writes ask for exactly the same thing. */
+function sameWrite(a: Write, b: Write): boolean {
+  if (a.type !== b.type) return false;
+  if (a.type === "delete" || b.type === "delete") return true;
+  return a.status === b.status && a.name === b.name;
 }
 
 const MAX_BACKOFF_MS = 60_000;
@@ -92,9 +112,14 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     // survives, and a delete still supersedes a post queued before it: the
     // reducer's order is the only order that matters here.
     const existing = queue.get(write.sessionID);
+    // Same operation and same state: this is a heartbeat for work already
+    // failing, so it keeps waiting out that backoff. A different write is new
+    // work — a DELETE after a failing POST — and gets its own attempt budget,
+    // though it may not jump the queue ahead of a retry already scheduled.
+    const same = existing !== undefined && sameWrite(existing.write, write);
     queue.set(write.sessionID, {
       write,
-      attempts: existing?.attempts ?? 0,
+      attempts: same ? existing.attempts : 0,
       notBefore: existing?.notBefore ?? 0,
     });
     schedule();
@@ -191,10 +216,11 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
     const notBefore = Date.now() + backoff;
     const queued = queue.get(sessionID);
     if (queued) {
-      // A newer state arrived while this one was failing. It is still the same
-      // resident and the same outage, so it inherits the backoff just earned
-      // instead of retrying immediately.
-      queued.attempts = Math.max(queued.attempts, attempts);
+      // A newer state arrived while this one was failing. It runs into the same
+      // outage, so it inherits the wait — but if it is different work (a DELETE
+      // after a failing POST) it keeps its own attempt budget rather than
+      // burning through the attempts the failed write already spent.
+      queued.attempts = sameWrite(queued.write, write) ? Math.max(queued.attempts, attempts) : 0;
       queued.notBefore = Math.max(queued.notBefore, notBefore);
     } else {
       queue.set(sessionID, { write, attempts, notBefore });
@@ -203,12 +229,10 @@ export function createDelivery(cfg: DeliveryConfig): Delivery {
   }
 
   function requestURL(write: Write): string {
-    const id = residentID(cfg.machineId, write.sessionID);
-    const url = new URL(cfg.bridgeUrl);
-    url.pathname = url.pathname.replace(/\/?$/, "/report");
+    const url = reportURL(cfg.bridgeUrl);
     if (write.type === "post") return url.toString();
     url.searchParams.set("source", cfg.source);
-    url.searchParams.set("id", id ?? "");
+    url.searchParams.set("id", residentID(cfg.machineId, write.sessionID) ?? "");
     return url.toString();
   }
 

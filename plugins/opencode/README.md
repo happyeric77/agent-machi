@@ -69,11 +69,15 @@ plugin stays silent and the session works exactly as before.
 - The display name is the session title, falling back to the directory name. A
   rename alone reports nothing (the bridge ignores a name on an unchanged
   status); the new name lands with the session's next transition.
-- Every live resident is renewed every 5 minutes. A same-status report is a
-  silent heartbeat on the bridge. Each heartbeat also re-reads, per session,
-  whether it is executing and which permission requests are pending, so a
-  missed event is corrected within five minutes. Reads for one session never
-  discard another session's: one session's activity cannot starve the rest.
+- Every live resident is renewed every 5 minutes, on its own clock: renewal
+  never waits for a metadata read. A same-status report only renews the lease,
+  so a renewal carries whatever state was last known and is not a correction.
+  The same heartbeat also starts a reconcile pass that re-reads, per session,
+  whether it is executing and which permission requests are pending; that is
+  what corrects a missed event. Because the pass is serial and bounded, how
+  soon a correction lands depends on how many sessions are tracked and whether
+  reads are failing — treat five minutes as the idle case, not a guarantee.
+  Reads for one session never discard another session's.
 - A write in flight is never replaced, and a session's latest state always
   wins: a session that comes back after a delete is reported again.
 - Write ordering is not guaranteed across a proxy. An unload aborts anything
@@ -82,10 +86,15 @@ plugin stays silent and the session works exactly as before.
   no sequence check. If a stale write must never win, that needs a write
   generation enforced at the bridge; aborting the client is not enough.
 - A session the server answers `Session.NotFoundError` for is deleted at once
-  instead of waiting out the bridge's TTL. A failed or timed-out read never
-  counts as "gone". An archived session is treated the same way: it still
-  answers reads and still appears in the list, and the only trace is
+  instead of waiting out the bridge's TTL — that is an authoritative absence,
+  and it does not require a delete or archive event. A failed or timed-out
+  read never counts as "gone". An archived session is treated the same way: it
+  still answers reads and still appears in the list, and the only trace is
   `time.archived`, so it is excluded wherever rows are read.
+- A session confirmed gone stays gone until a fresh, non-archived read proves
+  it is live again; a bare start event does not revive it. Prompt events that
+  arrive while it is gone are dropped, so a later revival cannot inherit a
+  stale form or permission.
 - A delete for a session this reporter never tracked still sends `DELETE`:
   after a plugin reload the resident from the earlier instance must be cleared
   now, not at TTL. Deleting an absent row is a no-op on the bridge.
@@ -107,19 +116,26 @@ Two authoritative sources in the integration plan are out of reach on OpenCode
   newer than `idle`, and `idle` is absent until the first turn ends; a session
   is ignored after a restart if its `busy` predates the server's boot.
 - `GET /api/session/{id}/form` has no counterpart either. Form state is
-  event-only, with two known failure modes: a form that opens and is answered
-  entirely between two heartbeats is never seen, and a `form.replied` event
-  missed across a reconnect leaves the resident `blocked` until the next form
-  event or session deletion. A failed read never counts as "no prompts pending".
+  event-only, and because there is no read to repair it the recovery is one
+  event, not a timer: a `form.created` that is answered entirely while the
+  stream is down is never seen, and a missed terminal (`form.replied` /
+  `form.cancelled`) leaves that resident `blocked` until the session is
+  deleted or the process restarts. A later form event for the same session
+  clears only that form's id. A failed prompt read never counts as "no prompts
+  pending", and neither does a response that is not a list.
 - Prompt reads (`permission.list`) are **location-scoped**, while the event
-  stream spans every location. A session in another location is therefore
-  reconciled from events only; its pending-permission set is never replaced by
-  a read from this location, because that read would describe different
-  prompts.
-- Plugin setup runs once per location. Exactly one live setup reports: a new
-  setup stops the previous one and takes over immediately, because the event
-  stream already spans every location and a plugin reload may leave the old
-  instance's cleanup unreachable.
+  stream spans every location. Each setup registers the directory it was
+  loaded for, and a session's prompts are read through the setup for its own
+  directory. A session in a location with no live setup is reconciled from
+  events only: its pending-permission set is never replaced by a read from
+  elsewhere, because that read would describe different prompts.
+- Plugin setup runs once per location, so reporter state cannot belong to a
+  setup. Setups for the same report endpoint share one reporter keyed by the
+  canonical `/report` URL and resident namespace — not by how `bridgeUrl` was
+  spelled. That keeps another location's residents renewing, and the remaining
+  setup takes over the event stream when the one that owned it unloads. The
+  reporter stops only when the last setup unloads; the process itself may
+  still be running.
 
 ## Uninstall
 

@@ -252,15 +252,22 @@ test("a prompt outliving its turn keeps the resident blocked", () => {
   assert.equal(renewal.type === "post" ? renewal.status : "delete", "blocked");
 });
 
-test("a later metadata read refreshes the name on the next transition", () => {
+test("a second metadata read never overwrites state newer events established", () => {
   const state = createState();
   created(state);
-  reduce(state, {
-    kind: "discovered",
-    sessions: [{ id: "ses_a", title: "renamed", directory: null }],
-  });
-  assert.deepEqual(reduce(state, { kind: "execution-started", sessionID: "ses_a" }), [
-    { type: "post", sessionID: "ses_a", status: "working", name: "renamed" },
+  reduce(state, { kind: "execution-started", sessionID: "ses_a" });
+  // A seed racing a lookup must not roll a live resident back to an older
+  // snapshot; only a rename event may change its name.
+  assert.deepEqual(
+    reduce(state, {
+      kind: "discovered",
+      sessions: [{ id: "ses_a", title: "stale-title", directory: null, executing: false }],
+    }),
+    [],
+  );
+  assert.deepEqual(reduce(state, { kind: "renamed", sessionID: "ses_a", title: "fresh" }), []);
+  assert.deepEqual(reduce(state, { kind: "permission-asked", sessionID: "ses_a", requestID: "per_1" }), [
+    { type: "post", sessionID: "ses_a", status: "blocked", name: "fresh" },
   ]);
 });
 

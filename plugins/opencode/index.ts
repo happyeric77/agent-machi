@@ -5,10 +5,11 @@
  * emits are queued in delivery.ts, which talks to the bridge off the hook
  * path. This file is only the wiring: read options, subscribe, reconcile.
  */
-import { createDelivery, type Delivery, type Write } from "./delivery.ts";
+import { createDelivery, reportURL, type Delivery, type Write } from "./delivery.ts";
 import {
   createState,
   liveSessions,
+  pruneRemoved,
   reduce,
   type Action,
   type Input,
@@ -18,6 +19,8 @@ import {
 
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const RECONNECT_MS = 2_000;
+/** Retry interval for a bootstrap list read that failed. */
+const SEED_RETRY_MS = 2_000;
 /** Bound for one metadata read, so a stall can never hold a session's chain. */
 const READ_TIMEOUT_MS = 5_000;
 /** Sessions per listing page while seeding; the API returns 50 by default. */
@@ -141,8 +144,15 @@ async function readPermissions(ctx: any, sessionID: string): Promise<readonly st
     return null;
   }
   if (pending === TIMEOUT) return null; // a failed read is never an empty set
-  const rows: any[] = Array.isArray(pending) ? pending : (pending?.data ?? []);
-  return rows.map((row: any) => String(row?.id ?? "")).filter((id) => id !== "");
+  // Only an actual list is authoritative. A missing method or an unexpected
+  // payload is an unknown answer, not "nothing pending".
+  if (Array.isArray(pending)) return ids(pending);
+  if (Array.isArray(pending?.data)) return ids(pending.data);
+  return null;
+}
+
+function ids(rows: any[]): string[] {
+  return rows.map((row) => String(row?.id ?? "")).filter((id) => id !== "");
 }
 
 /** A live plugin setup: the context it was handed, and where that lives. */
@@ -172,11 +182,16 @@ class Reporter {
   private readonly removed = new Set<string>();
   private readonly setups: Registration[] = [];
   private readonly bootSince = Date.now() - uptimeMs();
-  private stream: { controller: AbortController; ctx: any } | null = null;
+  private stream: { controller: AbortController; owner: Registration } | null = null;
+  /** Which registration owns the running stream. */
+  private streamOwner: Registration | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private again = false;
+  /** A folded pass asked for a bootstrap, not just a re-check. */
+  private againSeed = false;
   private seeded = false;
+  private retry: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
 
   constructor(config: Config) {
@@ -200,17 +215,18 @@ class Reporter {
    */
   unregister(registration: Registration): void {
     const index = this.setups.indexOf(registration);
-    if (index >= 0) this.setups.splice(index, 1);
+    if (index < 0) return; // already unregistered: cleanup is idempotent
+    this.setups.splice(index, 1);
     if (this.setups.length === 0) {
       this.close();
       return;
     }
-    const stream = this.stream;
-    if (stream !== null && stream.ctx === registration.ctx) {
+    if (this.streamOwner === registration) {
       // The owner is gone but others remain: re-elect by restarting the stream
       // against a surviving context instead of reporting nothing.
-      stream.controller.abort();
+      this.stream?.controller.abort();
       this.stream = null;
+      this.streamOwner = null;
       this.startStream();
     }
   }
@@ -220,9 +236,9 @@ class Reporter {
   }
 
   /** The context loaded for a directory, for location-scoped reads. */
-  private ctxFor(directory: string | null): any {
+  private registrationFor(directory: string | null): Registration | null {
     if (directory === null) return null;
-    return this.setups.find((setup) => setup.directory === directory)?.ctx ?? null;
+    return this.setups.find((setup) => setup.directory === directory) ?? null;
   }
 
   private send(action: Action): void {
@@ -382,53 +398,89 @@ class Reporter {
     // session's own directory can describe its prompts. Without one, the
     // session stays event-only rather than being read from the wrong place.
     let permissions: readonly string[] | null | undefined;
-    const locationCtx = this.ctxFor(view.directory ?? null);
-    if (locationCtx) {
-      const read = await readPermissions(locationCtx, sessionID);
-      if (!this.unchanged(sessionID, v)) return;
+    const location = this.registrationFor(view.directory ?? null);
+    if (location) {
+      const read = await readPermissions(location.ctx, sessionID);
+      // A retired setup's read describes a world that may already have moved
+      // on, and the session may have changed while it ran: drop it either way.
+      if (!this.unchanged(sessionID, v) || !this.setups.includes(location)) return;
       permissions = read;
     }
     this.dispatch({ kind: "reconcile", sessionID, view, permissions });
   }
 
   /** A reconcile pass over everything this reporter owns. */
-  private async reconcile(first: boolean): Promise<void> {
+  private async reconcile(seed: boolean): Promise<void> {
     if (this.closed) return;
-    // Recovery for a bootstrap that never landed: the pass keeps trying on
-    // every reconnect and heartbeat until one succeeds.
-    const bootstrapped = first ? await this.seed() : this.seeded;
-    if (bootstrapped) this.seeded = true;
+    // Recovery for a bootstrap that never landed: any pass may be asked to
+    // seed, and until one succeeds every later pass retries.
+    if (seed || !this.seeded) {
+      if (await this.seed()) this.seeded = true;
+      else this.scheduleBootstrapRetry();
+    }
     for (const sessionID of liveSessions(this.state)) {
       if (this.closed) return;
       await this.check(sessionID);
     }
+    // Every read that began before a removal has now finished, so a removed row
+    // can be dropped. The reporter's tombstone is what still refuses to admit
+    // the session again; the row itself would otherwise pile up forever.
+    for (const sessionID of [...this.state.sessions.keys()]) {
+      if (this.state.sessions.get(sessionID)?.removed) this.versions.delete(sessionID);
+    }
+    pruneRemoved(this.state);
+  }
+
+  /**
+   * A bootstrap that never landed is retried on its own timer. The stream only
+   * re-runs a pass when it reconnects, and a live stream may stay up for hours,
+   * so relying on that would leave a missed session undiscovered indefinitely.
+   */
+  private scheduleBootstrapRetry(): void {
+    if (this.closed || this.seeded || this.retry !== null) return;
+    this.retry = setTimeout(() => {
+      this.retry = null;
+      this.runReconcile(true);
+    }, SEED_RETRY_MS);
+    (this.retry as unknown as { unref?: () => void }).unref?.();
   }
 
   /**
    * One reconcile pass at a time, for startup, every reconnect and every
    * heartbeat. Overlapping passes would race: two reads for the same session
    * can return in either order and neither bumps a version, so a late stale
-   * read would win. A pass requested while one runs is folded into one more.
+   * read would win.
+   *
+   * A pass requested while one runs is folded into exactly one more, and the
+   * seed request is OR-ed in rather than dropped: a folded reconnect must still
+   * bootstrap, whatever the heartbeat's own argument was.
    */
-  private runReconcile(first: boolean): void {
+  private runReconcile(seed: boolean): void {
     if (this.closed) return;
     if (this.running) {
       this.again = true;
+      this.againSeed = this.againSeed || seed;
       return;
     }
     this.running = true;
     void (async () => {
+      let next = seed;
       try {
-        let bootstrap = first;
         do {
           this.again = false;
-          await this.reconcile(bootstrap);
-          bootstrap = false;
-        } while (this.again && !this.closed);
-      } catch {
-        // A pass fault must never surface in the host's event loop.
+          const wantSeed = next;
+          next = false;
+          this.againSeed = false;
+          // A pass that throws keeps its seed request for the next one.
+          try {
+            await this.reconcile(wantSeed);
+          } catch {
+            if (wantSeed) this.againSeed = true;
+          }
+        } while ((this.again || this.againSeed) && !this.closed);
       } finally {
         this.running = false;
+        if (!this.closed && this.againSeed) this.runReconcile(this.againSeed);
       }
     })();
   }
@@ -542,20 +594,30 @@ class Reporter {
 
   private startStream(): void {
     if (this.closed || this.stream || this.setups.length === 0) return;
-    const ctx = this.ctx();
+    const owner = this.setups[0];
+    if (!owner) return;
+    const ctx = owner.ctx;
     const controller = new AbortController();
-    this.stream = { controller, ctx };
+    this.stream = { controller, owner };
+    this.streamOwner = owner;
+    // A retired stream must not keep publishing: an abort is cooperative, and a
+    // generator may still yield one last event after it.
+    const live = (): boolean =>
+      !this.closed && !controller.signal.aborted && this.streamOwner === owner;
     void (async () => {
       // A dropped stream is retried, because events are the only live signal:
       // an ended stream must not leave the town frozen on stale state.
-      while (!this.closed && !controller.signal.aborted) {
+      while (live()) {
         try {
           const events = ctx?.event?.subscribe?.({ signal: controller.signal });
           // Start consuming before reconciling. An async generator is
           // pull-based: while the read is awaiting, nothing is reading it and
           // every event in that window is lost.
           const reader = (async () => {
-            for await (const event of events ?? []) this.onEvent(event);
+            for await (const event of events ?? []) {
+              if (!live()) return;
+              this.onEvent(event);
+            }
           })();
           // Every reconnect re-bootstraps: a session can have started and
           // finished entirely while the stream was down, and only a fresh list
@@ -565,14 +627,17 @@ class Reporter {
         } catch {
           // Fall through to the backoff below.
         }
-        if (this.closed || controller.signal.aborted) return;
+        if (!live()) return;
         await new Promise((resolve) => {
           const retry = setTimeout(resolve, RECONNECT_MS);
           (retry as unknown as { unref?: () => void }).unref?.();
         });
       }
     })().finally(() => {
-      if (this.stream?.controller === controller) this.stream = null;
+      if (this.stream?.controller === controller) {
+        this.stream = null;
+        this.streamOwner = null;
+      }
     });
   }
 
@@ -592,6 +657,12 @@ class Reporter {
     (this.heartbeat as unknown as { unref?: () => void }).unref?.();
   }
 
+  /** Shut down from outside (tests); the same path an unload takes. */
+  stop(): void {
+    this.setups.length = 0;
+    this.close();
+  }
+
   private close(): void {
     this.closed = true;
     this.stream?.controller.abort();
@@ -600,6 +671,8 @@ class Reporter {
     this.heartbeat = null;
     this.delivery.close();
     this.chains.clear();
+    if (this.retry !== null) clearTimeout(this.retry);
+    this.retry = null;
   }
 }
 
@@ -610,9 +683,19 @@ function reporters(): Map<string, Reporter> {
   return (host[REGISTRY] ??= new Map());
 }
 
-/** Keyed by everything that decides where writes go. */
+/** Shut every live reporter down. Tests use this; nothing in the plugin does. */
+export function stopAllReporters(): void {
+  for (const reporter of reporters().values()) reporter.stop();
+  reporters().clear();
+}
+
+/**
+ * Keyed by where writes actually go, not by how the option was spelled: two
+ * setups that land on the same report endpoint for the same resident namespace
+ * must share one writer, or their requests are not serialised at all.
+ */
 function keyOf(config: Config): string {
-  return [config.bridgeUrl.toString(), config.machineId, config.source, config.token].join("\n");
+  return [reportURL(config.bridgeUrl).toString(), config.machineId, config.source].join("\n");
 }
 
 export const AgentMachiReporter = {

@@ -121,23 +121,24 @@ export function reduce(state: State, input: Input): Action[] {
         if (view.parentID) continue;
         const known = state.sessions.get(view.id);
         if (known) {
+          // Admission for a resident that already exists is a no-op: a second
+          // metadata read (a seed racing a lookup) must never overwrite a name
+          // or an execution state that newer events already established. A
+          // rename comes from its own event; a status comes from `check()`.
+          if (!known.removed) continue;
           // A confirmed-gone session comes back only with a fresh view, which
           // is what a metadata read just proved. A start event alone must not
           // revive it: the row may still be archived.
-          const revived = known.removed;
-          if (revived) {
-            known.removed = false;
-            known.reported = null;
-            known.underlying = view.executing ? "working" : "idle";
-          }
-          // Already tracked: a later metadata read may only refresh the name.
+          known.removed = false;
+          known.reported = null;
+          known.underlying = view.executing ? "working" : "idle";
+          // A row that was removed may have collected prompts while it was
+          // gone; they belong to a resident that no longer exists.
+          known.permissions.clear();
+          known.forms.clear();
           const name = displayName(view);
-          if (name !== "" && name !== known.name) {
-            known.name = name;
-            // The bridge keeps metadata from the last status report, so the
-            // new name lands with the next transition or heartbeat.
-          }
-          if (revived) sync(state, view.id, out);
+          if (name !== "") known.name = name;
+          sync(state, view.id, out);
           continue;
         }
         state.sessions.set(view.id, {
@@ -186,7 +187,9 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "permission-asked": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
+      // A removed resident takes no prompt state: a late event would otherwise
+      // be waiting on the row when a later revival re-reads it.
+      if (!tracked || tracked.removed) return out;
       tracked.permissions.add(input.requestID);
       sync(state, input.sessionID, out);
       return out;
@@ -202,7 +205,9 @@ export function reduce(state: State, input: Input): Action[] {
 
     case "form-created": {
       const tracked = state.sessions.get(input.sessionID);
-      if (!tracked) return out;
+      // A removed resident takes no prompt state: a late event would otherwise
+      // be waiting on the row when a later revival re-reads it.
+      if (!tracked || tracked.removed) return out;
       tracked.forms.add(input.formID);
       sync(state, input.sessionID, out);
       return out;
@@ -280,6 +285,18 @@ export function reduce(state: State, input: Input): Action[] {
       sync(state, input.sessionID, out);
       return out;
     }
+  }
+}
+
+/**
+ * Drop a removed session's row once nothing can still commit against it: call
+ * after a full pass, when every read that started before the removal has
+ * finished. The tombstone in the reporter is what keeps a later rename or
+ * metadata read from admitting the row again.
+ */
+export function pruneRemoved(state: State): void {
+  for (const [sessionID, tracked] of state.sessions) {
+    if (tracked.removed) state.sessions.delete(sessionID);
   }
 }
 
