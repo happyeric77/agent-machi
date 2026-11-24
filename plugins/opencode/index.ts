@@ -449,6 +449,32 @@ class Reporter {
     return (this.state.sessions.get(sessionID)?.forms.size ?? 0) > 0;
   }
 
+  /**
+   * Materialize every form this reporter already knows is open for a session.
+   *
+   * A permission read cannot observe forms, so a snapshot must never be the
+   * thing that ends a block. Rather than skipping the snapshot — which would
+   * leave a stale permission set in place — the form is put into the reducer
+   * first, and the snapshot then applies on top. The reducer's status is
+   * `blocked` when either set is non-empty, so no rule has to special-case
+   * "which kind of prompt wins".
+   */
+  private materializeForms(sessionID: string): void {
+    if (this.hasOpenForm(sessionID)) return;
+    const candidates: { input: Input; at: number }[] = [
+      ...(this.inbound.get(sessionID) ?? []),
+      ...(this.pendingPrompts.get(sessionID) ?? []),
+      ...this.held.filter((entry) => heldSession(entry.input) === sessionID),
+    ];
+    for (const { input, at } of candidates) {
+      if (heldKind(input) !== "form") continue;
+      if ((this.goneAt.get(sessionID) ?? 0) > at) continue;
+      const key = Reporter.heldKey(input);
+      if (key !== null && this.isAnswered(key)) continue;
+      this.dispatch(input);
+    }
+  }
+
   /** Note a prompt event the moment it reaches the reporter. */
   private noteInbound(input: Input, at: number): void {
     const sessionID = heldSession(input);
@@ -489,14 +515,14 @@ class Reporter {
     this.pendingPrompts.delete(sessionID);
   }
 
-  private flushPendingPrompts(sessionID: string): void {
+  private flushPendingPrompts(sessionID: string, goneBefore = this.goneAt.get(sessionID) ?? 0): void {
     const waiting = this.pendingPrompts.get(sessionID);
     if (!waiting) return;
     this.pendingPrompts.delete(sessionID);
     for (const { input, at } of waiting) {
       // A removal that arrived after this ask was parked still wins: the ask
       // describes an incarnation the host has already ended.
-      if ((this.goneAt.get(sessionID) ?? 0) > at) continue;
+      if (goneBefore > at) continue;
       // The answer may already have arrived while this prompt was parked. Its
       // own reply task is queued behind unrelated work, but the answer is
       // already a fact: reporting the block here would be a status the user
@@ -644,7 +670,7 @@ class Reporter {
    * replayed: the answer is a fact even when the reply's own queued task has
    * not run yet, so a replay would report a block the user already cleared.
    */
-  private releaseHeld(sessionID: string): void {
+  private releaseHeld(sessionID: string, goneBefore = this.goneAt.get(sessionID) ?? 0): void {
     for (let i = 0; i < this.held.length; ) {
       const entry = this.held[i];
       if (heldSession(entry.input) !== sessionID) {
@@ -655,7 +681,7 @@ class Reporter {
       if (!this.state.sessions.has(sessionID)) return;
       // A removal that arrived after this prompt still ends it: replaying it
       // would report a block for an incarnation the host already closed.
-      if ((this.goneAt.get(sessionID) ?? 0) > entry.at) continue;
+      if (goneBefore > entry.at) continue;
       const key = Reporter.heldKey(entry.input);
       if (key !== null && this.isAnswered(key)) continue;
       this.dispatch(entry.input);
@@ -858,6 +884,11 @@ class Reporter {
     // follows describes a new incarnation, not the one whose prompts are still
     // held.
     const revived = this.removed.has(sessionID) || this.goneAt.has(sessionID);
+    // The stamp is kept for the prompt decisions below: clearing the mark first
+    // would make every held prompt look like it arrived after the removal, and a
+    // form opened by the incarnation that ended would block the one that
+    // replaced it.
+    const goneStamp = this.goneAt.get(sessionID) ?? 0;
     // A live row proves the session exists again, so the removal mark — which
     // only exists to block stale prompts — is cleared.
     this.removed.delete(sessionID);
@@ -898,13 +929,13 @@ class Reporter {
     const newerExec = (this.execAt.get(sessionID) ?? 0) > startedAt;
     const executing = newerExec ? this.execKind.get(sessionID) === "working" : view.executing;
     let nextPermissions: readonly string[] | undefined;
-    // A permission read cannot observe a form, so it must never publish an
-    // unblock while a form is open: only that form's own reply or a removal can.
-    const formOpen =
-      this.hasOpenForm(sessionID) ||
-      (this.inbound.get(sessionID) ?? []).some(({ input }) => heldKind(input) === "form") ||
-      (this.pendingPrompts.get(sessionID) ?? []).some(({ input }) => heldKind(input) === "form");
-    if (promptsFresh && !formOpen) {
+    // A permission read cannot observe a form, so it must never be the thing
+    // that ends a block. The form goes into the reducer before the snapshot is
+    // applied; the reducer's status is blocked while either set is non-empty,
+    // so the snapshot stays authoritative for permissions and the form stays
+    // authoritative for itself.
+    if (promptsFresh) {
+      this.materializeForms(sessionID);
       // Asks that arrived after this read began are newer than the snapshot, so
       // the snapshot cannot disprove them: publish the union, which keeps a real
       // block rather than briefly clearing it.
@@ -924,13 +955,13 @@ class Reporter {
       permissions: nextPermissions,
       ...(revived ? { revived: true } : {}),
     });
-    // A revival may have been admitted before the archive task ran. The queued
-    // removal still owns the old incarnation's prompt state, so dropping it is
-    // that task's job: nothing is left here for it to clear.
-    this.releaseHeld(sessionID);
+    // Prompts held from before the removal belong to the incarnation that ended.
+    // The mark is gone by now, so the stamp captured above is what the release
+    // has to compare against.
+    this.releaseHeld(sessionID, goneStamp);
     // The row answered execution; a prompt read that failed leaves the parked
     // asks as the only evidence, so they are applied rather than lost.
-    if (permissions === null) this.flushPendingPrompts(sessionID);
+    if (permissions === null) this.flushPendingPrompts(sessionID, goneStamp);
   }
 
   /**
@@ -1195,7 +1226,8 @@ class Reporter {
         return;
       }
       if (permissions && promptsStartedAt > (this.promptsAt.get(sessionID) ?? 0)) {
-      const merged = this.mergeParkedPrompts(sessionID, permissions, promptsStartedAt);
+        this.materializeForms(sessionID);
+        const merged = this.mergeParkedPrompts(sessionID, permissions, promptsStartedAt);
         this.promptsAt.set(sessionID, promptsStartedAt);
         this.dropPendingPrompts(sessionID);
         this.settleOpenAsks(sessionID, permissions, promptsStartedAt);
@@ -1574,7 +1606,10 @@ class Reporter {
             // event for the next pass instead of losing it.
             // Not consumed here: a duplicate open must leave the marker for the
             // terminal task, which is the only place a parked copy is dropped.
-            if (this.isAnswered(Reporter.promptKey("permission", requestID))) return;
+            if (this.isAnswered(Reporter.promptKey("permission", requestID))) {
+              this.closeAsk(sessionID, requestID, at);
+              return;
+            }
             // An ask older than the newest read is exactly what that read
             // disproved: a reply was missed or it never existed.
             if ((this.promptsAt.get(sessionID) ?? 0) > at) return;
@@ -1609,7 +1644,7 @@ class Reporter {
             // A removal already received ends this incarnation: its ask must not
             // be reported as a block for whoever comes next.
             if ((this.goneAt.get(sessionID) ?? 0) > at) {
-              this.closeAsk(sessionID, requestID);
+              this.closeAsk(sessionID, requestID, at);
               return;
             }
             // The ask is the newest prompt observation: a prompt read that began
@@ -1669,14 +1704,15 @@ class Reporter {
             // never revive a removed resident: `readSession` reports an
             // archived or absent row as absent, and absent admits nothing.
             if (this.isAnswered(Reporter.promptKey("form", formID))) {
-              this.closeAsk(sessionID, formID);
+              // This event's own record, not a newer ask that reused the id.
+              this.closeAsk(sessionID, formID, at);
               return;
             }
             // A permission read cannot observe a form, so it must never suppress
             // one. Only this form's own reply or its session's removal can.
             const admission = await this.admit(sessionID, true);
             if (this.isAnswered(Reporter.promptKey("form", formID))) {
-              this.closeAsk(sessionID, formID);
+              this.closeAsk(sessionID, formID, at);
               return;
             }
             if (admission === "unknown") {
@@ -1690,7 +1726,7 @@ class Reporter {
               return;
             }
             if ((this.goneAt.get(sessionID) ?? 0) > at) {
-              this.closeAsk(sessionID, formID);
+              this.closeAsk(sessionID, formID, at);
               return;
             }
             this.dispatch(input);

@@ -605,3 +605,22 @@ test("a form that opens while a revival is unconfirmed still blocks once admitte
     `a genuine form was dropped: ${JSON.stringify(statuses)}`,
   );
 });
+
+test("answering a form does not discard a permission from the same snapshot", async () => {
+  const w = harness();
+  // A form is open while the prompt list still reports a live permission (its
+  // ask event was missed). A permission read cannot see the form, and the form
+  // cannot see the permission: both have to be kept, so answering the form
+  // leaves the session blocked on the permission that is still open.
+  await w.setup({ permissions: async () => [{ id: "still-open" }] });
+  await w.emit("session.created");
+  await w.idle();
+  await w.emit("form.created", { form: { id: "frm", sessionID: "s" } });
+  await w.idle();
+  w.pass();
+  await w.idle();
+  await w.emit("form.replied", { id: "frm" });
+  await w.idle();
+  const statuses = w.writes().map(([status]) => status);
+  assert.equal(statuses[statuses.length - 1], "blocked", `writes were ${JSON.stringify(statuses)}`);
+});
