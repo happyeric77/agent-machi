@@ -197,7 +197,7 @@ class Reporter {
    * event is applied as soon as the session is really admitted, and discarded
    * when the session turns out not to exist.
    */
-  private readonly held: Input[] = [];
+  private readonly held: { input: Input; at: number }[] = [];
   /**
    * Prompt ids answered or cancelled by a terminal event that arrived while the
    * open event's admission read was still in flight.
@@ -411,9 +411,15 @@ class Reporter {
     else this.openAsks.set(sessionID, new Map([[promptID, value]]));
   }
 
-  private closeAsk(sessionID: string, promptID: string): void {
+  /**
+   * Drop the durable record of an ask, but only when it is this event's own:
+   * a duplicate open arriving after a newer ask with the same id must not erase
+   * the newer one.
+   */
+  private closeAsk(sessionID: string, promptID: string, at?: number): void {
     const entry = this.openAsks.get(sessionID);
     if (!entry) return;
+    if (at !== undefined && (entry.get(promptID)?.at ?? -1) > at) return;
     entry.delete(promptID);
     if (entry.size === 0) this.openAsks.delete(sessionID);
   }
@@ -436,6 +442,11 @@ class Reporter {
       if (at < promptsStartedAt && !listed.has(id)) entry.delete(id);
     }
     if (entry.size === 0) this.openAsks.delete(sessionID);
+  }
+
+  /** True when the reducer itself is holding a form for this session. */
+  private hasOpenForm(sessionID: string): boolean {
+    return (this.state.sessions.get(sessionID)?.forms.size ?? 0) > 0;
   }
 
   /** Note a prompt event the moment it reaches the reporter. */
@@ -590,17 +601,20 @@ class Reporter {
   }
 
   /** Remember a prompt event until its session is admitted or proved absent. */
-  private holdPrompt(input: Input): void {
+  private holdPrompt(input: Input, at: number): void {
     // A form that is answered while parked would otherwise apply late and stay
     // blocked forever; matching terminal events drop their held counterpart.
-    this.held.push(input);
+    // The arrival number matters as much as the event: a held prompt belongs to
+    // the incarnation that was live when it arrived, so a later removal or
+    // revival can tell it apart from a prompt for the new one.
+    this.held.push({ input, at });
   }
 
   /** A terminal event makes its parked prompt obsolete, admitted or not. */
   private dropHeld(sessionID: string, match: (input: Input) => boolean): void {
     for (let i = this.held.length - 1; i >= 0; i -= 1) {
-      const input = this.held[i];
-      if (heldSession(input) === sessionID && match(input)) this.held.splice(i, 1);
+      const entry = this.held[i];
+      if (heldSession(entry.input) === sessionID && match(entry.input)) this.held.splice(i, 1);
     }
     // The same prompt may be waiting on a prompt read instead; an answer makes
     // both copies obsolete.
@@ -614,12 +628,12 @@ class Reporter {
   }
 
   private hasHeld(sessionID: string): boolean {
-    return this.held.some((input) => heldSession(input) === sessionID);
+    return this.held.some((entry) => heldSession(entry.input) === sessionID);
   }
 
   private discardHeld(sessionID: string): void {
     for (let i = this.held.length - 1; i >= 0; i -= 1) {
-      if (heldSession(this.held[i]) === sessionID) this.held.splice(i, 1);
+      if (heldSession(this.held[i].input) === sessionID) this.held.splice(i, 1);
     }
   }
 
@@ -632,15 +646,19 @@ class Reporter {
    */
   private releaseHeld(sessionID: string): void {
     for (let i = 0; i < this.held.length; ) {
-      if (heldSession(this.held[i]) !== sessionID) {
+      const entry = this.held[i];
+      if (heldSession(entry.input) !== sessionID) {
         i += 1;
         continue;
       }
-      const [input] = this.held.splice(i, 1);
+      this.held.splice(i, 1);
       if (!this.state.sessions.has(sessionID)) return;
-      const key = Reporter.heldKey(input);
+      // A removal that arrived after this prompt still ends it: replaying it
+      // would report a block for an incarnation the host already closed.
+      if ((this.goneAt.get(sessionID) ?? 0) > entry.at) continue;
+      const key = Reporter.heldKey(entry.input);
       if (key !== null && this.isAnswered(key)) continue;
-      this.dispatch(input);
+      this.dispatch(entry.input);
     }
   }
 
@@ -880,7 +898,13 @@ class Reporter {
     const newerExec = (this.execAt.get(sessionID) ?? 0) > startedAt;
     const executing = newerExec ? this.execKind.get(sessionID) === "working" : view.executing;
     let nextPermissions: readonly string[] | undefined;
-    if (promptsFresh) {
+    // A permission read cannot observe a form, so it must never publish an
+    // unblock while a form is open: only that form's own reply or a removal can.
+    const formOpen =
+      this.hasOpenForm(sessionID) ||
+      (this.inbound.get(sessionID) ?? []).some(({ input }) => heldKind(input) === "form") ||
+      (this.pendingPrompts.get(sessionID) ?? []).some(({ input }) => heldKind(input) === "form");
+    if (promptsFresh && !formOpen) {
       // Asks that arrived after this read began are newer than the snapshot, so
       // the snapshot cannot disprove them: publish the union, which keeps a real
       // block rather than briefly clearing it.
@@ -925,7 +949,17 @@ class Reporter {
     // only a lifecycle event (which rereads the row) may. This is a refusal,
     // not a transient failure, so nothing may be parked for later. Removed
     // covers an id whose removal was observed before it was ever admitted,
-    if (fromPrompt && this.removed.has(sessionID)) return "refused";
+    // A pending lifecycle admission is evidence that a revival is being
+    // checked, so a prompt arriving during it is held rather than refused: a
+    // form that opens in the new incarnation has no read that could recover it.
+    if (
+      fromPrompt &&
+      this.removed.has(sessionID) &&
+      !this.pendingLifecycle.has(sessionID) &&
+      !this.pendingCreate.has(sessionID)
+    ) {
+      return "refused";
+    }
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0] ?? null;
     // Taken before the read starts: this read cannot know about anything that
@@ -1554,17 +1588,22 @@ class Reporter {
             }
             const admission = await this.admit(sessionID, true);
             // Answered while the admission read was in flight: the reply was
-            // already consumed, so this open event is stale by definition.
-            if (this.isAnswered(Reporter.promptKey("permission", requestID))) return;
+            // already consumed, so this open event is stale by definition — and
+            // it must not leave a durable record behind for a session that may
+            // never become a resident.
+            if (this.isAnswered(Reporter.promptKey("permission", requestID))) {
+              this.closeAsk(sessionID, requestID, at);
+              return;
+            }
             if (admission === "unknown") {
-              this.holdPrompt(input);
+              this.holdPrompt(input, at);
               return;
             }
             // Refused or absent: the ask belongs to no resident. Its durable
             // record would outlive every chance to clear it, so it goes with the
             // refusal rather than accumulating for a session that never exists.
             if (admission !== "admitted" && admission !== "admitted-fresh") {
-              this.closeAsk(sessionID, requestID);
+              this.closeAsk(sessionID, requestID, at);
               return;
             }
             // A removal already received ends this incarnation: its ask must not
@@ -1641,13 +1680,13 @@ class Reporter {
               return;
             }
             if (admission === "unknown") {
-              this.holdPrompt(input);
+              this.holdPrompt(input, at);
               return;
             }
             // Refused or absent: the form belongs to no resident, so its durable
             // record would outlive every chance to clear it.
             if (admission !== "admitted" && admission !== "admitted-fresh") {
-              this.closeAsk(sessionID, formID);
+              this.closeAsk(sessionID, formID, at);
               return;
             }
             if ((this.goneAt.get(sessionID) ?? 0) > at) {
@@ -1844,6 +1883,13 @@ export const AgentMachiReporter = {
 export default AgentMachiReporter;
 
 /** The session a parked prompt event belongs to. */
+/** Which prompt kind an input belongs to, or null when it is not a prompt. */
+function heldKind(input: Input): "permission" | "form" | null {
+  if (input.kind === "permission-asked") return "permission";
+  if (input.kind === "form-created") return "form";
+  return null;
+}
+
 function heldSession(input: Input): string | null {
   switch (input.kind) {
     case "permission-asked":

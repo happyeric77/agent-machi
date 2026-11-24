@@ -573,3 +573,35 @@ test("a snapshot settles an ask that was already closed when it began", async ()
   assert.deepEqual(w.writes(), [["idle", "original"]]);
   stopAllReporters();
 });
+
+test("a form that opens while a revival is unconfirmed still blocks once admitted", async () => {
+  const w = harness();
+  // The lifecycle admission read fails, so revival rides on a later list row.
+  let recovered = false;
+  await w.setup({
+    get: async () => {
+      if (!recovered) throw new Error("transient");
+      return row("revived", "working");
+    },
+    // Once reads recover, the list proves the revival is live.
+    list: async () => ({ data: recovered ? [row("revived", "working")] : [] }),
+  });
+  await w.emit("session.created");
+  await w.idle();
+  w.fire("session.archived");
+  await until("removed", () => w.writes().some(([x]) => x === "DELETE"));
+  // Revival is requested by a lifecycle event whose read fails, then a real form
+  // opens. It must not be lost just because the admission was inconclusive.
+  w.fire("session.execution.started");
+  await pause();
+  w.fire("form.created", { form: { id: "frm_new", sessionID: "s" } });
+  await pause();
+  recovered = true;
+  w.pass();
+  await w.idle();
+  const statuses = w.writes().map(([x]) => x);
+  assert.ok(
+    statuses.includes("blocked"),
+    `a genuine form was dropped: ${JSON.stringify(statuses)}`,
+  );
+});

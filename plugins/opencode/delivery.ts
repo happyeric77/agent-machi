@@ -66,6 +66,12 @@ function sameWrite(a: Write, b: Write): boolean {
 }
 
 const MAX_BACKOFF_MS = 60_000;
+/**
+ * Node clamps a `setTimeout` above this to 1 ms, which would turn a very long
+ * server hint into a busy loop. A long wait is re-armed instead: the deadline
+ * is kept in full, only each individual timer is capped.
+ */
+const MAX_TIMER_MS = 2_147_483_647;
 const MAX_ATTEMPTS = 8;
 
 /**
@@ -326,8 +332,13 @@ function schedule(lane: Lane): void {
   lane.timerDue = next;
   lane.timer = setTimeout(() => {
     lane.timer = null;
+    // A capped timer only wakes to re-arm; the deadline itself is unchanged.
+    if (Date.now() < next) {
+      schedule(lane);
+      return;
+    }
     void pump(lane);
-  }, Math.max(0, next - Date.now()));
+  }, Math.min(MAX_TIMER_MS, Math.max(0, next - Date.now())));
   // A pending retry must never hold the process open on its own.
   (lane.timer as unknown as { unref?: () => void }).unref?.();
 }

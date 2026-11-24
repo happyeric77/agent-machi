@@ -326,3 +326,33 @@ test("an HTTP-date Retry-After is parsed as a delay, not as seconds", () => {
   const long = new Response(null, { status: 429, headers: { "retry-after": "120" } });
   assert.equal(retryAfterMs(long), 120_000);
 });
+
+test("a server hint beyond Node's timer limit cannot become a 1 ms wake loop", async () => {
+  // Node clamps any delay above 2^31-1 ms to 1 ms, so a scheduler that hands the
+  // raw deadline to setTimeout spins. Each armed timer must stay within the
+  // limit even when the server asks for weeks.
+  const realSetTimeout = globalThis.setTimeout;
+  const delays: number[] = [];
+  (globalThis as any).setTimeout = ((fn: any, ms?: number, ...rest: any[]) => {
+    if (typeof ms === "number") delays.push(ms);
+    return realSetTimeout(fn, Math.min(ms ?? 0, 5), ...rest);
+  }) as typeof globalThis.setTimeout;
+  // A server hint of 3,000,000 s (about 34 days) is far past Node's limit.
+  const fetch = (() =>
+    new Response("nope", {
+      status: 429,
+      headers: { "Retry-After": "3000000" },
+    })) as unknown as typeof globalThis.fetch;
+  try {
+    const delivery = createDelivery({ ...base(), fetch, timeoutMs: 30 });
+    delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
+    await new Promise((resolve) => realSetTimeout(resolve, 80));
+    delivery.close();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  assert.ok(delays.length > 0, "the scheduler armed a timer");
+  for (const ms of delays) {
+    assert.ok(ms >= 0 && ms <= 2_147_483_647, `armed ${ms} ms`);
+  }
+});
