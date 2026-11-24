@@ -2,13 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createDelivery, residentID, type DeliveryConfig } from "./delivery.ts";
 
-const base: DeliveryConfig = {
-  bridgeUrl: new URL("http://127.0.0.1:9/"),
+// Pacing is per report endpoint and lanes are shared process-wide, so each test
+// gets its own endpoint: otherwise one test's outage window opens on the next.
+let endpoint = 0;
+const base = (): DeliveryConfig => ({
+  bridgeUrl: new URL(`http://127.0.0.1:9/e${++endpoint}/`),
   token: "t",
   source: "opencode",
   agent: "opencode",
   machineId: "mini",
-};
+});
 
 interface Recorded {
   method: string;
@@ -45,12 +48,12 @@ test("resident id requires a printable machine id and stays under the byte cap",
 
 test("a post targets /report with the bearer token and the resident id", async () => {
   const { calls, fetch } = recorder();
-  const delivery = createDelivery({ ...base, fetch });
+  const delivery = createDelivery({ ...base(), fetch });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working", name: "town" });
   await delivery.drain();
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "POST");
-  assert.equal(calls[0].url, "http://127.0.0.1:9/report");
+  assert.equal(calls[0].url, `http://127.0.0.1:9/e${endpoint}/report`);
   assert.equal(calls[0].headers.Authorization, "Bearer t");
   assert.deepEqual(JSON.parse(calls[0].body ?? "{}"), {
     source: "opencode",
@@ -63,17 +66,17 @@ test("a post targets /report with the bearer token and the resident id", async (
 
 test("a delete uses query params, not a body", async () => {
   const { calls, fetch } = recorder();
-  const delivery = createDelivery({ ...base, fetch });
+  const delivery = createDelivery({ ...base(), fetch });
   delivery.enqueue({ type: "delete", sessionID: "ses_a" });
   await delivery.drain();
   assert.equal(calls[0].method, "DELETE");
-  assert.equal(calls[0].url, "http://127.0.0.1:9/report?source=opencode&id=mini-ses_a");
+  assert.equal(calls[0].url, `http://127.0.0.1:9/e${endpoint}/report?source=opencode&id=mini-ses_a`);
   assert.equal(calls[0].body, null);
 });
 
 test("a newer status replaces an unsent one", async () => {
   const { calls, fetch } = recorder();
-  const delivery = createDelivery({ ...base, fetch });
+  const delivery = createDelivery({ ...base(), fetch });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "idle" });
   await delivery.drain();
@@ -85,7 +88,7 @@ test("a newer status replaces an unsent one", async () => {
 
 test("a delete supersedes a queued post for the same session", async () => {
   const { calls, fetch } = recorder();
-  const delivery = createDelivery({ ...base, fetch });
+  const delivery = createDelivery({ ...base(), fetch });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   delivery.enqueue({ type: "delete", sessionID: "ses_a" });
   await delivery.drain();
@@ -99,7 +102,7 @@ test("a session that comes back while its delete is backing off is reported agai
   // The DELETE is the request that fails, so the POST really does supersede a
   // DELETE that has not been accepted yet.
   const { calls, fetch } = recorder((url) => (url.includes("?") ? 503 : 200));
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 10 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 10 });
   delivery.enqueue({ type: "delete", sessionID: "ses_a" });
   await new Promise((resolve) => setTimeout(resolve, 40));
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
@@ -112,7 +115,7 @@ test("a fresh write after a failing one is still sent", async () => {
   // Only the first request fails: the point is that the replacement write is not
   // discarded just because the write it superseded had already spent attempts.
   const { calls, fetch } = recorder((_url, attempt) => (attempt === 1 ? 503 : 200));
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 10 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 10 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 30));
   delivery.enqueue({ type: "delete", sessionID: "ses_a" });
@@ -134,7 +137,7 @@ test("close aborts an in-flight request and nothing lands afterwards", async () 
       void settled;
     });
   }) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 60_000 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 60_000 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   delivery.close();
@@ -159,7 +162,7 @@ test("a failing write does not stop another session from being sent", async () =
     }
     return new Response('{"ok":true}', { status: 200 });
   }) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 50 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 50 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   delivery.enqueue({ type: "post", sessionID: "ses_b", status: "working" });
@@ -182,7 +185,7 @@ test("a stalled bridge is cancelled at the deadline, not left hanging", async ()
       // Headers never arrive: only the deadline can end this.
     });
   }) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 25 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 25 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 80));
   assert.equal(aborted, true, "the deadline aborted the stalled request");
@@ -196,7 +199,7 @@ test("drain after close resolves instead of starting a keep-alive", async () => 
     new Promise<Response>((_resolve, reject) => {
       init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
     })) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 60_000 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 60_000 });
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   delivery.close();
@@ -210,7 +213,7 @@ test("alternating states do not reset the outage backoff", async () => {
     requests += 1;
     return new Response("nope", { status: 503 });
   }) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 10 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 10 });
   // Flip between two states under a sustained outage. Each flip is "new work",
   // but the outage has not changed, so the delay must keep growing.
   for (let i = 0; i < 8; i += 1) {
@@ -229,7 +232,7 @@ test("outage pacing is endpoint-wide, not per resident", async () => {
     stamps.push(Date.now());
     return new Response("nope", { status: 503 });
   }) as unknown as typeof globalThis.fetch;
-  const delivery = createDelivery({ ...base, fetch, timeoutMs: 50 });
+  const delivery = createDelivery({ ...base(), fetch, timeoutMs: 50 });
   const started = Date.now();
   delivery.enqueue({ type: "post", sessionID: "ses_a", status: "working" });
   delivery.enqueue({ type: "post", sessionID: "ses_b", status: "working" });

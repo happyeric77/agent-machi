@@ -163,6 +163,16 @@ class Reporter {
   private readonly setups: Registration[] = [];
   /** Where each known session lives; the reducer only holds resident state. */
   private readonly directories = new Map<string, string | null>();
+  /**
+   * Every session this reporter has ever admitted.
+   *
+   * A prompt event may admit a session it has never seen (otherwise the very
+   * first prompt of a new session is lost while it is still `working`), but it
+   * must never admit one it has already shown and removed: a stale form would
+   * bring that resident back already blocked. Lifecycle events are the only
+   * path that revives a removed session, because they read the row first.
+   */
+  private readonly seen = new Set<string>();
   private readonly bootSince = Date.now() - uptimeMs();
   /** Work applied in arrival order: the whole point of this class. */
   private readonly queue: Array<() => Promise<unknown>> = [];
@@ -291,11 +301,16 @@ class Reporter {
   }
 
   private viewOf(row: SessionRow): SessionView {
+    // Every field is normalized here, because one malformed row (a numeric
+    // title, a non-string directory) must not make the reducer throw on the
+    // whole batch and take every valid neighbour with it.
+    const title = typeof row.title === "string" ? row.title : null;
+    const directory = typeof row.location?.directory === "string" ? row.location.directory : null;
     return {
       id: String(row.id),
-      parentID: row.parentID ?? null,
-      title: row.title ?? null,
-      directory: row.location?.directory ?? null,
+      parentID: typeof row.parentID === "string" ? row.parentID : null,
+      title,
+      directory,
       executing: isExecuting(row, this.bootSince),
     };
   }
@@ -345,6 +360,7 @@ class Reporter {
       this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
       return;
     }
+    this.seen.add(sessionID);
     const view = this.viewOf(read.row);
     // A child is never a resident, so it never gets a directory entry either:
     // that entry is what routes its later prompt reads.
@@ -354,23 +370,31 @@ class Reporter {
   }
 
   /**
-   * Admit a session a lifecycle event mentions but this reporter has not seen.
+   * Admit a session an event mentions but this reporter has not seen.
    *
-   * Only lifecycle events may do this. A prompt event applied to an admitted
-   * session would let a stale form bring a removed resident back already
-   * blocked, and a prompt read on the next pass recovers that case anyway.
-   * An archived or absent row is never admitted, because `readSession` reports
-   * it as absent rather than as a row.
+   * Admission is always backed by a fresh read, so an archived or absent row
+   * admits nothing. `fromPrompt` marks the one difference between the two
+   * callers: a prompt event may admit a brand-new session (its first prompt
+   * would otherwise be lost, and a form that is answered between two passes has
+   * no other way back), but it may not revive one this reporter removed, because
+   * a form that outlived its session would bring the resident back blocked.
    */
-  private async admit(sessionID: string): Promise<void> {
+  private async admit(sessionID: string, fromPrompt = false): Promise<void> {
     if (this.state.sessions.has(sessionID)) return;
-    const read = await this.readSession(sessionID, this.directories.get(sessionID) ?? null);
+    // A prompt event never revives a session this reporter already removed;
+    // only a lifecycle event (which rereads the row) may.
+    if (fromPrompt && this.seen.has(sessionID)) return;
+    const directory = this.directories.get(sessionID) ?? null;
+    const owner = this.registrationFor(directory) ?? this.setups[0] ?? null;
+    const read = await this.readSession(sessionID, directory);
     if (read.kind === "unknown") return;
     // An absent row is not a resident, so nothing is admitted and nothing is
     // deleted on behalf of an event: only a pass removes a resident, and only
     // after a read proved it gone.
     if (read.kind === "absent") return;
-    this.applyRead(sessionID, read);
+    // The owner is passed on so a context that retired between the read and
+    // this line cannot publish the row through the survivor.
+    this.applyRead(sessionID, read, undefined, owner ?? undefined);
   }
 
   /**
@@ -403,27 +427,43 @@ class Reporter {
   }
 
   /**
-   * Seed sessions executing at load. Returns false when the read failed, which
-   * is what schedules a retry: a session that starts during an outage would
-   * otherwise never be found.
-   */
-  /**
-   * Apply one page of the session list. Returns nothing: a page either lands
-   * or it does not, and the pass decides whether to continue.
+   * Apply one page of the session list.
+   *
+   * A page is weaker evidence than a `get`: it is a snapshot that may already
+   * be stale, and it carries no prompts. It can still do three things that a
+   * failing `get` cannot: notice that a tracked resident was archived, refresh
+   * a known resident's title, and admit an executing session this reporter has
+   * never seen.
    */
   private applyListRows(rows: readonly SessionRow[]): void {
     const views: SessionView[] = [];
     for (const row of rows) {
-      if (!row.id || row.parentID || isArchived(row)) continue;
+      if (!row.id || row.parentID) continue;
+      const tracked = this.state.sessions.has(row.id);
+      // Archiving is authoritative absence. A tracked resident whose `get` is
+      // failing must not keep renewing because the list is the only source
+      // left: that is exactly the state a delete would leave behind.
+      if (isArchived(row)) {
+        if (tracked) {
+          this.directories.delete(row.id);
+          this.dispatch({ kind: "reconcile", sessionID: row.id, view: null, missing: true });
+        }
+        continue;
+      }
       const view = this.viewOf(row);
-      // A live resident's fresh title is taken before the executing filter: the
-      // list is the only metadata source when its `get` is failing, and a title
-      // is not a status change.
-      if (this.state.sessions.has(view.id)) {
+      if (tracked) {
+        // A live resident's fresh title is taken before the executing filter:
+        // the list is the only metadata source when its `get` is failing, and a
+        // title is not a status change.
         this.dispatch({ kind: "renamed", sessionID: view.id, title: view.title ?? null });
         continue;
       }
       if (!isExecuting(row, this.bootSince)) continue;
+      // The directory is recorded on admission so the very first `get` and
+      // prompt read already go through the setup that owns that location.
+      if (view.directory !== null && view.directory !== undefined) {
+        this.directories.set(view.id, view.directory);
+      }
       // A removed resident is not in the map at all, so this readmits it: the
       // list row is a fresh, non-archived observation of a live session.
       views.push(view);
@@ -488,9 +528,11 @@ class Reporter {
       this.passWanted = true;
       return;
     }
+    const owner = this.setups[0];
+    if (!owner) return;
     this.passRunning = true;
     this.passWanted = false;
-    this.queueSeedPage(++this.passToken, null, 0);
+    this.queueSeedPage(++this.passToken, owner, null, 0);
   }
 
   private finishPass(pass: number): void {
@@ -502,22 +544,29 @@ class Reporter {
     }
   }
 
-  /** One list page, then either the next page or the first session check. */
-  private queueSeedPage(pass: number, cursor: string | null, page: number): void {
+  /**
+   * One list page, then either the next page or the first session check.
+   *
+   * The page owner is pinned for the whole cursor chain: a page fetched through
+   * one location must never be continued through another, and its rows must not
+   * be applied after that location unloaded.
+   */
+  private queueSeedPage(pass: number, owner: Registration, cursor: string | null, page: number): void {
     this.enqueue(async () => {
       if (!this.alive(pass)) return this.finishPass(pass);
-      const owner = this.setups[0];
-      if (!owner) return this.finishPass(pass);
       const listed = await this.listPage(owner, cursor);
-      if (!this.alive(pass)) return this.finishPass(pass);
+      if (!this.alive(pass) || this.retired(owner)) return this.finishPass(pass);
       if (listed === null) {
+        // A failed list read must not cancel the sweep: the residents already
+        // tracked still need their own checks, which is the only path that can
+        // notice a session that is gone.
         this.scheduleSeedRetry();
-        return this.finishPass(pass);
+        return this.queueCheck(pass, liveSessions(this.state), 0);
       }
       this.clearSeedRetry();
       this.applyListRows(listed.rows);
       if (listed.next !== null && page + 1 < SEED_MAX_PAGES) {
-        return this.queueSeedPage(pass, listed.next, page + 1);
+        return this.queueSeedPage(pass, owner, listed.next, page + 1);
       }
       this.queueCheck(pass, liveSessions(this.state), 0);
     });
@@ -604,7 +653,10 @@ class Reporter {
           const sessionID = data.sessionID;
           const requestID = data.id;
           this.enqueue(async () => {
-            // No admission: see admit()'s note. The next pass reads prompts.
+            // Same reasoning as a form: without admission the newest resident's
+            // very first prompt would be dropped. A fresh read decides whether
+            // the session exists at all.
+            await this.admit(sessionID, true);
             this.dispatch({ kind: "permission-asked", sessionID, requestID });
           });
         }
@@ -623,6 +675,12 @@ class Reporter {
         const sessionID = data?.form?.sessionID;
         if (typeof sessionID === "string" && typeof formID === "string") {
           this.enqueue(async () => {
+            // A form for a session this reporter does not know yet still has to
+            // be recorded, or the resident sits at `working` while a user is
+            // being asked a question. Admission here is a fresh read, so it can
+            // never revive a removed resident: `readSession` reports an
+            // archived or absent row as absent, and absent admits nothing.
+            await this.admit(sessionID, true);
             this.dispatch({ kind: "form-created", sessionID, formID });
           });
         }

@@ -72,9 +72,11 @@ plugin stays silent and the session works exactly as before.
   rename alone reports nothing (the bridge ignores a name on an unchanged
   status); the cached name lands on the next status change the bridge accepts.
   A later metadata read can also correct it.
-- Every live resident is renewed every 5 minutes, on its own clock: renewal
-  never waits for a metadata read. A same-status report only renews the lease,
-  so a renewal carries whatever state was last known and is not a correction.
+- Every live resident has its renewal attempted every 5 minutes, on its own
+  clock: renewal never waits for a metadata read. A same-status report only
+  renews the lease, so a renewal carries whatever state was last known and is
+  not a correction. It is an attempt, not a guarantee: the write can be queued,
+  superseded by newer state, or dropped after its retry budget.
   The same heartbeat also starts a reconcile pass that re-reads, per session,
   whether it is executing and which permission requests are pending; that is
   what corrects a missed event. Because the pass is serial and bounded, how
@@ -90,9 +92,9 @@ plugin stays silent and the session works exactly as before.
   still forward it after a newer DELETE reaches the bridge, and the bridge has
   no sequence check. If a stale write must never win, that needs a write
   generation enforced at the bridge; aborting the client is not enough.
-- For a resident this reporter is tracking, a `Session.NotFoundError` (or an
-  archived read) queues a `DELETE` instead of waiting out the bridge's TTL; it
-  does not require a delete or archive event. A session it never tracked is not
+- For a resident this reporter is tracking, a `Session.NotFoundError`, an
+  archived read, or an archived list row queues a `DELETE` instead of waiting
+  out the bridge's TTL; it does not require a delete or archive event. A session it never tracked is not
   read at all, so the earlier instance's resident waits for `DELETE` on the next
   archive/delete event or for the TTL. A failed or timed-out
   read never counts as "gone". An archived session is treated the same way: it
@@ -102,9 +104,11 @@ plugin stays silent and the session works exactly as before.
   it is live again; a bare start event does not revive it. Prompt events that
   arrive while it is gone are dropped, so a later revival cannot inherit a
   stale form or permission.
-- A delete for a session this reporter never tracked still sends `DELETE`:
-  after a plugin reload the resident from the earlier instance must be cleared
-  now, not at TTL. Deleting an absent row is a no-op on the bridge.
+- A delete or archive event for a session this reporter never tracked still
+  sends `DELETE`: after a plugin reload the resident from the earlier instance
+  must be cleared now, not at TTL. Deleting an absent row is a no-op on the
+  bridge. An untracked session that is merely observed to be absent (a
+  not-found on a lifecycle read) sends nothing.
 - Closing a tab or quitting the TUI reports nothing, and it does not stop
   renewals while the server that owns that session is still running. The
   resident expires only after renewals stop: 15 minutes of silence at the
@@ -146,7 +150,9 @@ Two authoritative sources in the integration plan are out of reach on OpenCode
 - Plugin setup runs once per location, so reporter state cannot belong to a
   setup. Setups for the same report endpoint share one reporter keyed by the
   canonical `/report` URL, the machine id and the source — not by how
-  `bridgeUrl` was spelled and not by the token. That keeps another location's
+  `bridgeUrl` was spelled and not by the token. Delivery pacing is shared by
+  the `/report` URL itself, so two machine ids aimed at one bridge do not open
+  two request lanes. That keeps another location's
   residents renewing, and the remaining setup takes over the event stream when
   the one that owned it unloads. A new setup does not preempt the owner. The
   reporter stops only when the last setup unloads; the process itself may
