@@ -56,6 +56,7 @@ export type Input =
   | { kind: "form-created"; sessionID: string; formID: string }
   | { kind: "form-replied"; sessionID: string; formID: string }
   | { kind: "form-cancelled"; sessionID: string; formID: string }
+  | { kind: "permissions"; sessionID: string; permissions: readonly string[] }
   | { kind: "deleted"; sessionID: string }
   | { kind: "tick" }
   | {
@@ -235,6 +236,18 @@ export function reduce(state: State, input: Input): Action[] {
       const tracked = state.sessions.get(input.sessionID);
       if (!tracked) return out;
       tracked.forms.delete(input.formID);
+      sync(state, input.sessionID, out);
+      return out;
+    }
+
+    case "permissions": {
+      // A successful prompt read is authoritative for the set, even when the
+      // metadata read that accompanied it was inconclusive: the reply event for
+      // a prompt is exactly what a missed event leaves stale.
+      const tracked = state.sessions.get(input.sessionID);
+      if (!tracked) return out;
+      tracked.permissions.clear();
+      for (const id of input.permissions) tracked.permissions.add(id);
       sync(state, input.sessionID, out);
       return out;
     }

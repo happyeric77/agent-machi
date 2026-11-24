@@ -184,12 +184,33 @@ class Reporter {
    */
   private readonly seen = new Set<string>();
   /**
+   * Sessions this reporter has observed being removed, whether or not it ever
+   * admitted them.
+   *
+   * A delete for a session the reporter never tracked leaves nothing in the
+   * reducer, so without this an id that was never `seen` would stay eligible
+   * for prompt-driven admission, and a stale form could bring it back blocked.
+   * A lifecycle read is still free to readmit it, and `applyRead` clears the
+   * mark when that happens.
+   */
+  private readonly removed = new Set<string>();
+  /**
    * Prompt events whose admission read failed transiently. A prompt is the only
    * thing a form has to go on, and a failed read must not silently drop it: the
    * event is applied as soon as the session is really admitted, and discarded
    * when the session turns out not to exist.
    */
   private readonly held: Input[] = [];
+  /**
+   * Prompt ids answered or cancelled by a terminal event that arrived while the
+   * open event's admission read was still in flight.
+   *
+   * The terminal event is queued behind that read, so it cannot drop the parked
+   * prompt in time — but it has already been consumed from the stream, so the
+   * answer is a fact. This set carries it across the gap: the open event skips
+   * itself (and is not parked) once it sees its own id here.
+   */
+  private readonly answered = new Set<string>();
   private readonly bootSince = Date.now() - uptimeMs();
   /** Work applied in arrival order: the whole point of this class. */
   private readonly queue: Array<() => Promise<unknown>> = [];
@@ -284,13 +305,28 @@ class Reporter {
     }
   }
 
+  /** A stable key for a prompt id, scoped by kind so ids cannot collide. */
+  private static promptKey(kind: "permission" | "form", id: string): string {
+    return `${kind}:${id}`;
+  }
+
+  private hasHeld(sessionID: string): boolean {
+    return this.held.some((input) => heldSession(input) === sessionID);
+  }
+
   private discardHeld(sessionID: string): void {
     for (let i = this.held.length - 1; i >= 0; i -= 1) {
       if (heldSession(this.held[i]) === sessionID) this.held.splice(i, 1);
     }
   }
 
-  /** Apply parked prompt events now that the session is really a resident. */
+  /**
+   * Apply parked prompt events now that the session is really a resident.
+   *
+   * A parked prompt whose terminal event was already consumed is dropped, not
+   * replayed: the answer is a fact even when the reply's own queued task has
+   * not run yet, so a replay would report a block the user already cleared.
+   */
   private releaseHeld(sessionID: string): void {
     for (let i = 0; i < this.held.length; ) {
       if (heldSession(this.held[i]) !== sessionID) {
@@ -299,8 +335,17 @@ class Reporter {
       }
       const [input] = this.held.splice(i, 1);
       if (!this.state.sessions.has(sessionID)) return;
+      const key = Reporter.heldKey(input);
+      if (key !== null && this.answered.has(key)) continue;
       this.dispatch(input);
     }
+  }
+
+  /** The `answered` key for a parked prompt event, or null for anything else. */
+  private static heldKey(input: Input): string | null {
+    if (input.kind === "permission-asked") return Reporter.promptKey("permission", input.requestID);
+    if (input.kind === "form-created") return Reporter.promptKey("form", input.formID);
+    return null;
   }
 
   private dispatch(input: Input): void {
@@ -409,10 +454,14 @@ class Reporter {
     if (read.kind === "absent") {
       this.directories.delete(sessionID);
       this.discardHeld(sessionID);
+      this.removed.add(sessionID);
       this.dispatch({ kind: "reconcile", sessionID, view: null, missing: true });
       return;
     }
     this.seen.add(sessionID);
+    // A live row is proof the session exists again, so a prompt may admit it
+    // from now on; the removal mark was only there to block stale prompts.
+    this.removed.delete(sessionID);
     const view = this.viewOf(read.row);
     // A child is never a resident, so it never gets a directory entry either:
     // that entry is what routes its later prompt reads.
@@ -436,8 +485,10 @@ class Reporter {
     if (this.state.sessions.has(sessionID)) return "admitted";
     // A prompt event never revives a session this reporter already removed;
     // only a lifecycle event (which rereads the row) may. This is a refusal,
-    // not a transient failure, so nothing may be parked for later.
-    if (fromPrompt && this.seen.has(sessionID)) return "refused";
+    // not a transient failure, so nothing may be parked for later. Removed
+    // covers an id whose removal was observed before it was ever admitted,
+    // which `seen` alone would miss.
+    if (fromPrompt && (this.seen.has(sessionID) || this.removed.has(sessionID))) return "refused";
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0] ?? null;
     const read = await this.readSession(sessionID, directory);
@@ -504,6 +555,7 @@ class Reporter {
       // left: that is exactly the state a delete would leave behind.
       if (isArchived(row)) {
         this.discardHeld(row.id);
+        this.removed.add(row.id);
         if (tracked) {
           this.directories.delete(row.id);
           this.dispatch({ kind: "reconcile", sessionID: row.id, view: null, missing: true });
@@ -523,7 +575,9 @@ class Reporter {
         });
         continue;
       }
-      if (!isExecuting(row, this.bootSince)) continue;
+      // An idle row still has to reach admission when a prompt is parked for it:
+      // a form has no read of its own, so otherwise it is lost for good.
+      if (!isExecuting(row, this.bootSince) && !this.hasHeld(view.id)) continue;
       // The directory is recorded on admission so the very first `get` and
       // prompt read already go through the setup that owns that location.
       if (view.directory !== null && view.directory !== undefined) {
@@ -534,6 +588,7 @@ class Reporter {
       // It counts as seen for the same reason a `get`-admitted one does: a
       // prompt event must never be what brings it back.
       this.seen.add(view.id);
+      this.removed.delete(view.id);
       views.push(view);
     }
     if (views.length === 0) return;
@@ -549,15 +604,31 @@ class Reporter {
     const directory = this.directories.get(sessionID) ?? null;
     const owner = this.registrationFor(directory) ?? this.setups[0];
     const read = await this.readSession(sessionID, directory);
-    if (read.kind !== "row") {
+    // Prompt reads are location-scoped: only the setup for this session's own
+    // directory can describe its prompts. Without one it stays event-only.
+    //
+    // A prompt read still runs when the metadata read was inconclusive: the
+    // prompt list is what clears a block whose reply event was missed, and a
+    // failing `get` says nothing about the prompts. It is skipped only when the
+    // read proved the session gone, because then there is nothing to reconcile
+    // and a stale answer could belong to a session that no longer exists.
+    if (read.kind === "absent") {
       this.applyRead(sessionID, read, undefined, owner);
       return;
     }
-    // Prompt reads are location-scoped: only the setup for this session's own
-    // directory can describe its prompts. Without one it stays event-only.
-    let permissions: readonly string[] | null | undefined;
-    const location = this.registrationFor(read.row.location?.directory ?? null);
-    if (location) permissions = await this.readPermissions(location, sessionID);
+    const locationDirectory = read.kind === "row" ? (read.row.location?.directory ?? null) : directory;
+    const location = this.registrationFor(locationDirectory);
+    if (!location) {
+      this.applyRead(sessionID, read, undefined, owner);
+      return;
+    }
+    const permissions = await this.readPermissions(location, sessionID);
+    if (read.kind === "unknown") {
+      // The row read failed, but the prompt read did not: apply the set on its
+      // own rather than discarding a good answer with a bad one.
+      if (permissions) this.dispatch({ kind: "permissions", sessionID, permissions });
+      return;
+    }
     this.applyRead(sessionID, read, permissions, owner);
   }
 
@@ -735,7 +806,14 @@ class Reporter {
             // very first prompt would be dropped. A fresh read decides whether
             // the session exists at all; a read that merely failed keeps the
             // event for the next pass instead of losing it.
+            if (this.answered.has(Reporter.promptKey("permission", requestID))) {
+              this.answered.delete(Reporter.promptKey("permission", requestID));
+              return;
+            }
             const admission = await this.admit(sessionID, true);
+            // Answered while the admission read was in flight: the reply was
+            // already consumed, so this open event is stale by definition.
+            if (this.answered.delete(Reporter.promptKey("permission", requestID))) return;
             if (admission === "unknown") {
               this.holdPrompt({ kind: "permission-asked", sessionID, requestID });
               return;
@@ -749,10 +827,10 @@ class Reporter {
         if (typeof data.sessionID === "string" && typeof data.requestID === "string") {
           const sessionID = data.sessionID;
           const requestID = data.requestID;
+          // Recorded on arrival, so an open event whose admission read is still
+          // in flight already knows it was answered and will not park itself.
+          this.answered.add(Reporter.promptKey("permission", requestID));
           this.enqueue(async () => {
-            // Dropped in the queue, not on arrival: a parked event whose
-            // admission read is still in flight must be cancelled before that
-            // task resumes and dispatches it.
             this.dropHeld(
               sessionID,
               (input) => input.kind === "permission-asked" && input.requestID === requestID,
@@ -772,7 +850,12 @@ class Reporter {
             // never revive a removed resident: `readSession` reports an
             // archived or absent row as absent, and absent admits nothing.
             const input = { kind: "form-created" as const, sessionID, formID };
+            if (this.answered.has(Reporter.promptKey("form", formID))) {
+              this.answered.delete(Reporter.promptKey("form", formID));
+              return;
+            }
             const admission = await this.admit(sessionID, true);
+            if (this.answered.delete(Reporter.promptKey("form", formID))) return;
             if (admission === "unknown") {
               this.holdPrompt(input);
               return;
@@ -789,6 +872,7 @@ class Reporter {
           const sessionID = data.sessionID;
           const formID = data.id;
           const kind = event.type === "form.replied" ? "form-replied" : "form-cancelled";
+          this.answered.add(Reporter.promptKey("form", formID));
           this.enqueue(async () => {
             // Same ordering rule as a permission reply: a form answered before
             // its session was admitted leaves nothing to report, and the drop
@@ -809,6 +893,9 @@ class Reporter {
             // must not keep one.
             this.directories.delete(sessionID);
             this.discardHeld(sessionID);
+            // Remembered even for an id this reporter never admitted: a later
+            // stale prompt must not be the event that revives it.
+            this.removed.add(sessionID);
             this.dispatch({ kind: "deleted", sessionID });
           });
         }
