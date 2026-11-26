@@ -42,6 +42,22 @@ const DOORSTEP_SECONDS = 0.9;
 /** Residents drawn as characters. The Roster still lists everyone. */
 export const VISIBLE_CAP = 24;
 
+/**
+ * Above this many residents the name tags are hidden: a tag is 1.75 world units
+ * wide and area spots sit 0.55 apart, so a full town turns the tags into one
+ * black band that hides the characters. The Roster and the highlight ring carry
+ * the names instead. Below it the town looks exactly as it did with the cast.
+ */
+const TAG_LIMIT = 8;
+/** Badge height with the tag shown, and the tag's clearance above it. */
+const BADGE_Y = 1.52;
+const TAG_GAP = 0.46;
+
+/** Whether a resident's name tag is drawn at this town size. */
+export function tagVisibleFor(actorCount: number, highlighted: boolean): boolean {
+  return actorCount <= TAG_LIMIT || highlighted;
+}
+
 const HOMES_KEY = "agent-machi.homes";
 
 interface DoorState {
@@ -77,6 +93,7 @@ interface Actor {
   fade: FadeController;
   ring: THREE.Mesh;
   tag: NameTag;
+  showTag: boolean;
   badge: StatusBadgeSprite;
   highlightTimer: ReturnType<typeof setTimeout> | null;
   debounceTimer: ReturnType<typeof setTimeout> | null;
@@ -199,9 +216,11 @@ export class Director {
     const actor = this.actors.get(paneId);
     if (!actor) return false;
     actor.ring.visible = true;
+    actor.showTag = true;
     if (actor.highlightTimer) clearTimeout(actor.highlightTimer);
     actor.highlightTimer = setTimeout(() => {
       actor.ring.visible = false;
+      actor.showTag = false;
       actor.highlightTimer = null;
     }, 2500);
     return true;
@@ -239,9 +258,22 @@ export class Director {
       if (actor.door) this.updateDoor(actor, dtSeconds);
       else if (actor.moving) actor.animator.update(dtSeconds);
       this.syncHeadBadge(actor);
+      this.syncTag(actor);
       actor.badge.update(dtSeconds);
     }
     for (const sign of this.homeSigns.values()) sign.update(dtSeconds);
+  }
+
+  /**
+   * Name tags survive a small town but not a full one: at the cap they cover
+   * each other and the characters. A highlighted resident always shows its tag.
+   * A hidden tag takes its height with it, so the status badge drops to just
+   * over the hat instead of hanging in the air where the tag used to be.
+   */
+  private syncTag(actor: Actor): void {
+    const drawn = tagVisibleFor(this.actors.size, actor.showTag);
+    actor.tag.sprite.visible = drawn && actor.traveler.visible && !actor.inside;
+    actor.badge.sprite.position.y = drawn ? BADGE_Y : BADGE_Y - TAG_GAP;
   }
 
   private setBridgeState(state: "connecting" | "online" | "offline", text: string): void {
@@ -394,12 +426,9 @@ export class Director {
     ring.visible = false;
 
     const tag = createNameTag(look.torso.name);
-    // Two tag rows, split by the resident's own hash: at the cap a single row
-    // of 24 tags overlaps into a black band and hides the characters.
-    const tagY = hash % 2 === 0 ? 1.02 : 1.30;
-    tag.sprite.position.y = tagY;
+    tag.sprite.position.y = 1.02;
     const badge = new StatusBadgeSprite(["!", "check", "work"], 0.36);
-    badge.sprite.position.set(0, tagY + 0.5, 0.02);
+    badge.sprite.position.set(0, BADGE_Y, 0.02);
     badge.sprite.renderOrder = 4;
 
     const actor: Actor = {
@@ -423,6 +452,7 @@ export class Director {
       fade: null as unknown as FadeController,
       ring,
       tag,
+      showTag: false,
       badge,
       highlightTimer: null,
       debounceTimer: null,
@@ -511,8 +541,11 @@ export class Director {
     } else if (actor.door?.kind === "door" && actor.door.phase === "entering") {
       this.abortEnter(actor);
     }
-    if (area === null && actor.door?.kind === "spot" && actor.door.phase === "entering") {
-      this.abortSpotApproach(actor);
+    // An approach to a spot the resident no longer holds is abandoned, never
+    // finished: finishing it would park the pawn on a spot another resident
+    // may already own.
+    if (actor.door?.kind === "spot" && actor.door.phase === "entering") {
+      if (actor.door.spotId !== actor.areaSpot) this.abortSpotApproach(actor);
     }
 
     if (actor.door) {
@@ -529,9 +562,17 @@ export class Director {
     if (actor.atSpot) {
       if (!standing) {
         actor.atSpot = false;
-      } else if (target === standing.entrance) {
+      } else if (
+        area === standing.area &&
+        actor.areaSpot === standing.id &&
+        target === standing.entrance
+      ) {
+        // Already standing where this status wants it.
         return;
       } else {
+        // Includes the case where a house happened to be reachable from the
+        // entrance this resident is standing at: the spot is released, so it
+        // still has to walk back before it can enter.
         this.beginSpotReturn(actor, standing);
         this.releaseSpot(actor);
         return;
@@ -685,13 +726,19 @@ export class Director {
     if (door.kind === "spot") {
       const spot = door.spotId ? spotById(door.spotId) : null;
       if (door.phase === "entering") {
+        if (door.spotId !== actor.areaSpot) {
+          // The status moved on while this walk was in flight. Do not settle
+          // on a spot the resident no longer holds: another resident may own it.
+          actor.moving = false;
+          this.placeAtNode(actor, actor.node);
+          logLine(`${actor.paneId} spot ${door.spotId ?? "?"} no longer wanted`);
+          this.retarget(actor);
+          return;
+        }
         actor.atSpot = true;
         actor.moving = false;
         actor.traveler.position.set(spot?.x ?? door.toX, spot?.y ?? this.groundY, spot?.z ?? door.toZ);
         logLine(`${actor.paneId} at spot ${door.spotId ?? "?"}`);
-        // The status may have moved on while this walk was in flight; the
-        // resident is now standing somewhere its current status does not want.
-        if (actor.areaSpot !== door.spotId) this.retarget(actor);
       } else {
         actor.atSpot = false;
         this.placeAtNode(actor, actor.node);

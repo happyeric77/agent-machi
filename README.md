@@ -163,12 +163,14 @@ One JSON object, at most 8 KiB, no unknown fields, and no trailing data.
 `ext:<source>:<id>`, and two sources may use the same id. The Roster display
 name falls back from the trimmed `name` to the trimmed `agent` to the pane id,
 and duplicate display names get a numeric suffix. Up to 24 residents are drawn
-as characters at a time, each with its own look and a name tag; agents beyond
-the 24th appear in the Roster and the Log only. The first seven to arrive get
-the authored houses and an office sign reading their character name, for
-example `Amber Office`, never the reported name; everyone else works from the
-work area and is labelled `Houseless` in the Roster. A resident gives its house
-up when it leaves.
+as characters at a time, each with its own look; agents beyond the 24th appear
+in the Roster and the Log only. Name tags are drawn while the town holds eight
+residents or fewer, and for whichever resident is highlighted from the Roster;
+above that they would overlap into a single band and hide the characters. The
+first seven to arrive get the authored houses and an office sign reading their
+character name, for example `Amber Office`, never the reported name; everyone
+else works from the work area and is labelled `Houseless` in the Roster. A
+resident gives its house up when it leaves.
 
 Response:
 

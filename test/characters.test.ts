@@ -1,11 +1,24 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { MODULES, PALETTE, lookFor } from "../src/characters.ts";
 
-test("the same resident id always gets the same module and colours", () => {
-  for (const paneId of ["ext:ci:1", "fake:p1", "w7:p2", "ext:opencode:mac-mini-ses_abc"]) {
-    assert.deepEqual(lookFor(paneId), lookFor(paneId));
-  }
+/** Looks computed by a fresh Node process, so nothing in this one can carry over. */
+function lookForInFreshProcess(paneIds: readonly string[]): unknown {
+  const module = new URL("../src/characters.ts", import.meta.url).href;
+  const script = `import { lookFor } from ${JSON.stringify(module)};
+const ids = ${JSON.stringify(paneIds)};
+process.stdout.write(JSON.stringify(ids.map((id) => lookFor(id))));`;
+  const out = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], {
+    encoding: "utf8",
+  });
+  return JSON.parse(out);
+}
+
+test("the same resident id gets the same look in two separate processes", () => {
+  const ids = ["ext:ci:1", "fake:p1", "w7:p2", "ext:opencode:mac-mini-ses_abc"];
+  assert.deepEqual(lookForInFreshProcess(ids), lookForInFreshProcess(ids));
+  assert.deepEqual(lookForInFreshProcess(ids), ids.map((id) => lookFor(id)));
 });
 
 test("ids from every bridge mode get a look, and different ids differ somewhere", () => {

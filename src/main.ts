@@ -230,7 +230,10 @@ async function showDemoRibbon(bridgeBase: string): Promise<void> {
   }
 }
 
-window.__agentMachi = { log: getLog, positions: () => director.getPositions() };
+// Test hook for the acceptance harness: not part of the shipped page.
+if (import.meta.env.DEV) {
+  window.__agentMachi = { log: getLog, positions: () => director.getPositions() };
+}
 
 const clock = new THREE.Clock();
 function frame(): void {

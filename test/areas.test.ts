@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AREA_SPOTS, pickAreaSpot, spotById, type AreaName } from "../src/areas.ts";
+import { planRoute } from "../src/planner.ts";
+import { loadGraph } from "../src/town/graph/graph.ts";
 
 const AREAS: AreaName[] = ["beach", "station", "worksite"];
 const MIN_SPACING = 0.5;
@@ -23,6 +25,22 @@ test("every spot names an entrance and sits on a walkable surface", () => {
   for (const spot of AREA_SPOTS) {
     assert.ok(spot.entrance.length > 0, spot.id);
     assert.ok(spot.y >= 0.5 && spot.y <= 0.63, `${spot.id} surface ${spot.y}`);
+  }
+});
+
+test("every spot's entrance node is walkable and actually connects to it", () => {
+  const graph = loadGraph();
+  for (const spot of AREA_SPOTS) {
+    const node = graph.nodes.get(spot.entrance);
+    assert.ok(node, `${spot.id} entrance ${spot.entrance} is not a graph node`);
+    assert.equal(node.runtimeCollisionStatus, "FINITE_SAMPLE_PASS", `${spot.entrance} is not walkable`);
+    // The coastal band is only reachable along the path, so its far spots walk
+    // in from CJ-C; 3.9 is the longest authored approach plus slack.
+    assert.ok(
+      Math.hypot(node.worldX - spot.x, node.worldZ - spot.z) <= 3.9,
+      `${spot.id} sits ${Math.hypot(node.worldX - spot.x, node.worldZ - spot.z).toFixed(2)} from ${spot.entrance}`,
+    );
+    assert.ok(planRoute(graph, "S", spot.entrance), `no route from S to ${spot.entrance}`);
   }
 });
 
