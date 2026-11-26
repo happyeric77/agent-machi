@@ -11,11 +11,10 @@ import {
   createWakamiyaAvenueFinish,
   decorateWakamiyaShopfronts,
 } from "./town/map/wakamiya.ts";
-import { createCoast, createRoutePreview } from "./town/coast.ts";
+import { createCoast } from "./town/coast.ts";
 import { tileSurfaceAt } from "./town/sceneryAnchors.ts";
 import { loadGraph } from "./town/graph/graph.ts";
 import { Director } from "./director.ts";
-import { createResidents } from "./characters.ts";
 import { LogPanel, RosterPanel } from "./panels.ts";
 import { getLog } from "./log.ts";
 import { TrailerCamera } from "./trailer.ts";
@@ -23,7 +22,10 @@ import "./style.css";
 
 declare global {
   interface Window {
-    __agentMachi?: { log: () => readonly string[] };
+    __agentMachi?: {
+      log: () => readonly string[];
+      positions: () => { paneId: string; x: number; z: number; settled: boolean }[];
+    };
   }
 }
 
@@ -99,21 +101,6 @@ decorateWakamiyaShopfronts(blueprintShops);
 scene.add(blueprintShops);
 scene.add(createOnariCentralFocus(MAP_GROUND_Y));
 scene.add(createWakamiyaAvenueFinish(MAP_GROUND_Y));
-
-const sourcePreview = createRoutePreview();
-const previewTravelers = sourcePreview.children.filter((object) => object.name.includes("traveller"));
-if (previewTravelers.length !== 2) throw new Error("Expected both original traveler assets");
-previewTravelers.forEach((traveler) => {
-  traveler.visible = false;
-  scene.add(traveler);
-});
-
-const residents = createResidents();
-for (const resident of residents) {
-  resident.visible = false;
-  scene.add(resident);
-}
-const travelers = [...previewTravelers, ...residents];
 
 const coast = createCoast();
 coast.scale.x = 1.65;
@@ -205,7 +192,7 @@ window.addEventListener("resize", resize);
 resize();
 
 const graph = loadGraph();
-const director = new Director(graph, travelers, MAP_GROUND_Y, statusElement, scene);
+const director = new Director(graph, MAP_GROUND_Y, statusElement, scene);
 // The bridge serves this page in production, so same-origin is the default;
 // Vite dev runs on its own port with the bridge still on 8731.
 const bridgeUrl =
@@ -243,7 +230,7 @@ async function showDemoRibbon(bridgeBase: string): Promise<void> {
   }
 }
 
-window.__agentMachi = { log: getLog };
+window.__agentMachi = { log: getLog, positions: () => director.getPositions() };
 
 const clock = new THREE.Clock();
 function frame(): void {

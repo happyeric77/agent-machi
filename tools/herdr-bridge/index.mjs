@@ -708,6 +708,24 @@ function startFake() {
     return;
   }
 
+  if (FAKE_SCENARIO === "cap") {
+    // Acceptance seeding: fill the visible cap and move every resident through
+    // one whole phase of the same status, 25s per phase, then repeat. Mirrors
+    // the Go bridge so compare-fake can diff the two.
+    const capAgents = [p1];
+    for (let index = 2; index <= 24; index += 1) {
+      capAgents.push(makeAgent(`fake:p${index}`, `Cap Agent ${index}`));
+    }
+    const phases = ["working", "blocked", "idle", "done"];
+    const cycle = (step) => {
+      const phase = phases[step % phases.length];
+      for (const row of capAgents) setFakeStatus(row, phase);
+      setTimeout(() => cycle(step + 1), 25000);
+    };
+    setTimeout(() => cycle(0), 1500);
+    return;
+  }
+
   if (FAKE_SCENARIO === "homeblock") {
     // Enter the home, then flip to blocked: the traveller must come back out
     // visibly and finish at the station, never stuck invisible.

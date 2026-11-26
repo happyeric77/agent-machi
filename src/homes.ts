@@ -129,7 +129,7 @@ export class HomeSign {
   private readonly canvas: HTMLCanvasElement;
   private readonly context: CanvasRenderingContext2D;
   private readonly texture: THREE.CanvasTexture;
-  private readonly badge = new StatusBadgeSprite("check", 0.28);
+  private readonly badge = new StatusBadgeSprite(["check"], 0.28);
   private name = "";
   private status = "";
   private lit: boolean | null = null;

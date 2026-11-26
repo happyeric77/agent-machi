@@ -14,7 +14,7 @@ export function statusColor(status: string): string {
 }
 
 // Sole status → badge map. Sign and head sprites only draw what this returns.
-export type StatusBadgeGlyph = "check" | "!";
+export type StatusBadgeGlyph = "check" | "!" | "work";
 
 export interface StatusBadge {
   glyph: StatusBadgeGlyph;
@@ -26,6 +26,10 @@ export interface StatusBadge {
 const STATUS_BADGES: Partial<Record<StatusName, StatusBadge>> = {
   done: { glyph: "check", fill: STATUS_COLORS.done, stroke: "#1c4630", ink: "#ffffff" },
   blocked: { glyph: "!", fill: "#f2b705", stroke: "#5e4a12", ink: "#2b2410" },
+  // Houseless residents cannot walk into an office to show work, so they carry
+  // this over the head. A square silhouette keeps it apart from the round
+  // blocked badge even before the three dots resolve.
+  working: { glyph: "work", fill: "#f2b705", stroke: "#5e4a12", ink: "#2b2410" },
 };
 
 export function statusBadge(status: string): StatusBadge | null {
