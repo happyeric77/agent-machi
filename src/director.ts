@@ -58,6 +58,18 @@ export function tagVisibleFor(actorCount: number, highlighted: boolean): boolean
   return actorCount <= TAG_LIMIT || highlighted;
 }
 
+/**
+ * Whether a status that wants a house should try to take one now. A resident
+ * working from the work area keeps that spot through `working -> done`: the
+ * green check belongs over the resident at its task, not on a door it was
+ * handed by a vacancy that opened mid-task. A vacancy is taken on the next
+ * task, when the resident is not already in place.
+ */
+export function claimsHomeFor(status: AgentStatus, housed: boolean, atWorkSpot: boolean): boolean {
+  if (status !== "working" && status !== "done") return false;
+  return housed || !atWorkSpot;
+}
+
 const HOMES_KEY = "agent-machi.homes";
 
 interface DoorState {
@@ -507,7 +519,11 @@ export class Director {
     let area: AreaName | null =
       status === "idle" ? "beach" : status === "blocked" ? "station" : null;
 
-    const home = wantsHome ? this.homeFor(actor.paneId) : null;
+    const housed = this.getHome(actor.paneId) !== null;
+    const held = actor.areaSpot ? spotById(actor.areaSpot) : null;
+    const home = claimsHomeFor(status, housed, held?.area === "worksite")
+      ? this.homeFor(actor.paneId)
+      : null;
     let target: string | null = home;
     if (!target) {
       if (wantsHome) area = "worksite";
