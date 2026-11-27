@@ -28,6 +28,7 @@ const scenarios = {
   signnames: 4000,
   dupe: 5000,
   panelnames: 10000,
+  cap: 27000,
 };
 
 fs.copyFileSync(path.join(ROOT, "tools/herdr-bridge/index.mjs"), NODE_COPY);

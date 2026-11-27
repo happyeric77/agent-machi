@@ -3,19 +3,19 @@ import { statusBadge, type StatusBadge, type StatusBadgeGlyph } from "./status.t
 
 const PULSE_RATE = 4.2;
 
-/** One pulsing badge sprite. `mount` is where it hangs, not a second status map. */
+/** One pulsing badge sprite. `mounts` is where it hangs, not a second status map. */
 export class StatusBadgeSprite {
   readonly sprite: THREE.Sprite;
   private readonly material: THREE.SpriteMaterial;
   private readonly context: CanvasRenderingContext2D;
   private readonly texture: THREE.CanvasTexture;
-  private readonly mount: StatusBadgeGlyph;
+  private readonly mounts: readonly StatusBadgeGlyph[];
   private readonly baseScale: number;
   private pulse = 0;
   private painted = "";
 
-  constructor(mount: StatusBadgeGlyph, baseScale: number) {
-    this.mount = mount;
+  constructor(mounts: readonly StatusBadgeGlyph[], baseScale: number) {
+    this.mounts = mounts;
     this.baseScale = baseScale;
     const canvas = document.createElement("canvas");
     canvas.width = 128;
@@ -37,7 +37,7 @@ export class StatusBadgeSprite {
 
   setStatus(status: string): void {
     const badge = statusBadge(status);
-    const show = badge?.glyph === this.mount ? badge : null;
+    const show = badge && this.mounts.includes(badge.glyph) ? badge : null;
     const wasVisible = this.sprite.visible;
     this.sprite.visible = show !== null;
     if (!show) return;
@@ -84,6 +84,15 @@ function drawStatusBadge(context: CanvasRenderingContext2D, badge: StatusBadge):
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillText("!", cx, cy + 4);
+    return;
+  }
+
+  if (badge.glyph === "work") {
+    // Three ascending bars: a still-frame work mark that survives being small.
+    context.fillStyle = badge.ink;
+    for (const [i, height] of [22, 38, 54].entries()) {
+      context.fillRect(cx - 27 + i * 21, cy + 22 - height, 15, height);
+    }
     return;
   }
 

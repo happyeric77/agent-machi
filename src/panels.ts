@@ -1,5 +1,6 @@
 import type { AgentRow, BridgeEvent, Director } from "./director.ts";
 import { resolveDisplayName } from "./display.ts";
+import { lookFor } from "./characters.ts";
 import { statusColor } from "./status.ts";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -78,10 +79,13 @@ export class RosterPanel {
       item.type = "button";
       item.dataset.status = row.agent_status;
 
-      const role = this.director.getRole(row.pane_id);
+      const look = lookFor(row.pane_id);
+      const role = look.torso.name;
       const top = el("span", "roster-top");
-      const badge = el("span", `role-badge ${role ? `role-${role.toLowerCase()}` : "role-log"}`);
-      badge.textContent = role ?? "log only";
+      const badge = el("span", "role-badge");
+      badge.textContent = role;
+      badge.style.color = look.torso.hex;
+      badge.style.background = `${look.torso.hex}33`;
       const name = el("span", "roster-name");
       name.textContent = formatName(role, resolveDisplayName(row));
       top.append(badge, name);
@@ -103,7 +107,7 @@ export class RosterPanel {
       agent.textContent = row.agent ?? "agent ?";
       const home = el("span", "");
       const assigned = this.director.getHome(row.pane_id);
-      home.textContent = assigned ? `Home ${assigned}` : "Home unassigned";
+      home.textContent = assigned ? `Home ${assigned}` : "Houseless";
       sub.append(agent, home);
 
       item.append(top, meta, sub);

@@ -162,39 +162,6 @@ body {
   letter-spacing: 0.02em;
 }
 
-.role-amber {
-  background: rgba(242, 183, 5, 0.22);
-  color: #f6cf5b;
-}
-
-.role-teal {
-  background: rgba(61, 155, 181, 0.24);
-  color: #79c6d8;
-}
-
-.role-moss {
-  background: rgba(143, 191, 106, 0.24);
-  color: #b8dda0;
-}
-
-.role-plum {
-  background: rgba(196, 127, 201, 0.24);
-  color: #e0a9e3;
-}
-
-.role-slate {
-  background: rgba(147, 169, 201, 0.24);
-  color: #bccbdf;
-}
-
-.role-sand {
-  background: rgba(232, 189, 99, 0.24);
-  color: #f0d393;
-}
-
-.role-log {
-  color: #b9c4bd;
-}
 
 .roster-name {
   overflow: hidden;

@@ -1,6 +1,9 @@
 package bridge
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 const fakeDefaultCwd = "/Users/example/Projects/agent-machi"
 
@@ -165,6 +168,30 @@ func (b *Bridge) StartFake() {
 			setFakeStatus(p4, StatusWorking)
 			time.AfterFunc(4000*time.Millisecond, func() { setFakeStatus(p4, StatusIdle) })
 		})
+
+	case "cap":
+		// Acceptance seeding: fill the visible cap and walk every resident
+		// through one whole phase of the same status, so a single run yields
+		// the per-area saturation checks. 25s per phase, then it repeats.
+		capAgents := make([]*AgentRow, 0, 24)
+		for index := 1; index <= 24; index++ {
+			paneID := "fake:p" + strconv.Itoa(index)
+			if index == 1 {
+				capAgents = append(capAgents, p1)
+				continue
+			}
+			capAgents = append(capAgents, makeAgent(paneID, strPtr("Cap Agent "+strconv.Itoa(index))))
+		}
+		phases := []AgentStatus{StatusWorking, StatusBlocked, StatusIdle, StatusDone}
+		var cycle func(step int)
+		cycle = func(step int) {
+			phase := phases[step%len(phases)]
+			for _, row := range capAgents {
+				setFakeStatus(row, phase)
+			}
+			time.AfterFunc(25*time.Second, func() { cycle(step + 1) })
+		}
+		time.AfterFunc(1500*time.Millisecond, func() { cycle(0) })
 
 	case "castreuse":
 		p2 := makeAgent("fake:p2", strPtr("Fake Agent B"))

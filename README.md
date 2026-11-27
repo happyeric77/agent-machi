@@ -48,8 +48,9 @@ agents go down to the beach.
   and its office; plus an event Log that survives page reloads.
 - **Names you can map**: signs read `Amber Office`; the roster shows
   `Amber (agent-machi)`, character first, project in parentheses.
-- **Six residents**: Amber, Teal, Moss, Plum, Slate, and Sand. Agents beyond
-  the sixth still appear in the roster and the Log.
+- **A full town**: up to 24 agents drawn as characters, each with its own
+  silhouette and colours worked out from its id. Agents beyond the 24th still
+  appear in the roster and the Log.
 - **Full camera control**: orbit, zoom, and pan, with a Reset view button.
 - **Trailer mode**: add `?trailer=1` to hide the panels and play a fixed
   wide-to-close camera orbit around the town.
@@ -161,11 +162,15 @@ One JSON object, at most 8 KiB, no unknown fields, and no trailing data.
 `source` and `id` together identify the resident: its pane id is
 `ext:<source>:<id>`, and two sources may use the same id. The Roster display
 name falls back from the trimmed `name` to the trimmed `agent` to the pane id,
-and duplicate display names get a numeric suffix. Up to six residents have a
-town role and a character at a time, and a role slot is reused when a resident
-leaves. A resident with a role has an office sign showing that role, for
-example `Amber Office`, never the reported name; residents without one appear
-in the Roster only.
+and duplicate display names get a numeric suffix. Up to 24 residents are drawn
+as characters at a time, each with its own look; agents beyond the 24th appear
+in the Roster and the Log only. Name tags are drawn while the town holds eight
+residents or fewer, and for whichever resident is highlighted from the Roster;
+above that they would overlap into a single band and hide the characters. The
+first seven to arrive get the authored houses and an office sign reading their
+character name, for example `Amber Office`, never the reported name; everyone
+else works from the work area and is labelled `Houseless` in the Roster. A
+resident gives its house up when it leaves.
 
 Response:
 
